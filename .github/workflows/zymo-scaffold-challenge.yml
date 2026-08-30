@@ -1,0 +1,109 @@
+name: Zymo Log scaffold challenge
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "500000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-scaffold-challenge.yml
+
+concurrency:
+  group: zymo-scaffold-challenge-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PAIRS: ${{ inputs.pairs || '500000' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install assembler and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+      - name: Download reads and references
+        run: |
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+      - name: Build BridgeAsm
+        run: cargo build --release
+      - name: Run BridgeAsm scaffold candidates
+        run: |
+          run_bridgeasm() {
+            name=$1
+            k=$2
+            mercy=$3
+            quality=$4
+            mkdir -p "benchmark/$name"
+            /usr/bin/time -v -o "benchmark/$name.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o "benchmark/$name" -k "$k" \
+                --min-count 2 --mercy-max-kmers "$mercy" \
+                --mercy-min-support 1 --mercy-min-quality "$quality" \
+                --min-read-support 2 --min-pair-support 2 \
+                --min-primary-support 5 --primary-dominance 0.75 \
+                --min-contig-length 200 --scaffold-gap-bases 100 --threads 2
+            cp "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/assemblies/$name-contigs.fasta"
+            cp "benchmark/$name/primary_scaffolds.fasta" \
+              "benchmark/assemblies/$name-scaffolds.fasta"
+          }
+          run_bridgeasm k31-default 31 16 25
+          run_bridgeasm k31-long-q30 31 64 30
+          run_bridgeasm k21-long-q30 21 64 30
+      - name: Run MEGAHIT
+        run: |
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+      - name: Run MetaQUAST on contigs and scaffolds
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/k31-default-contigs.fasta \
+            benchmark/assemblies/k31-default-scaffolds.fasta \
+            benchmark/assemblies/k31-long-q30-contigs.fasta \
+            benchmark/assemblies/k31-long-q30-scaffolds.fasta \
+            benchmark/assemblies/k21-long-q30-contigs.fasta \
+            benchmark/assemblies/k21-long-q30-scaffolds.fasta \
+            benchmark/assemblies/megahit.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json \
+            > benchmark/metaquast_summary.tsv
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nscaffold_semantics\treciprocal_pair_supported_N_gap\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-scaffold-challenge-500k
+          path: benchmark
+          retention-days: 14
