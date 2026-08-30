@@ -12,6 +12,10 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - .github/workflows/real-data-smoke.yml
+      - Cargo.toml
+      - src/**
+      - scripts/download_ena_subset.py
+      - scripts/fasta_stats.py
 
 permissions:
   contents: read
