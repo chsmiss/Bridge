@@ -138,16 +138,41 @@ pub fn build_raw_graph(
         .map(|key| kmer_set.evidence.get(key).map_or(0, |value| value.count))
         .collect();
 
-    let mut edges: Vec<(u32, u32)> = Vec::new();
+    // Count (k+1)-mer transitions rather than materializing every observed
+    // adjacency. This follows the edge-centric logic used by succinct DBG
+    // assemblers and removes many one-off error branches that survive node-only
+    // abundance filtering. Mercy-rescued paths remain eligible at count one.
+    let mut edge_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     for_each_pair(read1, read2, max_pairs, |_pair_index, left, right| {
-        add_record_edges(&left.sequence, kmer_set.summary.k, &index, &mut edges)?;
+        add_record_edges(
+            &left.sequence,
+            kmer_set.summary.k,
+            &index,
+            &mut edge_counts,
+        )?;
         if let Some(right) = right {
-            add_record_edges(&right.sequence, kmer_set.summary.k, &index, &mut edges)?;
+            add_record_edges(
+                &right.sequence,
+                kmer_set.summary.k,
+                &index,
+                &mut edge_counts,
+            )?;
         }
         Ok(())
     })?;
+
+    let min_edge_count = kmer_set.summary.min_count.max(1);
+    let mut edges: Vec<(u32, u32)> = edge_counts
+        .into_iter()
+        .filter_map(|((source, target), support)| {
+            let source_key = keys[(source / 2) as usize];
+            let target_key = keys[(target / 2) as usize];
+            let mercy_edge = kmer_set.rescued.contains(&source_key)
+                || kmer_set.rescued.contains(&target_key);
+            (support >= min_edge_count || mercy_edge).then_some((source, target))
+        })
+        .collect();
     edges.sort_unstable();
-    edges.dedup();
 
     let state_count = keys.len() * 2;
     let mut out_offsets = vec![0_u64; state_count + 1];
@@ -175,7 +200,7 @@ fn add_record_edges(
     sequence: &[u8],
     k: usize,
     index: &FxHashMap<KmerKey, u32>,
-    edges: &mut Vec<(u32, u32)>,
+    edge_counts: &mut FxHashMap<(u32, u32), u32>,
 ) -> Result<()> {
     let kmers = canonical_kmers(sequence, k)?;
     for pair in kmers.windows(2) {
@@ -190,11 +215,15 @@ fn add_record_edges(
         };
         let left_state = oriented_state(left_id, left);
         let right_state = oriented_state(right_id, right);
-        edges.push((left_state, right_state));
-        edges.push((
-            RawGraph::reverse_state(right_state),
-            RawGraph::reverse_state(left_state),
-        ));
+        let forward = edge_counts.entry((left_state, right_state)).or_insert(0);
+        *forward = forward.saturating_add(1);
+        let reverse = edge_counts
+            .entry((
+                RawGraph::reverse_state(right_state),
+                RawGraph::reverse_state(left_state),
+            ))
+            .or_insert(0);
+        *reverse = reverse.saturating_add(1);
     }
     Ok(())
 }
