@@ -26,6 +26,7 @@ impl KmerEvidence {
 #[derive(Clone, Debug, Serialize)]
 pub struct KmerCountSummary {
     pub k: usize,
+    pub min_count: u32,
     pub read_pairs: usize,
     pub observations: u64,
     pub distinct: usize,
@@ -144,6 +145,7 @@ pub fn count_and_filter(
 
     let summary = KmerCountSummary {
         k,
+        min_count,
         read_pairs,
         observations,
         distinct: evidence.len(),
