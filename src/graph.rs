@@ -341,7 +341,10 @@ fn push_unitig(
 fn build_unitig_adjacency(unitigs: &[Unitig]) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
     let mut starts: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for unitig in unitigs {
-        starts.entry(unitig.start_state).or_default().push(unitig.id);
+        starts
+            .entry(unitig.start_state)
+            .or_default()
+            .push(unitig.id);
     }
 
     let mut edges = Vec::new();
