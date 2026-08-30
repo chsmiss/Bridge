@@ -1,0 +1,115 @@
+name: One-shot bubble safety fix
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/one-shot-bubble-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgeasm-rust-v0
+          fetch-depth: 0
+      - name: Apply correctness and CI fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          assembler = Path('src/assembler.rs')
+          text = assembler.read_text()
+          old = '''    let mut excluded = FxHashSet::default();
+    for alleles in groups.values() {
+        let Some(primary) = alleles.iter().copied().max_by(|left, right| {
+            left.mean_coverage
+                .total_cmp(&right.mean_coverage)
+                .then_with(|| {
+                    (left.left_support + left.right_support)
+                        .cmp(&(right.left_support + right.right_support))
+                })
+                .then_with(|| right.unitig_id.cmp(&left.unitig_id))
+        }) else {
+            continue;
+        };
+        for allele in alleles {
+            if allele.unitig_id != primary.unitig_id {
+                excluded.insert(allele.unitig_id);
+            }
+        }
+    }
+'''
+          new = '''    let mut excluded = FxHashSet::default();
+    for alleles in groups.values() {
+        // Only collapse an alternate allele in the primary walk when at least
+        // two alleles are independently supported on both sides. Merely sharing
+        // start/end states is insufficient: repeats and orientation artefacts
+        // can otherwise make a linear genome look like a bubble and truncate
+        // the primary assembly.
+        let supported: Vec<&BubbleAllele> = alleles
+            .iter()
+            .copied()
+            .filter(|allele| allele.physically_flanked)
+            .collect();
+        if supported.len() < 2 {
+            continue;
+        }
+        let Some(primary) = supported.iter().copied().max_by(|left, right| {
+            left.mean_coverage
+                .total_cmp(&right.mean_coverage)
+                .then_with(|| {
+                    (left.left_support + left.right_support)
+                        .cmp(&(right.left_support + right.right_support))
+                })
+                .then_with(|| right.unitig_id.cmp(&left.unitig_id))
+        }) else {
+            continue;
+        };
+        for allele in supported {
+            if allele.unitig_id != primary.unitig_id {
+                excluded.insert(allele.unitig_id);
+            }
+        }
+    }
+'''
+          if old not in text:
+              raise SystemExit('expected bubble-collapse block was not found')
+          assembler.write_text(text.replace(old, new, 1))
+
+          ci = Path('.github/workflows/ci.yml')
+          text = ci.read_text()
+          text = text.replace('permissions:\n  contents: write\n\n', 'permissions:\n  contents: read\n\n')
+          old_ci = '''      - name: Format
+        run: cargo fmt --all
+      - name: Commit formatting on development branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/codex/bridgeasm-rust-v0'
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src tests
+            git commit -m "style: apply rustfmt"
+            git push
+          fi
+'''
+          new_ci = '''      - name: Format
+        run: cargo fmt --all -- --check
+'''
+          if old_ci not in text:
+              raise SystemExit('expected CI formatting block was not found')
+          ci.write_text(text.replace(old_ci, new_ci, 1))
+
+          Path('.github/workflows/one-shot-bubble-fix.yml').unlink()
+          PY
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/assembler.rs .github/workflows/ci.yml .github/workflows/one-shot-bubble-fix.yml
+          git commit -m "fix: require physical support before collapsing bubble alleles"
+          git push origin HEAD:codex/bridgeasm-rust-v0
