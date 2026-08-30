@@ -52,28 +52,8 @@ if count != 1:
     raise SystemExit(f"bubble block replacements: {count}")
 assembler.write_text(text)
 
-ci = Path(".github/workflows/ci.yml")
-text = ci.read_text()
-text = text.replace(
-    "permissions:\n  contents: write\n\n",
-    "permissions:\n  contents: read\n\n",
-)
-pattern = re.compile(
-    r"      - name: Format\n"
-    r"        run: cargo fmt --all\n"
-    r"      - name: Commit formatting on development branch\n.*?"
-    r"            git push\n",
-    re.S,
-)
-text, count = pattern.subn(
-    "      - name: Format\n        run: cargo fmt --all -- --check\n",
-    text,
-    count=1,
-)
-if count != 1:
-    raise SystemExit(f"CI formatting block replacements: {count}")
-ci.write_text(text)
-
+# These files are temporary implementation scaffolding and must not remain in
+# the production branch. The workflow itself is removed separately through
+# the GitHub API because Actions tokens cannot modify workflow files.
 Path(".github/patches/bubble-safety.patch").unlink(missing_ok=True)
-Path(".github/workflows/one-shot-bubble-fix.yml").unlink(missing_ok=True)
 Path(".github/scripts/apply_bubble_fix.py").unlink(missing_ok=True)
