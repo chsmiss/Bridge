@@ -1,0 +1,13 @@
+/target/
+/data/
+/benchmark/
+/references/
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.sam
+*.cram
+*.tmp
+.DS_Store
