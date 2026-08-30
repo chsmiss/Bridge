@@ -96,9 +96,8 @@ impl KmerKey {
         }
         let mut value = Self::ZERO;
         for &base in sequence {
-            let bits = base_bits(base).ok_or_else(|| {
-                anyhow::anyhow!("invalid DNA base in k-mer: {}", base as char)
-            })?;
+            let bits = base_bits(base)
+                .ok_or_else(|| anyhow::anyhow!("invalid DNA base in k-mer: {}", base as char))?;
             value.shift_left_two();
             value.words[0] |= u64::from(bits);
         }

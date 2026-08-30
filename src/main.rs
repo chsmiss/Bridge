@@ -6,7 +6,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "bridgeasm", version, about = "Evidence-aware short-read metagenome assembler")]
+#[command(
+    name = "bridgeasm",
+    version,
+    about = "Evidence-aware short-read metagenome assembler"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -49,7 +49,8 @@ fn write_fasta<'a, I>(path: &Path, records: I) -> Result<()>
 where
     I: IntoIterator<Item = (String, &'a [u8])>,
 {
-    let file = File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     for (header, sequence) in records {
         writeln!(writer, ">{header}")?;
@@ -63,7 +64,8 @@ where
 }
 
 fn write_gfa(product: &AssemblyProduct, path: &Path) -> Result<()> {
-    let file = File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writeln!(writer, "H\tVN:Z:1.0")?;
     for unitig in &product.unitig_graph.unitigs {
@@ -85,11 +87,7 @@ fn write_gfa(product: &AssemblyProduct, path: &Path) -> Result<()> {
         writeln!(
             writer,
             "L\tu{}\t+\tu{}\t+\t{}M\tDR:i:{}\tPE:i:{}",
-            source,
-            target,
-            product.unitig_graph.k,
-            evidence.direct_reads,
-            evidence.read_pairs
+            source, target, product.unitig_graph.k, evidence.direct_reads, evidence.read_pairs
         )?;
     }
     writer.flush()?;

@@ -1,6 +1,8 @@
 use crate::dna::{canonical_kmers, reverse_complement};
 use crate::fastq::for_each_pair;
-use crate::graph::{build_raw_graph, compact_unitigs, summarize, GraphSummary, RawGraph, UnitigGraph};
+use crate::graph::{
+    build_raw_graph, compact_unitigs, summarize, GraphSummary, RawGraph, UnitigGraph,
+};
 use crate::kmer::{count_and_filter, KmerCountSummary};
 use anyhow::{Context, Result};
 use rayon::ThreadPoolBuilder;
@@ -85,7 +87,10 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         config.mercy_min_support,
         config.max_pairs,
     )?;
-    timings.insert("kmer_count_filter".to_string(), started.elapsed().as_secs_f64());
+    timings.insert(
+        "kmer_count_filter".to_string(),
+        started.elapsed().as_secs_f64(),
+    );
 
     let started = Instant::now();
     let raw_graph = build_raw_graph(
@@ -99,7 +104,10 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
     let started = Instant::now();
     let unitig_graph = compact_unitigs(&raw_graph);
     let graph_summary = summarize(&raw_graph, &unitig_graph);
-    timings.insert("unitig_compaction".to_string(), started.elapsed().as_secs_f64());
+    timings.insert(
+        "unitig_compaction".to_string(),
+        started.elapsed().as_secs_f64(),
+    );
 
     let started = Instant::now();
     let (transitions, threaded_reads, threaded_pairs) = thread_reads(
@@ -109,21 +117,21 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         &unitig_graph,
         config.max_pairs,
     )?;
-    timings.insert("read_pair_threading".to_string(), started.elapsed().as_secs_f64());
+    timings.insert(
+        "read_pair_threading".to_string(),
+        started.elapsed().as_secs_f64(),
+    );
 
     let started = Instant::now();
-    let primary_paths = safe_primary_paths(
-        &unitig_graph,
-        &transitions,
-        config.min_read_support,
+    let primary_paths = safe_primary_paths(&unitig_graph, &transitions, config.min_read_support);
+    let mut primary_sequences =
+        deduplicate_primary_sequences(&unitig_graph, &primary_paths, config.min_contig_length);
+    primary_sequences
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+    timings.insert(
+        "safe_walk_emission".to_string(),
+        started.elapsed().as_secs_f64(),
     );
-    let mut primary_sequences = deduplicate_primary_sequences(
-        &unitig_graph,
-        &primary_paths,
-        config.min_contig_length,
-    );
-    primary_sequences.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-    timings.insert("safe_walk_emission".to_string(), started.elapsed().as_secs_f64());
 
     let mut primary_lengths: Vec<usize> = primary_sequences.iter().map(Vec::len).collect();
     let primary_bases = primary_lengths.iter().sum();
@@ -290,7 +298,8 @@ fn safe_primary_paths(
         if used[start as usize] {
             continue;
         }
-        let is_internal = incoming[start as usize].len() == 1 && outgoing[start as usize].len() == 1;
+        let is_internal =
+            incoming[start as usize].len() == 1 && outgoing[start as usize].len() == 1;
         if is_internal {
             continue;
         }
@@ -350,7 +359,11 @@ fn deduplicate_primary_sequences(
             continue;
         }
         let reverse = reverse_complement(&sequence);
-        let canonical = if reverse < sequence { reverse } else { sequence };
+        let canonical = if reverse < sequence {
+            reverse
+        } else {
+            sequence
+        };
         if seen.insert(canonical.clone()) {
             sequences.push(canonical);
         }

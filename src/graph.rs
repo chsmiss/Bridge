@@ -43,7 +43,9 @@ impl RawGraph {
         if state & 1 == 0 {
             self.keys[node].to_sequence(self.k)
         } else {
-            self.keys[node].reverse_complement(self.k).to_sequence(self.k)
+            self.keys[node]
+                .reverse_complement(self.k)
+                .to_sequence(self.k)
         }
     }
 }
@@ -204,13 +206,7 @@ pub fn compact_unitigs(graph: &RawGraph) -> UnitigGraph {
     for node in 0..graph.keys.len() as u32 {
         let state = node * 2;
         if graph.indegree[state as usize] == 0 && graph.outdegree(state) == 0 {
-            push_unitig(
-                graph,
-                vec![state],
-                false,
-                &mut unitigs,
-                &mut edge_to_unitig,
-            );
+            push_unitig(graph, vec![state], false, &mut unitigs, &mut edge_to_unitig);
         }
     }
 

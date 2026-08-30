@@ -53,7 +53,13 @@ pub fn count_and_filter(
     let mut observations = 0_u64;
 
     let read_pairs = for_each_pair(read1, read2, max_pairs, |_index, left, right| {
-        count_record(&left.sequence, &left.quality, k, &mut evidence, &mut observations)?;
+        count_record(
+            &left.sequence,
+            &left.quality,
+            k,
+            &mut evidence,
+            &mut observations,
+        )?;
         if let Some(right) = right {
             count_record(
                 &right.sequence,
