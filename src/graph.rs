@@ -147,13 +147,12 @@ pub fn build_raw_graph(
         .map(|key| kmer_set.evidence.get(key).map_or(0, |value| value.count))
         .collect();
 
-    // Count (k+1)-mer transitions rather than materializing every observed
-    // adjacency. A single sequencing substitution normally creates weak
-    // endpoint k-mers, so a once-observed edge whose two endpoints both passed
-    // the independent-fragment and quality gates is substantially stronger
-    // evidence than an arbitrary singleton edge. Retain that edge to avoid
-    // shredding genuinely sparse sequence; ambiguous exits are still resolved
-    // later by full-read and paired-fragment evidence.
+    // Count observed (k+1)-mer transitions. Edges passing the normal abundance
+    // threshold and mercy paths form the base graph. A once-observed edge whose
+    // endpoints are both independently solid is rescued only when it is the
+    // unique missing continuation on both sides and therefore cannot create a
+    // new branch. This retains low-depth linear sequence without repeating the
+    // broad singleton-edge experiment that increased fragmentation at k=21.
     let mut edge_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     for_each_pair(read1, read2, max_pairs, |_pair_index, left, right| {
         add_record_edges(&left.sequence, kmer_set.summary.k, &index, &mut edge_counts)?;
@@ -168,28 +167,51 @@ pub fn build_raw_graph(
         Ok(())
     })?;
 
+    let state_count = keys.len() * 2;
     let min_edge_count = kmer_set.summary.min_count.max(1);
-    let mut singleton_solid_edges = 0_usize;
-    let mut edges = Vec::with_capacity(edge_counts.len());
+    let mut base_edges = Vec::new();
+    let mut weak_candidates = Vec::new();
     for ((source, target), support) in edge_counts {
         let source_key = keys[(source / 2) as usize];
         let target_key = keys[(target / 2) as usize];
         let source_rescued = kmer_set.rescued.contains(&source_key);
         let target_rescued = kmer_set.rescued.contains(&target_key);
         let mercy_edge = source_rescued || target_rescued;
-        let both_solid = !source_rescued && !target_rescued;
-        let retain = support >= min_edge_count || mercy_edge || both_solid;
-        if !retain {
-            continue;
+        if support >= min_edge_count || mercy_edge {
+            base_edges.push((source, target));
+        } else if !source_rescued && !target_rescued {
+            weak_candidates.push((source, target));
         }
-        if support < min_edge_count && both_solid {
+    }
+
+    let mut base_out = vec![0_u32; state_count];
+    let mut base_in = vec![0_u32; state_count];
+    for &(source, target) in &base_edges {
+        base_out[source as usize] = base_out[source as usize].saturating_add(1);
+        base_in[target as usize] = base_in[target as usize].saturating_add(1);
+    }
+    let mut weak_out = vec![0_u32; state_count];
+    let mut weak_in = vec![0_u32; state_count];
+    for &(source, target) in &weak_candidates {
+        weak_out[source as usize] = weak_out[source as usize].saturating_add(1);
+        weak_in[target as usize] = weak_in[target as usize].saturating_add(1);
+    }
+
+    let mut singleton_solid_edges = 0_usize;
+    let mut edges = base_edges;
+    for (source, target) in weak_candidates {
+        let unique_missing_continuation = base_out[source as usize] == 0
+            && base_in[target as usize] == 0
+            && weak_out[source as usize] == 1
+            && weak_in[target as usize] == 1;
+        if unique_missing_continuation {
+            edges.push((source, target));
             singleton_solid_edges += 1;
         }
-        edges.push((source, target));
     }
     edges.sort_unstable();
+    edges.dedup();
 
-    let state_count = keys.len() * 2;
     let mut out_offsets = vec![0_u64; state_count + 1];
     let mut indegree = vec![0_u32; state_count];
     for &(source, target) in &edges {
