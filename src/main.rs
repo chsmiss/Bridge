@@ -38,6 +38,10 @@ enum Command {
         min_read_support: u32,
         #[arg(long, default_value_t = 2)]
         min_pair_support: u32,
+        #[arg(long, default_value_t = 5)]
+        min_primary_support: u32,
+        #[arg(long, default_value_t = 0.75)]
+        primary_dominance: f32,
         #[arg(long, default_value_t = 200)]
         min_contig_length: usize,
         #[arg(long)]
@@ -60,6 +64,8 @@ fn main() -> Result<()> {
             mercy_min_support,
             min_read_support,
             min_pair_support,
+            min_primary_support,
+            primary_dominance,
             min_contig_length,
             max_pairs,
             threads,
@@ -77,6 +83,8 @@ fn main() -> Result<()> {
                 mercy_min_support,
                 min_read_support,
                 min_pair_support,
+                min_primary_support,
+                primary_dominance,
                 min_contig_length,
                 max_pairs,
                 threads,
@@ -84,10 +92,12 @@ fn main() -> Result<()> {
             let product = assemble(&config)?;
             write_outputs(&product, &output)?;
             eprintln!(
-                "assembled {} primary contigs (N50 {}, total {} bp)",
+                "assembled {} primary contigs (N50 {}, total {} bp), {} bubbles / {} haplotigs",
                 product.stats.primary_contigs,
                 product.stats.primary_n50,
-                product.stats.primary_bases
+                product.stats.primary_bases,
+                product.stats.simple_bubbles,
+                product.stats.haplotigs
             );
         }
     }
