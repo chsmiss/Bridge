@@ -7,7 +7,7 @@ BridgeAsm is an experimental Rust assembler for Illumina paired-end metagenomes.
 ## Current algorithm
 
 1. Stream FASTQ/FASTQ.GZ without retaining all reads.
-2. Count exact canonical packed k-mers (`k <= 127`).
+2. Count exact canonical packed k-mers (`k <= 147`), covering standard 150 bp Illumina reads.
 3. Apply quality- and independent-fragment-aware solid-k-mer filtering.
 4. Rescue short weak paths between solid anchors with anchored mercy.
 5. Build an edge-centric bidirected de Bruijn graph using canonical nodes plus an orientation bit.
@@ -62,7 +62,8 @@ The repository includes deterministic GitHub Actions workflows for:
 
 - synthetic major/minor strain regression;
 - a real ERR2935805 Zymo Log subset against MEGAHIT and metaSPAdes;
-- MetaQUAST evaluation against the Zymo reference collection.
+- MetaQUAST evaluation against the Zymo reference collection;
+- a 500,000-pair recovery sweep over `k=21,31,51,91,147`, including exact reverse-complement-aware unions across k values.
 
 See [`docs/benchmark_zymo_subset.md`](docs/benchmark_zymo_subset.md) for measured results and negative ablations.
 
@@ -86,6 +87,7 @@ A fifth argument limits the run to the first N read pairs for capacity testing.
 - Minor and low-depth paths are not deleted merely because coverage is lower or a path disappears at larger k.
 - Weak-edge rescue must improve reference recovery without increasing switches or misassemblies; otherwise it is rejected.
 - Exact contigs and N-gap scaffolds remain separate products.
+- Cross-k union benchmarks are diagnostic recovery layers, not automatically promoted to a production primary assembly.
 - Every optimization must preserve deterministic synthetic regression results.
 
 ## Near-term roadmap
