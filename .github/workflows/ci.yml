@@ -46,10 +46,16 @@ jobs:
             -2 /tmp/bridgeasm-smoke/reads_R2.fastq.gz \
             -o /tmp/bridgeasm-out \
             -k 31 --min-count 2 --mercy-max-kmers 16 \
-            --min-read-support 2 --min-contig-length 100
+            --min-read-support 2 --min-primary-support 5 \
+            --primary-dominance 0.75 --min-contig-length 100
           test -s /tmp/bridgeasm-out/primary_contigs.fasta
+          test -s /tmp/bridgeasm-out/variants.fasta
           python3 scripts/evaluate_synthetic.py \
             --major /tmp/bridgeasm-smoke/major.fasta \
             --minor /tmp/bridgeasm-smoke/minor.fasta \
             --variants /tmp/bridgeasm-smoke/minor_variants.tsv \
-            --contigs /tmp/bridgeasm-out/primary_contigs.fasta
+            --contigs /tmp/bridgeasm-out/primary_contigs.fasta \
+            --additional /tmp/bridgeasm-out/variants.fasta \
+            --additional /tmp/bridgeasm-out/haplotigs.fasta | tee /tmp/bridgeasm-evaluation.tsv
+          awk -F '\t' '$1 == "minor_variant_recall" { found=1; if ($2 + 0 <= 0) exit 1 } END { if (!found) exit 1 }' \
+            /tmp/bridgeasm-evaluation.tsv
