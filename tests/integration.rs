@@ -47,6 +47,18 @@ fn config(reads: std::path::PathBuf, output: std::path::PathBuf, k: usize) -> As
     }
 }
 
+fn deterministic_genome(length: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    (0..length)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            b"ACGT"[((state >> 32) & 3) as usize]
+        })
+        .collect()
+}
+
 #[test]
 fn assembles_a_linear_genome() {
     let directory = tempfile::tempdir().unwrap();
@@ -73,6 +85,22 @@ fn supports_k_greater_than_31() {
 
     assert!(product.stats.primary_contigs >= 1);
     assert!(product.stats.graph.canonical_nodes > 0);
+}
+
+#[test]
+fn supports_k147_on_standard_150bp_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let reads = directory.path().join("reads.fastq");
+    let output = directory.path().join("out");
+    let genome = deterministic_genome(420);
+    write_reads(&reads, &genome, 150, 1);
+
+    let product = assemble(&config(reads, output, 147)).unwrap();
+
+    assert!(product.stats.graph.canonical_nodes > 0);
+    assert!(product.stats.graph.unitigs > 0);
+    assert!(product.stats.primary_contigs >= 1);
+    assert!(product.stats.largest_primary >= 150);
 }
 
 #[test]
