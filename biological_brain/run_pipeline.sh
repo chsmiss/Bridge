@@ -125,7 +125,7 @@ fi
 
 (
   cd "${ROOT}"
-  cargo "${CARGO_ARGS[@]:1}" -- \
+  cargo "${CARGO_ARGS[@]}" -- \
     --gfa "${GFA}" \
     --edge-evidence "${OUTPUT_DIR}/protein_evidence.tsv" \
     --dna-lm-scores "${OUTPUT_DIR}/dna_lm.tsv" \
