@@ -186,8 +186,13 @@ fn write_gfa(product: &AssemblyProduct, path: &Path) -> Result<()> {
                 .unwrap_or_default();
             writeln!(
                 writer,
-                "L\tu{}\t+\tu{}\t+\t{}M\tDR:i:{}\tPE:i:{}",
-                source, target, product.unitig_graph.k, evidence.direct_reads, evidence.read_pairs
+                "L\tu{}\t+\tu{}\t+\t{}M\tDR:i:{}\tGR:i:{}\tPE:i:{}",
+                source,
+                target,
+                product.unitig_graph.k,
+                evidence.direct_reads,
+                evidence.gapped_reads,
+                evidence.read_pairs
             )?;
         }
     }

@@ -89,6 +89,13 @@ impl UnitigGraph {
         self.out_range(unitig).len()
     }
 
+    #[inline]
+    pub fn has_edge(&self, source: u32, target: u32) -> bool {
+        self.out_targets[self.out_range(source)]
+            .binary_search(&target)
+            .is_ok()
+    }
+
     pub fn incoming_at_state(&self, state: u32) -> Vec<u32> {
         self.unitigs
             .iter()

@@ -33,6 +33,7 @@ pub struct AssembleConfig {
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct TransitionEvidence {
     pub direct_reads: u32,
+    pub gapped_reads: u32,
     pub read_pairs: u32,
 }
 
@@ -51,6 +52,13 @@ struct PathSelectionConfig {
     min_primary_support: u32,
     min_count: u32,
     dominance: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ThreadedSegment {
+    unitigs: Vec<u32>,
+    start_edge_position: usize,
+    end_edge_position: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -78,6 +86,7 @@ pub struct AssemblyStats {
     pub threaded_reads: u64,
     pub threaded_pairs: u64,
     pub direct_transitions: usize,
+    pub gapped_transitions: usize,
     pub pair_bridges: usize,
     pub dominant_transitions: usize,
     pub simple_bubbles: usize,
@@ -213,6 +222,10 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         .values()
         .filter(|evidence| evidence.direct_reads > 0)
         .count();
+    let gapped_transitions = transitions
+        .values()
+        .filter(|evidence| evidence.gapped_reads > 0)
+        .count();
     let pair_bridges = transitions
         .values()
         .filter(|evidence| evidence.read_pairs >= config.min_pair_support)
@@ -235,6 +248,7 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         threaded_reads,
         threaded_pairs,
         direct_transitions,
+        gapped_transitions,
         pair_bridges,
         dominant_transitions,
         simple_bubbles,
@@ -279,14 +293,14 @@ fn thread_reads(
         let left_segments = thread_record(&left.sequence, graph.k, &node_index, unitigs)?;
         if !left_segments.is_empty() {
             threaded_reads += 1;
-            add_direct_transitions(&left_segments, &mut transitions);
+            add_direct_transitions(&left_segments, unitigs, &mut transitions);
         }
 
         if let Some(right) = right {
             let right_segments = thread_record(&right.sequence, graph.k, &node_index, unitigs)?;
             if !right_segments.is_empty() {
                 threaded_reads += 1;
-                add_direct_transitions(&right_segments, &mut transitions);
+                add_direct_transitions(&right_segments, unitigs, &mut transitions);
             }
             if let (Some(left_end), Some(right_start)) = (
                 last_threaded_unitig(&left_segments),
@@ -314,13 +328,16 @@ fn thread_record(
     k: usize,
     node_index: &FxHashMap<crate::dna::KmerKey, u32>,
     unitigs: &UnitigGraph,
-) -> Result<Vec<Vec<u32>>> {
+) -> Result<Vec<ThreadedSegment>> {
     let kmers = canonical_kmers(sequence, k)?;
     let mut segments = Vec::new();
     let mut current = Vec::new();
+    let mut segment_start = None;
+    let mut segment_end = 0_usize;
 
     for pair in kmers.windows(2) {
-        let unitig_id = if pair[1].position == pair[0].position + 1 {
+        let edge_position = pair[0].position;
+        let unitig_id = if pair[1].position == edge_position + 1 {
             let ids = (node_index.get(&pair[0].key), node_index.get(&pair[1].key));
             match ids {
                 (Some(&left_id), Some(&right_id)) => {
@@ -339,46 +356,95 @@ fn thread_record(
 
         match unitig_id {
             Some(unitig_id) => {
+                segment_start.get_or_insert(edge_position);
+                segment_end = edge_position;
                 if current.last().copied() != Some(unitig_id) {
                     current.push(unitig_id);
                 }
             }
             None => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
-                }
+                flush_threaded_segment(&mut segments, &mut current, &mut segment_start, segment_end)
             }
         }
     }
-    if !current.is_empty() {
-        segments.push(current);
-    }
+    flush_threaded_segment(&mut segments, &mut current, &mut segment_start, segment_end);
     Ok(segments)
 }
 
-fn last_threaded_unitig(segments: &[Vec<u32>]) -> Option<u32> {
-    segments.last().and_then(|segment| segment.last()).copied()
+fn flush_threaded_segment(
+    segments: &mut Vec<ThreadedSegment>,
+    current: &mut Vec<u32>,
+    segment_start: &mut Option<usize>,
+    segment_end: usize,
+) {
+    if current.is_empty() {
+        *segment_start = None;
+        return;
+    }
+    let start_edge_position = segment_start.take().unwrap_or(segment_end);
+    segments.push(ThreadedSegment {
+        unitigs: std::mem::take(current),
+        start_edge_position,
+        end_edge_position: segment_end,
+    });
 }
 
-fn first_molecular_unitig(segments: &[Vec<u32>], unitigs: &UnitigGraph) -> Option<u32> {
+fn last_threaded_unitig(segments: &[ThreadedSegment]) -> Option<u32> {
     segments
         .last()
-        .and_then(|segment| segment.last())
+        .and_then(|segment| segment.unitigs.last())
+        .copied()
+}
+
+fn first_molecular_unitig(segments: &[ThreadedSegment], unitigs: &UnitigGraph) -> Option<u32> {
+    segments
+        .last()
+        .and_then(|segment| segment.unitigs.last())
         .map(|&unitig_id| unitigs.reverse_unitig[unitig_id as usize])
 }
 
 fn add_direct_transitions(
-    segments: &[Vec<u32>],
+    segments: &[ThreadedSegment],
+    unitigs: &UnitigGraph,
     transitions: &mut FxHashMap<(u32, u32), TransitionEvidence>,
 ) {
-    for path in segments {
-        for pair in path.windows(2) {
+    for segment in segments {
+        for pair in segment.unitigs.windows(2) {
             if pair[0] == pair[1] {
                 continue;
             }
             let evidence = transitions.entry((pair[0], pair[1])).or_default();
             evidence.direct_reads = evidence.direct_reads.saturating_add(1);
         }
+    }
+
+    // Exact k-mer threading can be interrupted by a short filtered or
+    // low-quality window even when the same read anchors the two adjacent
+    // unitigs. Recover only a single existing UnitigGraph edge and only across
+    // a very short gap; this adds physical evidence without inventing graph
+    // topology or searching arbitrary alternative paths.
+    const MAX_GAPPED_EDGE_KMERS: usize = 4;
+    for pair in segments.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        let Some(&source) = left.unitigs.last() else {
+            continue;
+        };
+        let Some(&target) = right.unitigs.first() else {
+            continue;
+        };
+        if source == target {
+            continue;
+        }
+        let missing_edges = right
+            .start_edge_position
+            .saturating_sub(left.end_edge_position.saturating_add(1));
+        if missing_edges > MAX_GAPPED_EDGE_KMERS || !unitigs.has_edge(source, target) {
+            continue;
+        }
+        let evidence = transitions.entry((source, target)).or_default();
+        evidence.direct_reads = evidence.direct_reads.saturating_add(1);
+        evidence.gapped_reads = evidence.gapped_reads.saturating_add(1);
     }
 }
 
@@ -804,5 +870,78 @@ mod transition_selection_tests {
     fn ambiguous_physical_evidence_remains_unresolved() {
         let candidates = [candidate(3, 0, 5, true), candidate(4, 0, 4, true)];
         assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), None);
+    }
+}
+
+#[cfg(test)]
+mod gapped_threading_tests {
+    use super::*;
+    use crate::graph::{Unitig, UnitigGraph};
+
+    fn unitig(id: u32) -> Unitig {
+        Unitig {
+            id,
+            states: Vec::new(),
+            sequence: b"ACGT".to_vec(),
+            start_state: id,
+            end_state: id + 1,
+            length: 4,
+            mean_coverage: 3.0,
+            min_coverage: 3,
+            max_coverage: 3,
+            circular: false,
+        }
+    }
+
+    fn two_unitig_graph(linked: bool) -> UnitigGraph {
+        UnitigGraph {
+            k: 3,
+            unitigs: vec![unitig(0), unitig(1)],
+            edge_to_unitig: FxHashMap::default(),
+            reverse_unitig: vec![0, 1],
+            out_offsets: if linked { vec![0, 1, 1] } else { vec![0, 0, 0] },
+            out_targets: if linked { vec![1] } else { Vec::new() },
+            indegree: if linked { vec![0, 1] } else { vec![0, 0] },
+        }
+    }
+
+    #[test]
+    fn short_gap_on_existing_edge_adds_physical_transition() {
+        let segments = vec![
+            ThreadedSegment {
+                unitigs: vec![0],
+                start_edge_position: 0,
+                end_edge_position: 2,
+            },
+            ThreadedSegment {
+                unitigs: vec![1],
+                start_edge_position: 5,
+                end_edge_position: 6,
+            },
+        ];
+        let mut transitions = FxHashMap::default();
+        add_direct_transitions(&segments, &two_unitig_graph(true), &mut transitions);
+        let evidence = transitions.get(&(0, 1)).copied().unwrap_or_default();
+        assert_eq!(evidence.direct_reads, 1);
+        assert_eq!(evidence.gapped_reads, 1);
+    }
+
+    #[test]
+    fn gap_does_not_create_missing_graph_edge() {
+        let segments = vec![
+            ThreadedSegment {
+                unitigs: vec![0],
+                start_edge_position: 0,
+                end_edge_position: 2,
+            },
+            ThreadedSegment {
+                unitigs: vec![1],
+                start_edge_position: 5,
+                end_edge_position: 6,
+            },
+        ];
+        let mut transitions = FxHashMap::default();
+        add_direct_transitions(&segments, &two_unitig_graph(false), &mut transitions);
+        assert!(!transitions.contains_key(&(0, 1)));
     }
 }
