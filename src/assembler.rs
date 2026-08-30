@@ -508,8 +508,8 @@ fn detect_simple_bubbles(
             .copied()
             .filter(|unitig| !allele_set.contains(unitig))
             .collect();
-        let unique_left = (left_candidates.len() == 1).then_some(left_candidates[0]);
-        let unique_right = (right_candidates.len() == 1).then_some(right_candidates[0]);
+        let unique_left = (left_candidates.len() == 1).then(|| left_candidates[0]);
+        let unique_right = (right_candidates.len() == 1).then(|| right_candidates[0]);
 
         for (allele_index, unitig_id) in alleles.into_iter().enumerate() {
             let unitig = &unitigs.unitigs[unitig_id as usize];
