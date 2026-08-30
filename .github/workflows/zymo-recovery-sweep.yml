@@ -1,0 +1,143 @@
+name: Zymo Log recovery sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "50000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-recovery-sweep.yml
+      - Cargo.toml
+      - src/**
+      - scripts/download_ena_subset.py
+      - scripts/fasta_stats.py
+
+concurrency:
+  group: zymo-recovery-sweep-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PAIRS: ${{ inputs.pairs || '50000' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install assembler and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+      - name: Download deterministic reads and Zymo references
+        run: |
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+      - name: Build BridgeAsm
+        run: cargo build --release
+      - name: Run BridgeAsm k21 and k31
+        run: |
+          run_bridgeasm() {
+            name=$1
+            k=$2
+            mercy=$3
+            mkdir -p "benchmark/$name"
+            /usr/bin/time -v -o "benchmark/$name.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o "benchmark/$name" -k "$k" \
+                --min-count 2 --mercy-max-kmers "$mercy" \
+                --mercy-min-support 1 --mercy-min-quality 25 \
+                --min-read-support 2 --min-pair-support 2 \
+                --min-primary-support 5 --primary-dominance 0.75 \
+                --min-contig-length 200 --threads 2
+          }
+          run_bridgeasm bridgeasm-k21 21 24
+          run_bridgeasm bridgeasm-k31 31 16
+      - name: Prepare BridgeAsm recovery layers
+        run: |
+          for name in bridgeasm-k21 bridgeasm-k31; do
+            cp "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/assemblies/$name-primary.fasta"
+            cp "benchmark/$name/unitigs.fasta" \
+              "benchmark/assemblies/$name-unitigs.fasta"
+            cp "benchmark/$name/primary_scaffolds.fasta" \
+              "benchmark/assemblies/$name-scaffolds.fasta"
+            cat "benchmark/$name/primary_contigs.fasta" \
+                "benchmark/$name/unitigs.fasta" \
+                "benchmark/$name/haplotigs.fasta" \
+              > "benchmark/assemblies/$name-all-exact.fasta"
+            cat "benchmark/$name/primary_scaffolds.fasta" \
+                "benchmark/$name/unitigs.fasta" \
+                "benchmark/$name/haplotigs.fasta" \
+                "benchmark/$name/variants.fasta" \
+              > "benchmark/assemblies/$name-all-layers.fasta"
+          done
+          cat benchmark/assemblies/bridgeasm-k21-all-exact.fasta \
+              benchmark/assemblies/bridgeasm-k31-all-exact.fasta \
+            > benchmark/assemblies/bridgeasm-multik-all-exact.fasta
+          cat benchmark/assemblies/bridgeasm-k21-all-layers.fasta \
+              benchmark/assemblies/bridgeasm-k31-all-layers.fasta \
+            > benchmark/assemblies/bridgeasm-multik-all-layers.fasta
+          for fasta in benchmark/assemblies/bridgeasm-*.fasta; do
+            base=$(basename "$fasta" .fasta)
+            python3 scripts/fasta_stats.py "$fasta" \
+              --json "benchmark/$base.stats.json" \
+              > "benchmark/$base.stats.tsv"
+          done
+      - name: Run MEGAHIT
+        run: |
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json > benchmark/megahit.stats.tsv
+      - name: Run MetaQUAST recovery sweep
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridgeasm-k21-primary.fasta \
+            benchmark/assemblies/bridgeasm-k21-unitigs.fasta \
+            benchmark/assemblies/bridgeasm-k21-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k21-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k21-all-layers.fasta \
+            benchmark/assemblies/bridgeasm-k31-primary.fasta \
+            benchmark/assemblies/bridgeasm-k31-unitigs.fasta \
+            benchmark/assemblies/bridgeasm-k31-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k31-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k31-all-layers.fasta \
+            benchmark/assemblies/bridgeasm-multik-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-multik-all-layers.fasta \
+            benchmark/assemblies/megahit.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\n' "$GITHUB_SHA" "$PAIRS" \
+            > benchmark/benchmark_provenance.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-recovery-sweep
+          path: benchmark
+          retention-days: 14
