@@ -117,9 +117,15 @@ fn main() -> Result<()> {
     }
     let mut evidence = read_edge_evidence(&cli.edge_evidence, &name_to_id)?;
     if let Some(path) = cli.esm_scores.as_ref() {
-        merge_scalar_scores(path, "esm_delta", &name_to_id, &mut evidence, |row, value| {
-            row.esm_delta = value;
-        })?;
+        merge_scalar_scores(
+            path,
+            "esm_delta",
+            &name_to_id,
+            &mut evidence,
+            |row, value| {
+                row.esm_delta = value;
+            },
+        )?;
     }
     if let Some(path) = cli.dna_lm_scores.as_ref() {
         merge_scalar_scores(
@@ -157,7 +163,10 @@ fn main() -> Result<()> {
         write_report(report, &segments, &ranked, &selected)?;
     }
 
-    let mut lengths: Vec<usize> = sequences.iter().map(|(_, sequence)| sequence.len()).collect();
+    let mut lengths: Vec<usize> = sequences
+        .iter()
+        .map(|(_, sequence)| sequence.len())
+        .collect();
     let total: usize = lengths.iter().sum();
     let n50 = n50(&mut lengths);
     let largest = lengths.iter().copied().max().unwrap_or(0);
@@ -197,9 +206,7 @@ fn validate(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn read_gfa(
-    path: &Path,
-) -> Result<(Vec<Segment>, Vec<Link>, FxHashMap<String, usize>, usize)> {
+fn read_gfa(path: &Path) -> Result<(Vec<Segment>, Vec<Link>, FxHashMap<String, usize>, usize)> {
     let reader = BufReader::new(
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
     );
@@ -234,7 +241,10 @@ fn read_gfa(
                 target: fields[3].to_string(),
                 target_orientation: fields[4].to_string(),
                 overlap: fields[5].to_string(),
-                tags: fields[6..].iter().map(|value| (*value).to_string()).collect(),
+                tags: fields[6..]
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
             }),
             _ => {}
         }
@@ -303,7 +313,11 @@ fn required_column(columns: &FxHashMap<String, usize>, name: &str) -> Result<usi
         .with_context(|| format!("TSV is missing required column {name:?}"))
 }
 
-fn optional_field<'a>(fields: &'a [&str], columns: &FxHashMap<String, usize>, name: &str) -> &'a str {
+fn optional_field<'a>(
+    fields: &'a [&str],
+    columns: &FxHashMap<String, usize>,
+    name: &str,
+) -> &'a str {
     columns
         .get(name)
         .and_then(|index| fields.get(*index))
@@ -357,30 +371,17 @@ fn read_edge_evidence(
         evidence.insert(
             (source, target),
             EdgeEvidence {
-                protein_score: parse_f32(
-                    optional_field(&fields, &columns, "protein_score"),
-                    0.0,
-                ),
-                protein_ambiguity: parse_f32(
-                    optional_field(&fields, &columns, "ambiguity"),
-                    1.0,
-                ),
+                protein_score: parse_f32(optional_field(&fields, &columns, "protein_score"), 0.0),
+                protein_ambiguity: parse_f32(optional_field(&fields, &columns, "ambiguity"), 1.0),
                 frame_consistency: parse_f32(
                     optional_field(&fields, &columns, "frame_consistency"),
                     0.0,
                 ),
-                unique_kmers: parse_u32(
-                    optional_field(&fields, &columns, "unique_kmers"),
-                    0,
-                ),
-                breakpoint_class: optional_field(&fields, &columns, "breakpoint_class")
-                    .to_string(),
+                unique_kmers: parse_u32(optional_field(&fields, &columns, "unique_kmers"), 0),
+                breakpoint_class: optional_field(&fields, &columns, "breakpoint_class").to_string(),
                 protein_id: optional_field(&fields, &columns, "protein_id").to_string(),
                 esm_delta: parse_f32(optional_field(&fields, &columns, "esm_delta"), 0.0),
-                dna_lm_delta: parse_f32(
-                    optional_field(&fields, &columns, "dna_lm_delta"),
-                    0.0,
-                ),
+                dna_lm_delta: parse_f32(optional_field(&fields, &columns, "dna_lm_delta"), 0.0),
             },
         );
     }
@@ -473,13 +474,11 @@ fn select_links(
         let eligible = match cli.mode {
             Mode::Conservative => physical && coverage_ratio >= cli.min_coverage_ratio,
             Mode::Balanced => {
-                coverage_ratio >= cli.min_coverage_ratio && (physical || protein_ok || topology_unique)
+                coverage_ratio >= cli.min_coverage_ratio
+                    && (physical || protein_ok || topology_unique)
             }
             Mode::Exploratory => {
-                physical
-                    || protein_ok
-                    || topology_unique
-                    || row.dna_lm_delta > 0.25
+                physical || protein_ok || topology_unique || row.dna_lm_delta > 0.25
             }
         };
         if !eligible {
@@ -489,8 +488,15 @@ fn select_links(
         let physical_score = f64::from(link.direct) * 1000.0
             + f64::from(link.gapped) * 420.0
             + f64::from(link.pairs) * 220.0;
-        let topology_bonus = if outgoing[link.source].len() == 1 { 220.0 } else { 0.0 }
-            + if incoming[link.target].len() == 1 { 220.0 } else { 0.0 };
+        let topology_bonus = if outgoing[link.source].len() == 1 {
+            220.0
+        } else {
+            0.0
+        } + if incoming[link.target].len() == 1 {
+            220.0
+        } else {
+            0.0
+        };
         let coverage_score = f64::from(coverage_ratio) * 650.0;
         let protein_score = if protein_ok {
             cli.protein_weight
@@ -594,11 +600,7 @@ fn build_paths(node_count: usize, successor: &FxHashMap<usize, Link>) -> Vec<Vec
     paths
 }
 
-fn extend_path(
-    start: usize,
-    successor: &FxHashMap<usize, Link>,
-    used: &mut [bool],
-) -> Vec<usize> {
+fn extend_path(start: usize, successor: &FxHashMap<usize, Link>, used: &mut [bool]) -> Vec<usize> {
     let mut path = Vec::new();
     let mut current = start;
     for _ in 0..used.len() {
