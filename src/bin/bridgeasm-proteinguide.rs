@@ -1045,14 +1045,13 @@ fn find_suffix_prefix_overlap(
     best.map(|(length, identity, _distance)| (length, identity))
 }
 
-fn select_path_cover(
-    ranked: &mut [RankedCandidate],
-    segment_count: usize,
-) -> (
+type PathCover = (
     Vec<Option<Candidate>>,
     Vec<Option<usize>>,
     Vec<Option<bool>>,
-) {
+);
+
+fn select_path_cover(ranked: &mut [RankedCandidate], segment_count: usize) -> PathCover {
     let mut successor: Vec<Option<Candidate>> = vec![None; segment_count];
     let mut predecessor = vec![None; segment_count];
     let mut orientation = vec![None; segment_count];
