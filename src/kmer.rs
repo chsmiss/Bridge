@@ -23,17 +23,6 @@ impl KmerEvidence {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct KmerFilterConfig {
-    pub k: usize,
-    pub min_count: u32,
-    pub min_fragment_support: u32,
-    pub min_mean_quality: f32,
-    pub mercy_max_kmers: usize,
-    pub mercy_min_support: u16,
-    pub mercy_min_quality: f32,
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct KmerCountSummary {
     pub k: usize,
@@ -56,9 +45,19 @@ pub struct KmerSet {
 pub fn count_and_filter(
     read1: &Path,
     read2: Option<&Path>,
-    filter: &KmerFilterConfig,
+    k: usize,
+    min_count: u32,
+    mercy_max_kmers: usize,
+    mercy_min_support: u16,
     max_pairs: Option<usize>,
 ) -> Result<KmerSet> {
+    // Keep the public API stable while making the production min-count=2 path
+    // quality- and independent-fragment-aware. Tests and explicitly permissive
+    // runs using min-count=1 retain the historical behavior.
+    let min_fragment_support = if min_count <= 1 { 1 } else { 2 };
+    let min_mean_quality = if min_count <= 1 { 0.0 } else { 20.0 };
+    let mercy_min_quality = if min_count <= 1 { 0.0 } else { 25.0 };
+
     let mut evidence: FxHashMap<KmerKey, KmerEvidence> = FxHashMap::default();
     let mut observations = 0_u64;
 
@@ -66,14 +65,14 @@ pub fn count_and_filter(
         let mut fragment_keys = Vec::with_capacity(
             left.sequence
                 .len()
-                .saturating_sub(filter.k)
+                .saturating_sub(k)
                 .saturating_add(1)
                 * if right.is_some() { 2 } else { 1 },
         );
         count_record(
             &left.sequence,
             &left.quality,
-            filter.k,
+            k,
             &mut evidence,
             &mut observations,
             &mut fragment_keys,
@@ -82,7 +81,7 @@ pub fn count_and_filter(
             count_record(
                 &right.sequence,
                 &right.quality,
-                filter.k,
+                k,
                 &mut evidence,
                 &mut observations,
                 &mut fragment_keys,
@@ -100,34 +99,34 @@ pub fn count_and_filter(
 
     let abundance_candidates = evidence
         .values()
-        .filter(|value| value.count >= filter.min_count)
+        .filter(|value| value.count >= min_count)
         .count();
     let solid: FxHashSet<KmerKey> = evidence
         .iter()
         .filter_map(|(key, value)| {
-            (value.count >= filter.min_count
-                && value.fragment_count >= filter.min_fragment_support
-                && value.mean_quality(filter.k) >= filter.min_mean_quality)
+            (value.count >= min_count
+                && value.fragment_count >= min_fragment_support
+                && value.mean_quality(k) >= min_mean_quality)
                 .then_some(*key)
         })
         .collect();
 
     let mut mercy_support: FxHashMap<KmerKey, u16> = FxHashMap::default();
-    if filter.mercy_max_kmers > 0 {
+    if mercy_max_kmers > 0 {
         for_each_pair(read1, read2, max_pairs, |_index, left, right| {
             collect_mercy_candidates(
                 &left.sequence,
-                filter.k,
+                k,
                 &solid,
-                filter.mercy_max_kmers,
+                mercy_max_kmers,
                 &mut mercy_support,
             )?;
             if let Some(right) = right {
                 collect_mercy_candidates(
                     &right.sequence,
-                    filter.k,
+                    k,
                     &solid,
-                    filter.mercy_max_kmers,
+                    mercy_max_kmers,
                     &mut mercy_support,
                 )?;
             }
@@ -139,8 +138,7 @@ pub fn count_and_filter(
         .into_iter()
         .filter_map(|(key, support)| {
             let value = evidence.get(&key)?;
-            (support >= filter.mercy_min_support
-                && value.mean_quality(filter.k) >= filter.mercy_min_quality)
+            (support >= mercy_min_support && value.mean_quality(k) >= mercy_min_quality)
                 .then_some(key)
         })
         .collect();
@@ -148,7 +146,7 @@ pub fn count_and_filter(
     retained.extend(rescued.iter().copied());
 
     let summary = KmerCountSummary {
-        k: filter.k,
+        k,
         read_pairs,
         observations,
         distinct: evidence.len(),
