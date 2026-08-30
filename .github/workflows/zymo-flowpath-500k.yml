@@ -10,6 +10,13 @@ on:
       - src/**
       - Cargo.toml
       - Cargo.lock
+  pull_request:
+    paths:
+      - src/bin/bridgeasm-flowpath.rs
+      - .github/workflows/zymo-flowpath-500k.yml
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
   workflow_dispatch:
 
 permissions:
