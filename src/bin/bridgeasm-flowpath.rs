@@ -143,7 +143,7 @@ fn read_gfa(path: &PathBuf) -> Result<(Vec<Segment>, Vec<Link>)> {
     );
     let mut segments = Vec::new();
     let mut name_to_id = FxHashMap::default();
-    let mut raw_links = Vec::new();
+    let mut raw_links: Vec<String> = Vec::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -164,13 +164,14 @@ fn read_gfa(path: &PathBuf) -> Result<(Vec<Segment>, Vec<Link>)> {
                     coverage,
                 });
             }
-            Some("L") if fields.len() >= 6 => raw_links.push(fields),
+            Some("L") if fields.len() >= 6 => raw_links.push(line),
             _ => {}
         }
     }
 
     let mut links = Vec::with_capacity(raw_links.len());
-    for fields in raw_links {
+    for line in raw_links {
+        let fields: Vec<&str> = line.split('\t').collect();
         let Some(&source) = name_to_id.get(fields[1]) else {
             continue;
         };
