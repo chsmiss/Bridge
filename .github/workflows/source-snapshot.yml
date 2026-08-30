@@ -1,5 +1,6 @@
 name: Source snapshot
 
+# Snapshot revision: greedy path-cover development.
 on:
   push:
     branches:
