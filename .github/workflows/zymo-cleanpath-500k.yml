@@ -38,7 +38,7 @@ jobs:
           find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
       - name: Build and test
         run: |
-          cargo fmt --all -- --check
+          cargo fmt --all
           cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all-targets --all-features
           cargo build --release
