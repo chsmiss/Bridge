@@ -6,16 +6,12 @@ on:
       pairs:
         description: Number of ERR2935805 read pairs
         required: false
-        default: "50000"
+        default: "500000"
   push:
     branches:
       - codex/bridgeasm-rust-v0
     paths:
       - .github/workflows/zymo-recovery-sweep.yml
-      - Cargo.toml
-      - src/**
-      - scripts/download_ena_subset.py
-      - scripts/fasta_stats.py
 
 concurrency:
   group: zymo-recovery-sweep-${{ github.ref }}
@@ -27,9 +23,9 @@ permissions:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
-      PAIRS: ${{ inputs.pairs || '50000' }}
+      PAIRS: ${{ inputs.pairs || '500000' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,7 +49,7 @@ jobs:
           test -s /tmp/zymo-references.fasta
       - name: Build BridgeAsm
         run: cargo build --release
-      - name: Run BridgeAsm k21 and k31
+      - name: Run BridgeAsm k sweep
         run: |
           run_bridgeasm() {
             name=$1
@@ -73,31 +69,53 @@ jobs:
           }
           run_bridgeasm bridgeasm-k21 21 24
           run_bridgeasm bridgeasm-k31 31 16
-      - name: Prepare BridgeAsm recovery layers
+          run_bridgeasm bridgeasm-k51 51 8
+          run_bridgeasm bridgeasm-k91 91 4
+          run_bridgeasm bridgeasm-k147 147 0
+      - name: Prepare per-k and cross-k recovery layers
         run: |
-          for name in bridgeasm-k21 bridgeasm-k31; do
+          names="bridgeasm-k21 bridgeasm-k31 bridgeasm-k51 bridgeasm-k91 bridgeasm-k147"
+          for name in $names; do
             cp "benchmark/$name/primary_contigs.fasta" \
               "benchmark/assemblies/$name-primary.fasta"
-            cp "benchmark/$name/unitigs.fasta" \
-              "benchmark/assemblies/$name-unitigs.fasta"
-            cp "benchmark/$name/primary_scaffolds.fasta" \
-              "benchmark/assemblies/$name-scaffolds.fasta"
-            cat "benchmark/$name/primary_contigs.fasta" \
-                "benchmark/$name/unitigs.fasta" \
-                "benchmark/$name/haplotigs.fasta" \
-              > "benchmark/assemblies/$name-all-exact.fasta"
-            cat "benchmark/$name/primary_scaffolds.fasta" \
-                "benchmark/$name/unitigs.fasta" \
-                "benchmark/$name/haplotigs.fasta" \
-                "benchmark/$name/variants.fasta" \
-              > "benchmark/assemblies/$name-all-layers.fasta"
+            python3 scripts/merge_fasta_unique.py \
+              "benchmark/assemblies/$name-all-exact.fasta" \
+              "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/$name/unitigs.fasta" \
+              "benchmark/$name/haplotigs.fasta" \
+              --min-length 200
+            python3 scripts/merge_fasta_unique.py \
+              "benchmark/assemblies/$name-allele-inclusive.fasta" \
+              "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/$name/unitigs.fasta" \
+              "benchmark/$name/haplotigs.fasta" \
+              "benchmark/$name/variants.fasta" \
+              --min-length 200
           done
-          cat benchmark/assemblies/bridgeasm-k21-all-exact.fasta \
-              benchmark/assemblies/bridgeasm-k31-all-exact.fasta \
-            > benchmark/assemblies/bridgeasm-multik-all-exact.fasta
-          cat benchmark/assemblies/bridgeasm-k21-all-layers.fasta \
-              benchmark/assemblies/bridgeasm-k31-all-layers.fasta \
-            > benchmark/assemblies/bridgeasm-multik-all-layers.fasta
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/assemblies/bridgeasm-multik-primary-union.fasta \
+            benchmark/assemblies/bridgeasm-k21-primary.fasta \
+            benchmark/assemblies/bridgeasm-k31-primary.fasta \
+            benchmark/assemblies/bridgeasm-k51-primary.fasta \
+            benchmark/assemblies/bridgeasm-k91-primary.fasta \
+            benchmark/assemblies/bridgeasm-k147-primary.fasta \
+            --min-length 200
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/assemblies/bridgeasm-multik-exact-union.fasta \
+            benchmark/assemblies/bridgeasm-k21-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k31-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k51-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k91-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k147-all-exact.fasta \
+            --min-length 200
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/assemblies/bridgeasm-multik-allele-union.fasta \
+            benchmark/assemblies/bridgeasm-k21-allele-inclusive.fasta \
+            benchmark/assemblies/bridgeasm-k31-allele-inclusive.fasta \
+            benchmark/assemblies/bridgeasm-k51-allele-inclusive.fasta \
+            benchmark/assemblies/bridgeasm-k91-allele-inclusive.fasta \
+            benchmark/assemblies/bridgeasm-k147-allele-inclusive.fasta \
+            --min-length 200
           for fasta in benchmark/assemblies/bridgeasm-*.fasta; do
             base=$(basename "$fasta" .fasta)
             python3 scripts/fasta_stats.py "$fasta" \
@@ -117,27 +135,28 @@ jobs:
         run: |
           python3 /tmp/quast-5.3.0/metaquast.py \
             benchmark/assemblies/bridgeasm-k21-primary.fasta \
-            benchmark/assemblies/bridgeasm-k21-unitigs.fasta \
-            benchmark/assemblies/bridgeasm-k21-scaffolds.fasta \
             benchmark/assemblies/bridgeasm-k21-all-exact.fasta \
-            benchmark/assemblies/bridgeasm-k21-all-layers.fasta \
             benchmark/assemblies/bridgeasm-k31-primary.fasta \
-            benchmark/assemblies/bridgeasm-k31-unitigs.fasta \
-            benchmark/assemblies/bridgeasm-k31-scaffolds.fasta \
             benchmark/assemblies/bridgeasm-k31-all-exact.fasta \
-            benchmark/assemblies/bridgeasm-k31-all-layers.fasta \
-            benchmark/assemblies/bridgeasm-multik-all-exact.fasta \
-            benchmark/assemblies/bridgeasm-multik-all-layers.fasta \
+            benchmark/assemblies/bridgeasm-k51-primary.fasta \
+            benchmark/assemblies/bridgeasm-k51-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k91-primary.fasta \
+            benchmark/assemblies/bridgeasm-k91-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k147-primary.fasta \
+            benchmark/assemblies/bridgeasm-k147-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-multik-primary-union.fasta \
+            benchmark/assemblies/bridgeasm-multik-exact-union.fasta \
+            benchmark/assemblies/bridgeasm-multik-allele-union.fasta \
             benchmark/assemblies/megahit.fasta \
             -r /tmp/zymo-references.fasta \
             -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
       - name: Save provenance
         run: |
           cp /tmp/zymo-log/subset_provenance.json benchmark/
-          printf 'commit\t%s\nread_pairs\t%s\n' "$GITHUB_SHA" "$PAIRS" \
-            > benchmark/benchmark_provenance.tsv
+          printf 'commit\t%s\nread_pairs\t%s\nk_values\t21,31,51,91,147\nmerge_semantics\texact_reverse_complement_deduplication\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
       - uses: actions/upload-artifact@v4
         with:
-          name: zymo-log-recovery-sweep
+          name: zymo-log-recovery-sweep-500k
           path: benchmark
           retention-days: 14
