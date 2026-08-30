@@ -144,12 +144,7 @@ pub fn build_raw_graph(
     // abundance filtering. Mercy-rescued paths remain eligible at count one.
     let mut edge_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     for_each_pair(read1, read2, max_pairs, |_pair_index, left, right| {
-        add_record_edges(
-            &left.sequence,
-            kmer_set.summary.k,
-            &index,
-            &mut edge_counts,
-        )?;
+        add_record_edges(&left.sequence, kmer_set.summary.k, &index, &mut edge_counts)?;
         if let Some(right) = right {
             add_record_edges(
                 &right.sequence,
@@ -167,8 +162,8 @@ pub fn build_raw_graph(
         .filter_map(|((source, target), support)| {
             let source_key = keys[(source / 2) as usize];
             let target_key = keys[(target / 2) as usize];
-            let mercy_edge = kmer_set.rescued.contains(&source_key)
-                || kmer_set.rescued.contains(&target_key);
+            let mercy_edge =
+                kmer_set.rescued.contains(&source_key) || kmer_set.rescued.contains(&target_key);
             (support >= min_edge_count || mercy_edge).then_some((source, target))
         })
         .collect();
