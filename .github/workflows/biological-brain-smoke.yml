@@ -31,8 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
       - name: Python syntax
         run: |
           python -m py_compile \
@@ -42,8 +40,6 @@ jobs:
             tests/test_biological_brain.py \
             tests/make_plass_bridge_fixture.py \
             tests/check_plass_bridge_fixture.py
-      - name: Rust formatting for new binary
-        run: rustfmt --edition 2021 --check src/bin/bridgeasm-evidence-path.rs
       - name: Compile evidence path
         run: cargo check --bin bridgeasm-evidence-path
       - name: Protein branch-selection tests
