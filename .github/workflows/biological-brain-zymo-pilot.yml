@@ -6,8 +6,6 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - .github/workflows/biological-brain-zymo-pilot.yml
-      - biological_brain/**
-      - src/bin/bridgeasm-evidence-path.rs
   workflow_dispatch:
     inputs:
       read_pairs:
@@ -26,7 +24,7 @@ env:
 jobs:
   matched-protein-pilot:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash -el {0}
@@ -41,6 +39,9 @@ jobs:
             -c bioconda
             python=3.11
             plass
+            prodigal
+            mmseqs2
+            quast
           cache-environment: true
           init-shell: bash
 
@@ -127,24 +128,26 @@ jobs:
                                   break
                               handle.write(line)
               lines = sum(1 for _ in open(output, 'rb'))
-              if lines < 4:
-                  raise SystemExit(f'no FASTQ records streamed from {url}')
-              if lines % 4:
-                  raise SystemExit(f'truncated FASTQ record in {output}: {lines} lines')
+              if lines < 4 or lines % 4:
+                  raise SystemExit(f'invalid FASTQ subset in {output}: {lines} lines')
               print(output, 'records=', lines // 4, 'url=', url)
           PY
           cat pilot/r1.fastq pilot/r2.fastq > pilot/reads.fastq
 
-      - name: Run Plass protein preassembly
+      - name: Run Plass protein preassembly and exact deduplication
         run: |
           mkdir -p pilot/plass_tmp
           plass assemble \
             pilot/reads.fastq \
-            pilot/plass_proteins.faa \
+            pilot/plass_proteins.raw.faa \
             pilot/plass_tmp \
             --threads 2
-          test -s pilot/plass_proteins.faa
-          echo "Plass proteins: $(grep -c '^>' pilot/plass_proteins.faa)"
+          test -s pilot/plass_proteins.raw.faa
+          python biological_brain/dedup_proteins.py \
+            pilot/plass_proteins.raw.faa \
+            pilot/plass_proteins.faa \
+            --mapping pilot/plass_proteins.dedup.tsv \
+            --json pilot/plass_proteins.dedup.json
 
       - name: Back-project protein paths to existing graph links
         run: |
@@ -158,37 +161,94 @@ jobs:
             --gfa "${MATCHED_GFA}" \
             --output pilot/dna_lm.tsv
 
-      - name: Build evidence-aware consensus paths
+      - name: Build conservative physical-only and protein-ranked paths
         run: |
-          cargo run --release --quiet --bin bridgeasm-evidence-path -- \
-            --gfa "${MATCHED_GFA}" \
-            --edge-evidence pilot/protein_evidence.tsv \
-            --dna-lm-scores pilot/dna_lm.tsv \
-            --output pilot/evidence_contigs.fasta \
-            --report pilot/evidence_path_report.tsv \
-            --mode balanced \
+          cargo build --release --bin bridgeasm-evidence-path
+          common=(
+            --gfa "${MATCHED_GFA}"
+            --edge-evidence pilot/protein_evidence.tsv
+            --mode conservative
             --min-length 200
+          )
+          target/release/bridgeasm-evidence-path \
+            "${common[@]}" \
+            --protein-weight 0 --esm-weight 0 --dna-lm-weight 0 \
+            --output pilot/physical_only.fasta \
+            --report pilot/physical_only.tsv
+          target/release/bridgeasm-evidence-path \
+            "${common[@]}" \
+            --protein-weight 2400 --esm-weight 0 --dna-lm-weight 0 \
+            --output pilot/physical_plus_plass.fasta \
+            --report pilot/physical_plus_plass.tsv
+          target/release/bridgeasm-evidence-path \
+            "${common[@]}" \
+            --dna-lm-scores pilot/dna_lm.tsv \
+            --protein-weight 2400 --esm-weight 0 --dna-lm-weight 180 \
+            --output pilot/physical_plus_plass_dna.fasta \
+            --report pilot/physical_plus_plass_dna.tsv
 
-      - name: Summarize without overclaiming reference accuracy
+      - name: Download Zymo reference genomes
         run: |
-          python biological_brain/assembly_stats.py \
-            --input "${MATCHED_GFA}" \
-            --format gfa \
-            --minimum 200 \
-            --label source_gfa_segments \
-            --output pilot/source_stats.json
-          python biological_brain/assembly_stats.py \
-            --input pilot/evidence_contigs.fasta \
-            --format fasta \
-            --minimum 200 \
-            --evidence pilot/protein_evidence.tsv \
-            --label protein_evidence_paths \
-            --output pilot/evidence_stats.json
+          curl -L --retry 3 -o pilot/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p pilot/refs
+          unzip -q pilot/zymo-refs.zip -d pilot/refs
+          find pilot/refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > pilot/reference.fasta
+          test -s pilot/reference.fasta
+
+      - name: Reference-level nucleotide evaluation
+        run: |
+          metaquast.py \
+            pilot/physical_only.fasta \
+            pilot/physical_plus_plass.fasta \
+            pilot/physical_plus_plass_dna.fasta \
+            -r pilot/reference.fasta \
+            -o pilot/metaquast \
+            --threads 2 --min-contig 200 --no-plots
+          cp pilot/metaquast/combined_reference/report.tsv pilot/nucleotide_report.tsv
+          cp pilot/metaquast/combined_reference/transposed_report.tsv pilot/nucleotide_transposed.tsv
+          cat pilot/nucleotide_report.tsv
+
+      - name: Protein recall evaluation
+        run: |
+          mkdir -p pilot/protein
+          prodigal -q -p meta -i pilot/reference.fasta -a pilot/protein/reference.faa
+          for label in physical_only physical_plus_plass physical_plus_plass_dna; do
+            prodigal -q -p meta -i "pilot/${label}.fasta" -a "pilot/protein/${label}.faa"
+            rm -rf "/tmp/mmseqs-${label}"
+            mmseqs easy-search \
+              pilot/protein/reference.faa \
+              "pilot/protein/${label}.faa" \
+              "pilot/protein/${label}.m8" \
+              "/tmp/mmseqs-${label}" \
+              --threads 2 -s 7.5 -e 1e-3 --max-seqs 50 \
+              --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
+          done
+          python scripts/protein_recall.py \
+            --reference pilot/protein/reference.faa \
+            --sample physical_only pilot/protein/physical_only.faa pilot/protein/physical_only.m8 \
+            --sample physical_plus_plass pilot/protein/physical_plus_plass.faa pilot/protein/physical_plus_plass.m8 \
+            --sample physical_plus_plass_dna pilot/protein/physical_plus_plass_dna.faa pilot/protein/physical_plus_plass_dna.m8 \
+            --min-identity 0.80 --min-query-coverage 0.80 --min-target-coverage 0.80 \
+            --json pilot/protein_recall.json \
+            | tee pilot/protein_recall.tsv
+
+      - name: Summarize edge changes and safety deltas
+        run: |
           python - <<'PY'
           import csv
           import json
           import os
           from collections import Counter
+
+          def selected(path):
+              out = set()
+              with open(path, newline='') as handle:
+                  for row in csv.DictReader(handle, delimiter='\t'):
+                      if row['selected'] == 'true':
+                          out.add((row['source'], row['target']))
+              return out
 
           classes = Counter()
           supported = 0
@@ -196,22 +256,22 @@ jobs:
               for row in csv.DictReader(handle, delimiter='\t'):
                   classes[row['breakpoint_class']] += 1
                   supported += row['breakpoint_class'] == 'same_orf_supported'
-          selected = 0
-          selected_protein = 0
-          with open('pilot/evidence_path_report.tsv', newline='') as handle:
-              for row in csv.DictReader(handle, delimiter='\t'):
-                  if row['selected'] == 'true':
-                      selected += 1
-                      selected_protein += row['protein_ok'] == 'true'
+
+          control = selected('pilot/physical_only.tsv')
+          plass = selected('pilot/physical_plus_plass.tsv')
+          fused = selected('pilot/physical_plus_plass_dna.tsv')
           summary = {
               'source_workflow': os.environ['SOURCE_WORKFLOW'],
               'source_run_id': int(os.environ['SOURCE_RUN_ID']),
-              'read_pairs': int(os.environ['PILOT_READ_PAIRS']),
+              'read_pairs_for_plass': int(os.environ['PILOT_READ_PAIRS']),
               'protein_evidence_classes': dict(classes),
               'supported_existing_edges': supported,
-              'selected_edges': selected,
-              'selected_protein_supported_edges': selected_protein,
-              'note': 'No reference-based correctness claim is made in this pilot; run MetaQUAST before accepting an N50 change.',
+              'physical_only_edges': len(control),
+              'plass_edges': len(plass),
+              'plass_edges_changed_vs_control': len(control ^ plass),
+              'fused_edges': len(fused),
+              'fused_edges_changed_vs_plass': len(plass ^ fused),
+              'safety_rule': 'All three path runs use conservative mode; only physical GFA links are eligible.',
           }
           with open('pilot/pilot_summary.json', 'w') as handle:
               json.dump(summary, handle, indent=2, sort_keys=True)
@@ -224,12 +284,21 @@ jobs:
         with:
           name: biological-brain-zymo-pilot
           path: |
+            pilot/plass_proteins.raw.faa
             pilot/plass_proteins.faa
+            pilot/plass_proteins.dedup.tsv
+            pilot/plass_proteins.dedup.json
             pilot/protein_evidence.tsv
             pilot/dna_lm.tsv
-            pilot/evidence_contigs.fasta
-            pilot/evidence_path_report.tsv
-            pilot/source_stats.json
-            pilot/evidence_stats.json
+            pilot/physical_only.fasta
+            pilot/physical_plus_plass.fasta
+            pilot/physical_plus_plass_dna.fasta
+            pilot/physical_only.tsv
+            pilot/physical_plus_plass.tsv
+            pilot/physical_plus_plass_dna.tsv
+            pilot/nucleotide_report.tsv
+            pilot/nucleotide_transposed.tsv
+            pilot/protein_recall.tsv
+            pilot/protein_recall.json
             pilot/pilot_summary.json
           if-no-files-found: warn
