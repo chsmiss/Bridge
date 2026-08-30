@@ -399,23 +399,13 @@ fn primary_paths(
     let selected_out: Vec<Option<u32>> = outgoing_candidates
         .iter()
         .map(|candidates| {
-            choose_transition(
-                candidates,
-                min_read_support,
-                min_primary_support,
-                dominance,
-            )
+            choose_transition(candidates, min_read_support, min_primary_support, dominance)
         })
         .collect();
     let selected_in: Vec<Option<u32>> = incoming_candidates
         .iter()
         .map(|candidates| {
-            choose_transition(
-                candidates,
-                min_read_support,
-                min_primary_support,
-                dominance,
-            )
+            choose_transition(candidates, min_read_support, min_primary_support, dominance)
         })
         .collect();
 
