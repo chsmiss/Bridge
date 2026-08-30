@@ -34,6 +34,7 @@ jobs:
       - name: Python syntax
         run: |
           python -m py_compile \
+            biological_brain/dedup_proteins.py \
             biological_brain/protein_bridge_evidence.py \
             biological_brain/kmer_junction_lm.py \
             biological_brain/esm_breakpoint_score.py \
@@ -67,7 +68,7 @@ jobs:
           init-shell: bash
       - name: Generate translated-assembly fixture
         run: python tests/make_plass_bridge_fixture.py --output fixture
-      - name: Assemble proteins with Plass
+      - name: Assemble and exact-deduplicate proteins with Plass
         run: |
           mkdir -p fixture/plass_tmp
           plass assemble \
@@ -77,11 +78,17 @@ jobs:
             --threads 2
           test -s fixture/plass_proteins.faa
           echo "Plass proteins: $(grep -c '^>' fixture/plass_proteins.faa)"
+          python biological_brain/dedup_proteins.py \
+            fixture/plass_proteins.faa \
+            fixture/plass_proteins.dedup.faa \
+            --mapping fixture/plass_proteins.dedup.tsv \
+            --json fixture/plass_proteins.dedup.json
+          test -s fixture/plass_proteins.dedup.faa
       - name: Convert protein assembly into edge evidence
         run: |
           python biological_brain/protein_bridge_evidence.py \
             --gfa fixture/graph.gfa \
-            --proteins fixture/plass_proteins.faa \
+            --proteins fixture/plass_proteins.dedup.faa \
             --output fixture/protein_evidence.tsv \
             --junction-nt 450
           python biological_brain/kmer_junction_lm.py \
@@ -104,7 +111,7 @@ jobs:
             --evidence fixture/protein_evidence.tsv \
             --report fixture/evidence_path_report.tsv \
             --contigs fixture/evidence_contigs.fasta \
-            --plass-proteins fixture/plass_proteins.faa
+            --plass-proteins fixture/plass_proteins.dedup.faa
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -113,6 +120,9 @@ jobs:
             fixture/manifest.json
             fixture/reference_protein.faa
             fixture/plass_proteins.faa
+            fixture/plass_proteins.dedup.faa
+            fixture/plass_proteins.dedup.tsv
+            fixture/plass_proteins.dedup.json
             fixture/protein_evidence.tsv
             fixture/dna_lm.tsv
             fixture/evidence_path_report.tsv
