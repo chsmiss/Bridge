@@ -16,34 +16,41 @@ This report records deterministic short-read smoke tests for the experimental Br
 The current default uses:
 
 - quality- and independent-fragment-aware solid k-mers;
-- strict observed `(k+1)`-mer edge abundance thresholds;
 - anchored mercy rescue for short weak paths spanned by reads between solid anchors;
+- ordinary `(k+1)`-mer edges at the configured abundance threshold;
+- once-observed edges when **both endpoints independently passed the solid-k-mer quality and fragment gates**;
+- full-read evidence to rank ambiguous graph exits rather than treating a weak edge as an automatic join;
 - preservation of alternate bubble alleles;
-- primary-walk collapse only when multiple alternatives are physically supported on both flanks;
-- pair-supported N-gap scaffolds kept separate from exact contigs.
+- primary bubble collapse only when multiple alternatives have bilateral physical support.
 
-Two broader weak-edge rules were tested and rejected:
+This singleton-solid-edge policy is deliberately narrower than retaining arbitrary singleton k-mers. Both endpoint nodes must already be supported by independent fragments and base-quality evidence. The edge only keeps the candidate path in the graph; primary emission still requires positive transition evidence.
 
-1. Retain every once-observed edge whose endpoints are both solid.
-2. Retain only once-observed solid-endpoint edges that are unique missing continuations.
+## Edge-policy ablation on the 50k subset
 
-The second rule changed k=21 genome fraction from 1.507% to 1.508% on the 50k subset, while misassemblies increased from 6 to 7 and mismatches from 3.09 to 3.82 per 100 kb. It produced no substantive k=31 benefit. The production graph therefore remains strict edge threshold plus anchored mercy.
+| edge policy | k | GF | total bp | NA50 | misassemblies | mismatches/100 kb | indels/100 kb |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| strict threshold + mercy | 21 | 1.460% | 1,065,725 | 265 | 7 | 3.95 | 1.06 |
+| solid-endpoint singleton edges | 21 | **1.507%** | **1,101,806** | **268** | **6** | **3.09** | 1.10 |
+| unique non-branching singleton edges | 21 | 1.508% | 1,102,282 | 268 | 7 | 3.82 | 1.10 |
+| strict threshold + mercy | 31 | 1.370% | 991,461 | 242 | 0 | 2.26 | 1.05 |
+| solid-endpoint singleton edges | 31 | **1.427%** | **1,013,008** | 242 | **0** | **0.91** | **0.85** |
+| unique non-branching singleton edges | 31 | 1.427% | 1,014,133 | 242 | 0 | 0.91 | 0.85 |
+
+The reference-based result favors the solid-endpoint rule. It increased genome fraction for both k values and preserved the zero-misassembly k=31 result. Restricting rescue to unique non-branching edges did not improve correctness and slightly worsened the k=21 error profile. The broad solid-endpoint rule is therefore retained, with ambiguity deferred to read-supported primary-walk selection.
 
 ## 20k read-pair continuity smoke
 
 | assembler/configuration | sequences >=200 bp | total bp | N50 | largest |
 |---|---:|---:|---:|---:|
-| BridgeAsm k=21 | 689 | 182,206 | 259 | 681 |
-| BridgeAsm k=31 | 333 | 85,794 | 250 | 834 |
-| BridgeAsm k=51 | 32 | 8,041 | 234 | 798 |
+| BridgeAsm k=21 | 577 | 159,662 | 264 | 760 |
+| BridgeAsm k=31 | 375 | 93,458 | 247 | 834 |
+| BridgeAsm k=51 | 35 | 8,815 | 244 | 798 |
 | MEGAHIT | 515 | 211,780 | 398 | 2,076 |
 | metaSPAdes | 2,550 | 791,838 | 313 | 1,800 |
 
 Approximate peak RSS on the same hosted runner was 220-244 MB for BridgeAsm, 267 MB for MEGAHIT, and 942 MB for metaSPAdes.
 
 ## 50k read-pair MetaQUAST reference smoke
-
-The table below records the completed reference smoke used to evaluate the rejected weak-edge experiment. The strict production run is regenerated automatically by `zymo-reference-smoke.yml`; the weak-edge comparison is included here because it establishes the rollback decision.
 
 | assembler/configuration | genome fraction | total assembled bp | N50 | NA50 | misassemblies | mismatches/100 kb | indels/100 kb | duplication ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -59,9 +66,10 @@ BridgeAsm currently occupies the high-precision, lower-recall end of the assembl
 - k=31 produced zero reported misassemblies and substantially fewer base errors in this subset;
 - k=21 recovered more reference sequence but introduced several misassemblies;
 - MEGAHIT and metaSPAdes recovered more reference sequence and longer paths, but with many more errors on this small, low-depth subset;
-- simply admitting weak singleton edges did not close the completeness gap safely.
+- solid-endpoint weak-edge rescue produced a modest but measurable recall gain without degrading the k=31 correctness result;
+- the remaining completeness gap cannot be closed by admitting weak edges alone.
 
-The next useful algorithmic work is not a broader weak-edge rule. Higher-value directions are:
+The next useful algorithmic work is:
 
 1. graph-to-primary emission that uses physically supported walks without duplicating constituent unitigs;
 2. bounded local path resolution around high-coverage graph breaks;
