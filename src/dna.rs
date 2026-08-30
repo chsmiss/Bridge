@@ -3,8 +3,9 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-pub const MAX_K: usize = 127;
-const WORDS: usize = 4;
+/// Illumina 150 bp reads leave at least three start positions at k=147.
+pub const MAX_K: usize = 147;
+const WORDS: usize = 5;
 
 #[inline]
 pub fn base_bits(base: u8) -> Option<u8> {
@@ -46,7 +47,7 @@ pub fn reverse_complement(sequence: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Exact packed DNA key supporting k <= 127. Bits above 2*k are always zero.
+/// Exact packed DNA key supporting k <= 147. Bits above 2*k are always zero.
 /// Words are little-endian: words[0] stores the least-significant 64 bits.
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub struct KmerKey {
@@ -79,11 +80,11 @@ impl PartialOrd for KmerKey {
 
 impl fmt::Debug for KmerKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "KmerKey({:016x}{:016x}{:016x}{:016x})",
-            self.words[3], self.words[2], self.words[1], self.words[0]
-        )
+        formatter.write_str("KmerKey(")?;
+        for word in self.words.iter().rev() {
+            write!(formatter, "{word:016x}")?;
+        }
+        formatter.write_str(")")
     }
 }
 
@@ -306,7 +307,7 @@ mod tests {
 
     #[test]
     fn packed_key_supports_long_kmers() {
-        for k in [1, 21, 31, 41, 63, 71, 91, 111, 127] {
+        for k in [1, 21, 31, 41, 63, 71, 91, 111, 127, 147] {
             let sequence: Vec<u8> = (0..k).map(|index| b"ACGT"[index % 4]).collect();
             let key = KmerKey::from_sequence(&sequence).unwrap();
             assert_eq!(key.to_sequence(k), sequence);
@@ -317,9 +318,11 @@ mod tests {
 
     #[test]
     fn rolling_matches_direct_encoding() {
-        let sequence = b"ACGTTGCATGCAACGTACGATCGTACGATCGATGCTAGCTAGCATCGATCG";
-        for k in [21, 31, 41] {
-            let rolling = canonical_kmers(sequence, k).unwrap();
+        let sequence: Vec<u8> = (0..300)
+            .map(|index| b"ACGTGCACT"[(index * 7 + index / 5) % 9])
+            .collect();
+        for k in [21, 31, 41, 91, 127, 147] {
+            let rolling = canonical_kmers(&sequence, k).unwrap();
             for item in rolling {
                 let direct = KmerKey::from_sequence(&sequence[item.position..item.position + k])
                     .unwrap()
