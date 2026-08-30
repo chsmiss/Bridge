@@ -41,6 +41,8 @@ fn config(reads: std::path::PathBuf, output: std::path::PathBuf, k: usize) -> As
         min_primary_support: 2,
         primary_dominance: 0.70,
         threaded_path_cover: false,
+        major_path_cover: false,
+        path_cover_secondary_dominance: 0.20,
         min_contig_length: 20,
         scaffold_gap_bases: 100,
         max_pairs: None,

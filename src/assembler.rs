@@ -28,6 +28,8 @@ pub struct AssembleConfig {
     pub min_primary_support: u32,
     pub primary_dominance: f32,
     pub threaded_path_cover: bool,
+    pub major_path_cover: bool,
+    pub path_cover_secondary_dominance: f32,
     pub min_contig_length: usize,
     pub scaffold_gap_bases: usize,
     pub max_pairs: Option<usize>,
@@ -61,6 +63,17 @@ struct TripletCandidate {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct MajorEdgeCandidate {
+    source: u32,
+    target: u32,
+    score: u64,
+    source_fraction: f32,
+    target_fraction: f32,
+    coverage_ratio: f32,
+    sequence_gain: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PathSelectionConfig {
     min_read_support: u32,
     min_pair_support: u32,
@@ -68,6 +81,8 @@ struct PathSelectionConfig {
     min_count: u32,
     dominance: f32,
     threaded_path_cover: bool,
+    major_path_cover: bool,
+    secondary_dominance: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +121,7 @@ pub struct AssemblyStats {
     pub pair_bridges: usize,
     pub threaded_triplet_classes: usize,
     pub threaded_path_transitions: usize,
+    pub major_path_transitions: usize,
     pub dominant_transitions: usize,
     pub simple_bubbles: usize,
     pub variant_alleles: usize,
@@ -225,20 +241,23 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         config.min_read_support,
         config.min_contig_length,
     );
-    let (primary_paths, dominant_transitions, threaded_path_transitions) = primary_paths(
-        &unitig_graph,
-        &transitions,
-        &triplets,
-        &bubble_alleles,
-        PathSelectionConfig {
-            min_read_support: config.min_read_support,
-            min_pair_support: config.min_pair_support,
-            min_primary_support: config.min_primary_support,
-            min_count: config.min_count,
-            dominance: config.primary_dominance,
-            threaded_path_cover: config.threaded_path_cover,
-        },
-    );
+    let (primary_paths, dominant_transitions, threaded_path_transitions, major_path_transitions) =
+        primary_paths(
+            &unitig_graph,
+            &transitions,
+            &triplets,
+            &bubble_alleles,
+            PathSelectionConfig {
+                min_read_support: config.min_read_support,
+                min_pair_support: config.min_pair_support,
+                min_primary_support: config.min_primary_support,
+                min_count: config.min_count,
+                dominance: config.primary_dominance,
+                threaded_path_cover: config.threaded_path_cover,
+                major_path_cover: config.major_path_cover,
+                secondary_dominance: config.path_cover_secondary_dominance,
+            },
+        );
     let mut primary_sequences =
         deduplicate_primary_sequences(&unitig_graph, &primary_paths, config.min_contig_length);
     primary_sequences
@@ -308,6 +327,7 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         pair_bridges,
         threaded_triplet_classes: triplets.len(),
         threaded_path_transitions,
+        major_path_transitions,
         dominant_transitions,
         simple_bubbles,
         variant_alleles: bubble_alleles.len(),
@@ -550,7 +570,7 @@ fn primary_paths(
     triplets: &FxHashMap<(u32, u32, u32), u32>,
     bubble_alleles: &[BubbleAllele],
     selection: PathSelectionConfig,
-) -> (Vec<Vec<u32>>, usize, usize) {
+) -> (Vec<Vec<u32>>, usize, usize, usize) {
     let unitig_count = unitigs.unitigs.len();
     let excluded = non_primary_bubble_alleles(bubble_alleles);
     let mut outgoing_candidates: Vec<Vec<TransitionCandidate>> = vec![Vec::new(); unitig_count];
@@ -617,7 +637,7 @@ fn primary_paths(
         })
         .collect();
 
-    let (successor, predecessor, dominant_transitions, threaded_path_transitions) =
+    let (mut successor, mut predecessor, mut dominant_transitions, threaded_path_transitions) =
         if selection.threaded_path_cover {
             build_threaded_path_cover(
                 unitigs,
@@ -639,6 +659,20 @@ fn primary_paths(
                 &selected_in,
             )
         };
+    let major_path_transitions = if selection.major_path_cover {
+        extend_major_path_cover(
+            unitigs,
+            &excluded,
+            &outgoing_candidates,
+            &incoming_candidates,
+            selection,
+            &mut successor,
+            &mut predecessor,
+        )
+    } else {
+        0
+    };
+    dominant_transitions += major_path_transitions;
 
     let mut used = vec![false; unitig_count];
     for &unitig_id in &excluded {
@@ -656,7 +690,12 @@ fn primary_paths(
             paths.push(extend_selected_path(start, &successor, &mut used));
         }
     }
-    (paths, dominant_transitions, threaded_path_transitions)
+    (
+        paths,
+        dominant_transitions,
+        threaded_path_transitions,
+        major_path_transitions,
+    )
 }
 
 fn build_reciprocal_path_cover(
@@ -839,6 +878,137 @@ fn build_threaded_path_cover(
         dominant_transitions,
         threaded_path_transitions,
     )
+}
+
+fn extend_major_path_cover(
+    unitigs: &UnitigGraph,
+    excluded: &FxHashSet<u32>,
+    outgoing_candidates: &[Vec<TransitionCandidate>],
+    incoming_candidates: &[Vec<TransitionCandidate>],
+    selection: PathSelectionConfig,
+    successor: &mut [Option<u32>],
+    predecessor: &mut [Option<u32>],
+) -> usize {
+    let unitig_count = unitigs.unitigs.len();
+    let mut outgoing_totals = vec![0_u64; unitig_count];
+    let mut incoming_totals = vec![0_u64; unitig_count];
+    let mut outgoing_best = vec![0_u64; unitig_count];
+    let mut incoming_best = vec![0_u64; unitig_count];
+
+    for (source, candidates) in outgoing_candidates.iter().enumerate() {
+        for candidate in candidates {
+            let score = major_edge_score(*candidate);
+            outgoing_totals[source] = outgoing_totals[source].saturating_add(score);
+            outgoing_best[source] = outgoing_best[source].max(score);
+            incoming_totals[candidate.node as usize] =
+                incoming_totals[candidate.node as usize].saturating_add(score);
+            incoming_best[candidate.node as usize] =
+                incoming_best[candidate.node as usize].max(score);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (source, outgoing) in outgoing_candidates.iter().enumerate() {
+        if excluded.contains(&(source as u32)) {
+            continue;
+        }
+        for candidate in outgoing {
+            let target = candidate.node as usize;
+            if excluded.contains(&candidate.node) || source == target {
+                continue;
+            }
+            let physical_support = candidate.direct_reads.max(candidate.read_pairs);
+            if physical_support < selection.min_primary_support {
+                continue;
+            }
+            let score = major_edge_score(*candidate);
+            if score == 0 || (score != outgoing_best[source] && score != incoming_best[target]) {
+                continue;
+            }
+            let source_fraction = score as f32 / outgoing_totals[source].max(1) as f32;
+            let target_fraction = score as f32 / incoming_totals[target].max(1) as f32;
+            if source_fraction.max(target_fraction) < selection.dominance
+                || source_fraction.min(target_fraction) < selection.secondary_dominance
+            {
+                continue;
+            }
+            let source_coverage = unitigs.unitigs[source].mean_coverage.max(f32::EPSILON);
+            let target_coverage = unitigs.unitigs[target].mean_coverage.max(f32::EPSILON);
+            let coverage_ratio =
+                source_coverage.min(target_coverage) / source_coverage.max(target_coverage);
+            candidates.push(MajorEdgeCandidate {
+                source: source as u32,
+                target: candidate.node,
+                score,
+                source_fraction,
+                target_fraction,
+                coverage_ratio,
+                sequence_gain: unitigs.unitigs[target]
+                    .sequence
+                    .len()
+                    .saturating_sub(unitigs.k),
+            });
+        }
+    }
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                right
+                    .source_fraction
+                    .min(right.target_fraction)
+                    .total_cmp(&left.source_fraction.min(left.target_fraction))
+            })
+            .then_with(|| {
+                right
+                    .source_fraction
+                    .max(right.target_fraction)
+                    .total_cmp(&left.source_fraction.max(left.target_fraction))
+            })
+            .then_with(|| right.coverage_ratio.total_cmp(&left.coverage_ratio))
+            .then_with(|| right.sequence_gain.cmp(&left.sequence_gain))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.target.cmp(&right.target))
+    });
+
+    // This is a weighted one-in/one-out path cover over existing exact graph
+    // edges. Unlike reciprocal-best selection, it can continue through a
+    // convergence when the strongest incoming edge was blocked because its
+    // source already selected a stronger alternative. No sequence or graph
+    // edge is invented, and a disjoint-set prevents circular walks.
+    let mut parent: Vec<u32> = (0..unitig_count as u32).collect();
+    for (source, target) in successor.iter().enumerate() {
+        if let Some(target) = target {
+            union_components(&mut parent, source as u32, *target);
+        }
+    }
+
+    let mut added = 0_usize;
+    for candidate in candidates {
+        let source = candidate.source as usize;
+        let target = candidate.target as usize;
+        if successor[source].is_some()
+            || predecessor[target].is_some()
+            || find_component(&mut parent, candidate.source)
+                == find_component(&mut parent, candidate.target)
+        {
+            continue;
+        }
+        successor[source] = Some(candidate.target);
+        predecessor[target] = Some(candidate.source);
+        union_components(&mut parent, candidate.source, candidate.target);
+        if outgoing_candidates[source].len() > 1 || incoming_candidates[target].len() > 1 {
+            added += 1;
+        }
+    }
+    added
+}
+
+fn major_edge_score(candidate: TransitionCandidate) -> u64 {
+    u64::from(candidate.direct_reads)
+        .saturating_mul(100)
+        .saturating_add(u64::from(candidate.read_pairs).saturating_mul(15))
 }
 
 fn triplet_candidate(
@@ -1269,6 +1439,8 @@ mod transition_selection_tests {
             min_count: 2,
             dominance: 0.75,
             threaded_path_cover: true,
+            major_path_cover: false,
+            secondary_dominance: 0.20,
         };
         let (successor, predecessor, _, threaded) = build_threaded_path_cover(
             &unitigs,
@@ -1286,6 +1458,93 @@ mod transition_selection_tests {
         assert_eq!(predecessor[1], Some(0));
         assert_eq!(predecessor[3], Some(1));
         assert_eq!(threaded, 2);
+    }
+}
+
+#[cfg(test)]
+mod major_path_cover_tests {
+    use super::*;
+    use crate::graph::{Unitig, UnitigGraph};
+
+    fn unitig(id: u32) -> Unitig {
+        Unitig {
+            id,
+            states: Vec::new(),
+            sequence: b"ACGTACGT".to_vec(),
+            start_state: id,
+            end_state: id + 1,
+            length: 8,
+            mean_coverage: 10.0,
+            min_coverage: 10,
+            max_coverage: 10,
+            circular: false,
+        }
+    }
+
+    #[test]
+    fn greedy_cover_uses_a_free_secondary_source_after_a_conflict() {
+        let graph = UnitigGraph {
+            k: 3,
+            unitigs: (0..4).map(unitig).collect(),
+            edge_to_unitig: FxHashMap::default(),
+            reverse_unitig: vec![0, 1, 2, 3],
+            out_offsets: vec![0, 0, 0, 0, 0],
+            out_targets: Vec::new(),
+            indegree: vec![0; 4],
+        };
+        let candidate = |node, reads| TransitionCandidate {
+            node,
+            direct_reads: reads,
+            read_pairs: 0,
+            solid_topology: true,
+        };
+        let outgoing = vec![
+            vec![candidate(2, 10), candidate(3, 11)],
+            vec![candidate(2, 9)],
+            Vec::new(),
+            Vec::new(),
+        ];
+        let incoming = vec![
+            Vec::new(),
+            Vec::new(),
+            vec![candidate(0, 10), candidate(1, 9)],
+            vec![candidate(0, 11)],
+        ];
+        let selected_out = vec![Some(3), Some(2), None, None];
+        let selected_in = vec![None, None, Some(0), Some(0)];
+        let excluded = FxHashSet::default();
+        let (mut successor, mut predecessor, _, _) = build_reciprocal_path_cover(
+            &excluded,
+            &outgoing,
+            &incoming,
+            &selected_out,
+            &selected_in,
+        );
+        assert_eq!(successor[0], Some(3));
+        assert_eq!(successor[1], None);
+
+        let selection = PathSelectionConfig {
+            min_read_support: 2,
+            min_pair_support: 2,
+            min_primary_support: 5,
+            min_count: 2,
+            dominance: 0.75,
+            threaded_path_cover: false,
+            major_path_cover: true,
+            secondary_dominance: 0.20,
+        };
+        let added = extend_major_path_cover(
+            &graph,
+            &excluded,
+            &outgoing,
+            &incoming,
+            selection,
+            &mut successor,
+            &mut predecessor,
+        );
+        assert_eq!(added, 1);
+        assert_eq!(successor[1], Some(2));
+        assert_eq!(predecessor[2], Some(1));
     }
 }
 

@@ -44,9 +44,15 @@ enum Command {
         min_primary_support: u32,
         #[arg(long, default_value_t = 0.75)]
         primary_dominance: f32,
-        /// Use dominant same-read unitig triplets to resolve a global path cover.
+        /// Use dominant same-read unitig triplets to extend the conservative path cover.
         #[arg(long, default_value_t = false)]
         threaded_path_cover: bool,
+        /// Build a major-strain path cover by greedily matching high-confidence graph edges.
+        #[arg(long, default_value_t = false)]
+        major_path_cover: bool,
+        /// Minimum support fraction at the weaker endpoint of a major-path edge.
+        #[arg(long, default_value_t = 0.20)]
+        path_cover_secondary_dominance: f32,
         #[arg(long, default_value_t = 200)]
         min_contig_length: usize,
         #[arg(long, default_value_t = 100)]
@@ -75,6 +81,8 @@ fn main() -> Result<()> {
             min_primary_support,
             primary_dominance,
             threaded_path_cover,
+            major_path_cover,
+            path_cover_secondary_dominance,
             min_contig_length,
             scaffold_gap_bases,
             max_pairs,
@@ -85,6 +93,11 @@ fn main() -> Result<()> {
             }
             if !(0.0..=60.0).contains(&mercy_min_quality) {
                 anyhow::bail!("mercy minimum quality must be in 0..=60");
+            }
+            if !(0.0..=1.0).contains(&path_cover_secondary_dominance)
+                || path_cover_secondary_dominance > primary_dominance
+            {
+                anyhow::bail!("path-cover secondary dominance must be in 0..=primary-dominance");
             }
             let config = AssembleConfig {
                 read1,
@@ -100,6 +113,8 @@ fn main() -> Result<()> {
                 min_primary_support,
                 primary_dominance,
                 threaded_path_cover,
+                major_path_cover,
+                path_cover_secondary_dominance,
                 min_contig_length,
                 scaffold_gap_bases,
                 max_pairs,
