@@ -8,7 +8,8 @@ k-mer occurrence and homology ambiguity even though they encode the same colline
 This utility always collapses exact duplicate sequences. With --collapse-contained it also
 collapses a sequence only when the *entire amino-acid sequence* is an exact substring of an
 already retained longer sequence. Non-identical, non-contained homologs remain separate, so
-true paralog/repeat ambiguity is preserved.
+true paralog/repeat ambiguity is preserved. The matched Zymo evaluation uses this exact
+containment policy before protein evidence is projected back to graph edges.
 """
 
 from __future__ import annotations
