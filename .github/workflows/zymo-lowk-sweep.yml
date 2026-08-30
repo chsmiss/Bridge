@@ -1,0 +1,137 @@
+name: Zymo Log low-k sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "50000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-lowk-sweep.yml
+      - Cargo.toml
+      - src/**
+      - scripts/download_ena_subset.py
+      - scripts/fasta_stats.py
+
+concurrency:
+  group: zymo-lowk-sweep-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PAIRS: ${{ inputs.pairs || '50000' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install assembler and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+      - name: Download deterministic reads and Zymo references
+        run: |
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+      - name: Build BridgeAsm
+        run: cargo build --release
+      - name: Run low-k parameter sweep
+        run: |
+          run_bridgeasm() {
+            name=$1
+            k=$2
+            mercy=$3
+            read_support=$4
+            pair_support=$5
+            primary_support=$6
+            dominance=$7
+            mkdir -p "benchmark/$name"
+            /usr/bin/time -v -o "benchmark/$name.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o "benchmark/$name" -k "$k" \
+                --min-count 2 --mercy-max-kmers "$mercy" \
+                --mercy-min-support 1 --mercy-min-quality 25 \
+                --min-read-support "$read_support" \
+                --min-pair-support "$pair_support" \
+                --min-primary-support "$primary_support" \
+                --primary-dominance "$dominance" \
+                --min-contig-length 200 --threads 2
+            cp "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/assemblies/$name-primary.fasta"
+            cp "benchmark/$name/primary_scaffolds.fasta" \
+              "benchmark/assemblies/$name-scaffolds.fasta"
+            cat "benchmark/$name/primary_contigs.fasta" \
+                "benchmark/$name/unitigs.fasta" \
+                "benchmark/$name/haplotigs.fasta" \
+              > "benchmark/assemblies/$name-all-exact.fasta"
+            python3 scripts/fasta_stats.py "benchmark/$name/primary_contigs.fasta" \
+              --json "benchmark/$name.stats.json" > "benchmark/$name.stats.tsv"
+          }
+          for k in 15 17 19 21; do
+            mercy=$((45-k))
+            run_bridgeasm "bridgeasm-k${k}-strict" "$k" "$mercy" 2 2 5 0.75
+            run_bridgeasm "bridgeasm-k${k}-recovery" "$k" "$mercy" 1 1 2 0.60
+          done
+      - name: Run MEGAHIT
+        run: |
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+      - name: Run MetaQUAST low-k sweep
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridgeasm-k15-strict-primary.fasta \
+            benchmark/assemblies/bridgeasm-k15-strict-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k15-strict-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k15-recovery-primary.fasta \
+            benchmark/assemblies/bridgeasm-k15-recovery-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k17-strict-primary.fasta \
+            benchmark/assemblies/bridgeasm-k17-strict-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k17-strict-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k17-recovery-primary.fasta \
+            benchmark/assemblies/bridgeasm-k17-recovery-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k19-strict-primary.fasta \
+            benchmark/assemblies/bridgeasm-k19-strict-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k19-strict-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k19-recovery-primary.fasta \
+            benchmark/assemblies/bridgeasm-k19-recovery-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k21-strict-primary.fasta \
+            benchmark/assemblies/bridgeasm-k21-strict-scaffolds.fasta \
+            benchmark/assemblies/bridgeasm-k21-strict-all-exact.fasta \
+            benchmark/assemblies/bridgeasm-k21-recovery-primary.fasta \
+            benchmark/assemblies/bridgeasm-k21-recovery-scaffolds.fasta \
+            benchmark/assemblies/megahit.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\n' "$GITHUB_SHA" "$PAIRS" \
+            > benchmark/benchmark_provenance.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-lowk-sweep
+          path: benchmark
+          retention-days: 14
