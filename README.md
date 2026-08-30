@@ -2,7 +2,7 @@
 
 BridgeAsm is an experimental Rust assembler for Illumina paired-end metagenomes. Its design goal is to increase recoverable sequence and strain preservation while requiring positive read or fragment evidence for ambiguous joins.
 
-> **Status:** research prototype. It is not yet a production replacement for MEGAHIT or metaSPAdes. Current Zymo subset tests show substantially lower assembly error rates, but lower genome fraction and contiguity.
+> **Status:** research prototype. It is not yet a production replacement for MEGAHIT or metaSPAdes. Current Zymo tests show substantially lower assembly error rates, but lower contiguity and slightly lower genome fraction than MEGAHIT at 500,000 read pairs.
 
 ## Current algorithm
 
@@ -16,7 +16,7 @@ BridgeAsm is an experimental Rust assembler for Illumina paired-end metagenomes.
 8. Preserve alternate bubble alleles; collapse a primary bubble path only when alternatives have bilateral physical support.
 9. Emit evidence-supported primary walks and optional paired-end N-gap scaffolds as separate products.
 
-Long k-mer keys are construction-time objects. Persistent graph traversal uses dense integer IDs.
+The `k=147` limit is intended for 150 bp reads. A dataset can only use k values no longer than its actual reads; ERR2935805 contains 101 bp mates, so its largest meaningful odd k is 99. Long k-mer keys are construction-time objects. Persistent graph traversal uses dense integer IDs.
 
 ## Build
 
@@ -61,11 +61,24 @@ scripts/benchmark_synthetic.sh
 The repository includes deterministic GitHub Actions workflows for:
 
 - synthetic major/minor strain regression;
-- a real ERR2935805 Zymo Log subset against MEGAHIT and metaSPAdes;
+- real ERR2935805 Zymo Log subsets against MEGAHIT and metaSPAdes;
 - MetaQUAST evaluation against the Zymo reference collection;
-- a 500,000-pair recovery sweep over `k=21,31,51,91,147`, including exact reverse-complement-aware unions across k values.
+- a 500,000-pair cross-k recovery benchmark;
+- a focused medium-k, mercy, and primary-emission sweep intended to close the remaining GF gap.
 
-See [`docs/benchmark_zymo_subset.md`](docs/benchmark_zymo_subset.md) for measured results and negative ablations.
+See [`docs/benchmark_zymo_subset.md`](docs/benchmark_zymo_subset.md) and [`docs/benchmarks/zymo_log_500k_recovery.md`](docs/benchmarks/zymo_log_500k_recovery.md) for measured results and negative ablations.
+
+### Current 500k result
+
+On the deterministic first 500,000 ERR2935805 read pairs:
+
+- best BridgeAsm single-k primary GF: **4.740%** at k=31;
+- exact cross-k recovery-union GF: **5.095%**;
+- MEGAHIT GF: **5.461%**;
+- BridgeAsm retained substantially fewer mismatches, indels, and misassemblies;
+- the remaining unique-coverage gap is about **0.366 percentage points**, concentrated mainly in the Pseudomonas reference.
+
+The cross-k union is a diagnostic recovery catalog, not yet a production primary assembly, because overlapping paths from several k values produce a high duplication ratio.
 
 ### Full Zymo Log benchmark
 
@@ -85,16 +98,17 @@ A fifth argument limits the run to the first N read pairs for capacity testing.
 
 - Positive physical evidence may support a join; absence of evidence does not.
 - Minor and low-depth paths are not deleted merely because coverage is lower or a path disappears at larger k.
-- Weak-edge rescue must improve reference recovery without increasing switches or misassemblies; otherwise it is rejected.
+- Weak-edge rescue must improve reference recovery without an unacceptable increase in switches or misassemblies; otherwise it is rejected.
 - Exact contigs and N-gap scaffolds remain separate products.
-- Cross-k union benchmarks are diagnostic recovery layers, not automatically promoted to a production primary assembly.
+- Cross-k recovery outputs must be clustered and deduplicated without reference truth before promotion to a production assembly.
 - Every optimization must preserve deterministic synthetic regression results.
 
 ## Near-term roadmap
 
-1. Memory-bounded partitioned counting and direct compacted-DBG construction.
-2. Unitig-native sparse indexing for parallel read/pair threading.
-3. Fragment-class phasing instead of global pairwise-link materialization.
-4. Bounded local path resolution for high-coverage graph breaks.
-5. Repeat/copy-number flow only after measured hard-region attribution.
-6. Protein/DNA model priors only for candidate reranking after physical candidate generation.
+1. Close the remaining 500k GF gap using medium-k complementarity, calibrated mercy, and evidence-supported emission.
+2. Replace exact-only cross-k deduplication with reference-free containment and overlap clustering.
+3. Add memory-bounded partitioned counting and direct compacted-DBG construction.
+4. Add unitig-native sparse indexing for parallel read/pair threading.
+5. Replace global pairwise links with fragment-class phasing.
+6. Add bounded local path resolution for high-coverage graph breaks.
+7. Use repeat/copy-number flow and biological model priors only after measured failure attribution.
