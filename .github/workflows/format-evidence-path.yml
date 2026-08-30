@@ -1,0 +1,28 @@
+name: Format evidence path source
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/format-evidence-path.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format Rust source
+        run: cargo fmt --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: formatted-evidence-path
+          path: src/bin/bridgeasm-evidence-path.rs
+          retention-days: 1
