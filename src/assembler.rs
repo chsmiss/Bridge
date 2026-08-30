@@ -435,7 +435,10 @@ fn choose_transition(
     if candidates.len() == 1 {
         return Some(candidates[0].0);
     }
-    let total: u64 = candidates.iter().map(|candidate| u64::from(candidate.1)).sum();
+    let total: u64 = candidates
+        .iter()
+        .map(|candidate| u64::from(candidate.1))
+        .sum();
     let best = candidates[0];
     let fraction = best.1 as f32 / total.max(1) as f32;
     (best.1 >= min_primary_support && fraction >= dominance).then_some(best.0)
@@ -472,7 +475,10 @@ fn detect_simple_bubbles(
             .entry((unitig.start_state, unitig.end_state))
             .or_default()
             .push(unitig.id);
-        starts.entry(unitig.start_state).or_default().push(unitig.id);
+        starts
+            .entry(unitig.start_state)
+            .or_default()
+            .push(unitig.id);
         ends.entry(unitig.end_state).or_default().push(unitig.id);
     }
 
