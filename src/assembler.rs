@@ -161,9 +161,16 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
     );
 
     let started = Instant::now();
+    let bubble_alleles = detect_simple_bubbles(
+        &unitig_graph,
+        &transitions,
+        config.min_read_support,
+        config.min_contig_length,
+    );
     let (primary_paths, dominant_transitions) = primary_paths(
         &unitig_graph,
         &transitions,
+        &bubble_alleles,
         config.min_read_support,
         config.min_primary_support,
         config.primary_dominance,
@@ -172,12 +179,6 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         deduplicate_primary_sequences(&unitig_graph, &primary_paths, config.min_contig_length);
     primary_sequences
         .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-    let bubble_alleles = detect_simple_bubbles(
-        &unitig_graph,
-        &transitions,
-        config.min_read_support,
-        config.min_contig_length,
-    );
     timings.insert(
         "branch_aware_emission".to_string(),
         started.elapsed().as_secs_f64(),
@@ -363,35 +364,68 @@ fn add_direct_transitions(
 fn primary_paths(
     unitigs: &UnitigGraph,
     transitions: &FxHashMap<(u32, u32), TransitionEvidence>,
+    bubble_alleles: &[BubbleAllele],
     min_read_support: u32,
     min_primary_support: u32,
     dominance: f32,
 ) -> (Vec<Vec<u32>>, usize) {
     let unitig_count = unitigs.unitigs.len();
+    let excluded = non_primary_bubble_alleles(bubble_alleles);
     let mut outgoing_candidates: Vec<Vec<(u32, u32)>> = vec![Vec::new(); unitig_count];
     let mut incoming_candidates: Vec<Vec<(u32, u32)>> = vec![Vec::new(); unitig_count];
 
-    for (&(source, target), evidence) in transitions {
-        if evidence.direct_reads < min_read_support || source == target {
+    // Use graph adjacency as the candidate set. Every retained unitig edge was
+    // observed at least min_count times, or was explicitly mercy-rescued.
+    // Direct-read counts rank ambiguous exits, while excluding non-primary
+    // simple-bubble alleles collapses local reconvergent variation in the
+    // primary backbone without deleting it from variants/haplotigs.
+    for source in 0..unitig_count as u32 {
+        if excluded.contains(&source) {
             continue;
         }
-        outgoing_candidates[source as usize].push((target, evidence.direct_reads));
-        incoming_candidates[target as usize].push((source, evidence.direct_reads));
+        for edge_index in unitigs.out_range(source) {
+            let target = unitigs.out_targets[edge_index];
+            if excluded.contains(&target) || source == target {
+                continue;
+            }
+            let support = transitions
+                .get(&(source, target))
+                .map_or(0, |evidence| evidence.direct_reads);
+            outgoing_candidates[source as usize].push((target, support));
+            incoming_candidates[target as usize].push((source, support));
+        }
     }
 
     let selected_out: Vec<Option<u32>> = outgoing_candidates
         .iter()
-        .map(|candidates| choose_transition(candidates, min_primary_support, dominance))
+        .map(|candidates| {
+            choose_transition(
+                candidates,
+                min_read_support,
+                min_primary_support,
+                dominance,
+            )
+        })
         .collect();
     let selected_in: Vec<Option<u32>> = incoming_candidates
         .iter()
-        .map(|candidates| choose_transition(candidates, min_primary_support, dominance))
+        .map(|candidates| {
+            choose_transition(
+                candidates,
+                min_read_support,
+                min_primary_support,
+                dominance,
+            )
+        })
         .collect();
 
     let mut successor = vec![None; unitig_count];
     let mut predecessor = vec![None; unitig_count];
     let mut dominant_transitions = 0_usize;
     for source in 0..unitig_count as u32 {
+        if excluded.contains(&source) {
+            continue;
+        }
         let Some(target) = selected_out[source as usize] else {
             continue;
         };
@@ -407,6 +441,9 @@ fn primary_paths(
     }
 
     let mut used = vec![false; unitig_count];
+    for &unitig_id in &excluded {
+        used[unitig_id as usize] = true;
+    }
     let mut paths = Vec::new();
     for start in 0..unitig_count as u32 {
         if used[start as usize] || predecessor[start as usize].is_some() {
@@ -422,8 +459,37 @@ fn primary_paths(
     (paths, dominant_transitions)
 }
 
+fn non_primary_bubble_alleles(bubble_alleles: &[BubbleAllele]) -> FxHashSet<u32> {
+    let mut groups: FxHashMap<u32, Vec<&BubbleAllele>> = FxHashMap::default();
+    for allele in bubble_alleles {
+        groups.entry(allele.bubble_id).or_default().push(allele);
+    }
+
+    let mut excluded = FxHashSet::default();
+    for alleles in groups.values() {
+        let Some(primary) = alleles.iter().copied().max_by(|left, right| {
+            left.mean_coverage
+                .total_cmp(&right.mean_coverage)
+                .then_with(|| {
+                    (left.left_support + left.right_support)
+                        .cmp(&(right.left_support + right.right_support))
+                })
+                .then_with(|| right.unitig_id.cmp(&left.unitig_id))
+        }) else {
+            continue;
+        };
+        for allele in alleles {
+            if allele.unitig_id != primary.unitig_id {
+                excluded.insert(allele.unitig_id);
+            }
+        }
+    }
+    excluded
+}
+
 fn choose_transition(
     candidates: &[(u32, u32)],
+    min_read_support: u32,
     min_primary_support: u32,
     dominance: f32,
 ) -> Option<u32> {
@@ -433,7 +499,10 @@ fn choose_transition(
     let mut candidates = candidates.to_vec();
     candidates.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
     if candidates.len() == 1 {
-        return Some(candidates[0].0);
+        let candidate = candidates[0];
+        // A unique graph exit is itself positive sequence evidence. Mercy-only
+        // unique edges still require at least one direct read before emission.
+        return (candidate.1 >= min_read_support || candidate.1 > 0).then_some(candidate.0);
     }
     let total: u64 = candidates
         .iter()
