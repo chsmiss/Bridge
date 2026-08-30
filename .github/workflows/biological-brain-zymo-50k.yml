@@ -42,15 +42,21 @@ jobs:
           cache-environment: true
           init-shell: bash
 
-      - name: Download matched 50k BridgeAsm graph artifact
+      - name: Download matched 50k assembly artifact
         run: |
-          mkdir -p source
+          mkdir -p source baseline
           gh run download "${SOURCE_RUN_ID}" \
             --repo "${GITHUB_REPOSITORY}" \
             --name zymo-log-reference-smoke \
             --dir source
           cp source/bridgeasm-k31/assembly.gfa graph.gfa
+          cp source/assemblies/bridgeasm-k31.fasta baseline/bridgeasm-k31.fasta
+          cp source/assemblies/megahit.fasta baseline/megahit.fasta
+          cp source/assemblies/metaspades.fasta baseline/metaspades.fasta
           test -s graph.gfa
+          test -s baseline/bridgeasm-k31.fasta
+          test -s baseline/megahit.fasta
+          test -s baseline/metaspades.fasta
           printf 'source_run_id\t%s\nena_run\t%s\nread_pairs\t%s\ngraph\tbridgeasm-k31/assembly.gfa\n' \
             "$SOURCE_RUN_ID" "$ENA_RUN" "$READ_PAIRS" > provenance.tsv
 
@@ -122,12 +128,19 @@ jobs:
           cp metaquast/combined_reference/transposed_report.tsv nucleotide_transposed.tsv
           cat nucleotide_report.tsv
 
-      - name: Protein recall
+      - name: Protein recall across nucleotide assemblers and PLASS
         run: |
           mkdir protein
           prodigal -q -p meta -i reference.fasta -a protein/reference.faa
+          for label in bridgeasm-k31 megahit metaspades; do
+            prodigal -q -p meta -i "baseline/${label}.fasta" -a "protein/${label}.faa"
+          done
           for label in physical_only physical_plus_plass physical_plus_plass_dna; do
             prodigal -q -p meta -i "${label}.fasta" -a "protein/${label}.faa"
+          done
+          cp plass.faa protein/plass_standalone.faa
+
+          for label in bridgeasm-k31 megahit metaspades plass_standalone physical_only physical_plus_plass physical_plus_plass_dna; do
             rm -rf "/tmp/mmseqs-${label}"
             mmseqs easy-search \
               protein/reference.faa "protein/${label}.faa" "protein/${label}.m8" "/tmp/mmseqs-${label}" \
@@ -136,6 +149,10 @@ jobs:
           done
           python scripts/protein_recall.py \
             --reference protein/reference.faa \
+            --sample bridgeasm-k31 protein/bridgeasm-k31.faa protein/bridgeasm-k31.m8 \
+            --sample megahit protein/megahit.faa protein/megahit.m8 \
+            --sample metaspades protein/metaspades.faa protein/metaspades.m8 \
+            --sample plass_standalone protein/plass_standalone.faa protein/plass_standalone.m8 \
             --sample physical_only protein/physical_only.faa protein/physical_only.m8 \
             --sample physical_plus_plass protein/physical_plus_plass.faa protein/physical_plus_plass.m8 \
             --sample physical_plus_plass_dna protein/physical_plus_plass_dna.faa protein/physical_plus_plass_dna.m8 \
@@ -197,6 +214,10 @@ jobs:
           name: biological-brain-zymo-50k
           path: |
             provenance.tsv
+            baseline/bridgeasm-k31.fasta
+            baseline/megahit.fasta
+            baseline/metaspades.fasta
+            plass.faa
             plass.dedup.json
             plass.dedup.tsv
             protein_evidence.tsv
