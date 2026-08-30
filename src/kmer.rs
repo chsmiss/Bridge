@@ -63,10 +63,7 @@ pub fn count_and_filter(
 
     let read_pairs = for_each_pair(read1, read2, max_pairs, |_index, left, right| {
         let mut fragment_keys = Vec::with_capacity(
-            left.sequence
-                .len()
-                .saturating_sub(k)
-                .saturating_add(1)
+            left.sequence.len().saturating_sub(k).saturating_add(1)
                 * if right.is_some() { 2 } else { 1 },
         );
         count_record(
