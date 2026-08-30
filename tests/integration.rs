@@ -4,10 +4,7 @@ use std::io::Write;
 
 fn write_reads(path: &std::path::Path, genome: &[u8], read_length: usize, step: usize) {
     let mut file = File::create(path).unwrap();
-    for (index, start) in (0..=genome.len() - read_length)
-        .step_by(step)
-        .enumerate()
-    {
+    for (index, start) in (0..=genome.len() - read_length).step_by(step).enumerate() {
         let sequence = &genome[start..start + read_length];
         writeln!(file, "@r{index}").unwrap();
         writeln!(file, "{}", String::from_utf8_lossy(sequence)).unwrap();
