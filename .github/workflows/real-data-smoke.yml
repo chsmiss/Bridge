@@ -1,0 +1,94 @@
+name: Real Zymo Log smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs to stream
+        required: false
+        default: "20000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/real-data-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  zymo-log-subset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install comparison assemblers when available
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit || true
+          sudo apt-get install -y spades || true
+      - name: Download deterministic real-data subset
+        env:
+          PAIRS: ${{ inputs.pairs || '20000' }}
+        run: |
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+      - name: Build BridgeAsm
+        run: cargo build --release
+      - name: Run BridgeAsm k31
+        run: |
+          mkdir -p benchmark/bridgeasm-k31
+          /usr/bin/time -v -o benchmark/bridgeasm-k31.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/bridgeasm-k31 \
+              -k 31 --min-count 2 --mercy-max-kmers 16 \
+              --min-read-support 2 --min-primary-support 5 \
+              --primary-dominance 0.75 --min-contig-length 200 --threads 2
+          python3 scripts/fasta_stats.py benchmark/bridgeasm-k31/primary_contigs.fasta \
+            --json benchmark/bridgeasm-k31.stats.json | tee benchmark/bridgeasm-k31.stats.tsv
+      - name: Run BridgeAsm k51 sanity
+        run: |
+          mkdir -p benchmark/bridgeasm-k51
+          /usr/bin/time -v -o benchmark/bridgeasm-k51.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/bridgeasm-k51 \
+              -k 51 --min-count 2 --mercy-max-kmers 8 \
+              --min-read-support 2 --min-primary-support 5 \
+              --primary-dominance 0.75 --min-contig-length 200 --threads 2
+          python3 scripts/fasta_stats.py benchmark/bridgeasm-k51/primary_contigs.fasta \
+            --json benchmark/bridgeasm-k51.stats.json | tee benchmark/bridgeasm-k51.stats.tsv
+      - name: Run MEGAHIT
+        if: ${{ hashFiles('/usr/bin/megahit') != '' }}
+        run: |
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json | tee benchmark/megahit.stats.tsv
+      - name: Run metaSPAdes
+        shell: bash
+        run: |
+          if command -v metaspades.py >/dev/null 2>&1; then
+            /usr/bin/time -v -o benchmark/metaspades.time.txt \
+              metaspades.py \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o benchmark/metaspades -t 2 -m 6 --only-assembler
+            python3 scripts/fasta_stats.py benchmark/metaspades/contigs.fasta \
+              --json benchmark/metaspades.stats.json | tee benchmark/metaspades.stats.tsv
+          else
+            echo "metaspades.py unavailable" | tee benchmark/metaspades-unavailable.txt
+          fi
+      - name: Save subset provenance
+        run: cp /tmp/zymo-log/subset_provenance.json benchmark/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-real-data-smoke
+          path: benchmark
+          retention-days: 14
