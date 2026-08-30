@@ -1,0 +1,45 @@
+name: Apply tested code patch
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/code-patches/**
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgeasm-rust-v0
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply pending patches
+        shell: bash
+        run: |
+          shopt -s nullglob
+          patches=(.github/code-patches/*.py)
+          if (( ${#patches[@]} == 0 )); then
+            echo "No pending patches"
+            exit 0
+          fi
+          for patch in "${patches[@]}"; do
+            python3 "$patch"
+          done
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          rm -f "${patches[@]}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: apply tested assembler optimization"
+          git push origin HEAD:codex/bridgeasm-rust-v0
