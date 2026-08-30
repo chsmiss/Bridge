@@ -17,6 +17,10 @@ on:
       - scripts/download_ena_subset.py
       - scripts/fasta_stats.py
 
+concurrency:
+  group: zymo-log-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
