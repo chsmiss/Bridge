@@ -39,6 +39,19 @@ jobs:
           python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
       - name: Build BridgeAsm
         run: cargo build --release
+      - name: Run BridgeAsm k21 low-depth mode
+        run: |
+          mkdir -p benchmark/bridgeasm-k21
+          /usr/bin/time -v -o benchmark/bridgeasm-k21.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/bridgeasm-k21 \
+              -k 21 --min-count 2 --mercy-max-kmers 24 \
+              --min-read-support 2 --min-primary-support 5 \
+              --primary-dominance 0.75 --min-contig-length 200 --threads 2
+          python3 scripts/fasta_stats.py benchmark/bridgeasm-k21/primary_contigs.fasta \
+            --json benchmark/bridgeasm-k21.stats.json | tee benchmark/bridgeasm-k21.stats.tsv
       - name: Run BridgeAsm k31
         run: |
           mkdir -p benchmark/bridgeasm-k31
