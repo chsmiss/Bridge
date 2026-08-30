@@ -2,6 +2,7 @@
 name = "bridgeasm"
 version = "0.3.0"
 edition = "2021"
+default-run = "bridgeasm"
 description = "Evidence-aware short-read metagenome assembler prototype"
 license = "MIT"
 repository = "https://github.com/chsmiss/Bridge"
