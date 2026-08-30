@@ -23,12 +23,11 @@ jobs:
           gzip --decompress --stdout .github/patches/bridgeasm-n50.patch.gz > /tmp/bridgeasm-n50.patch
           git apply --check /tmp/bridgeasm-n50.patch
           git apply /tmp/bridgeasm-n50.patch
-          rm .github/workflows/apply-n50-update.yml
-          rm .github/patches/bridgeasm-n50.patch.gz
+          rm -f .github/workflows/zymo-n50-smoke.yml
           chmod +x scripts/stitch_exact_overlaps.py
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
+          git add Cargo.toml Cargo.lock src/assembler.rs src/main.rs tests/integration.rs scripts/stitch_exact_overlaps.py
           git commit -m 'feat: add dominant same-read path cover for longer contigs'
           git push origin HEAD:codex/bridgeasm-rust-v0
