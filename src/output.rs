@@ -1,5 +1,7 @@
-use crate::assembler::AssemblyProduct;
+use crate::assembler::{AssemblyProduct, BubbleAllele};
+use crate::dna::reverse_complement;
 use anyhow::{Context, Result};
+use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -37,7 +39,22 @@ pub fn write_outputs(product: &AssemblyProduct, output_dir: &Path) -> Result<()>
         }),
     )?;
 
+    write_bubble_fasta(
+        &output_dir.join("variants.fasta"),
+        &product.bubble_alleles,
+        false,
+    )?;
+    write_bubble_fasta(
+        &output_dir.join("haplotigs.fasta"),
+        &product.bubble_alleles,
+        true,
+    )?;
+    write_bubble_table(
+        &output_dir.join("bubble_alleles.tsv"),
+        &product.bubble_alleles,
+    )?;
     write_gfa(product, &output_dir.join("assembly.gfa"))?;
+
     let stats_file = File::create(output_dir.join("run_profile.json"))
         .context("failed to create run_profile.json")?;
     serde_json::to_writer_pretty(BufWriter::new(stats_file), &product.stats)
@@ -63,6 +80,87 @@ where
     Ok(())
 }
 
+fn write_bubble_fasta(path: &Path, alleles: &[BubbleAllele], haplotigs: bool) -> Result<()> {
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut seen: FxHashSet<Vec<u8>> = FxHashSet::default();
+    let mut output_index = 0_usize;
+
+    for allele in alleles {
+        let sequence = if haplotigs {
+            let Some(sequence) = allele.haplotig_sequence.as_deref() else {
+                continue;
+            };
+            sequence
+        } else {
+            allele.allele_sequence.as_slice()
+        };
+        let reverse = reverse_complement(sequence);
+        let canonical = if reverse.as_slice() < sequence {
+            reverse
+        } else {
+            sequence.to_vec()
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        output_index += 1;
+        writeln!(
+            writer,
+            ">{}_{:06} bubble={} allele={} len={} cov={:.3} left_reads={} right_reads={} flanked={}",
+            if haplotigs { "haplotig" } else { "variant" },
+            output_index,
+            allele.bubble_id,
+            allele.allele_index,
+            canonical.len(),
+            allele.mean_coverage,
+            allele.left_support,
+            allele.right_support,
+            allele.physically_flanked
+        )?;
+        for chunk in canonical.chunks(80) {
+            writer.write_all(chunk)?;
+            writer.write_all(b"\n")?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_bubble_table(path: &Path, alleles: &[BubbleAllele]) -> Result<()> {
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "bubble_id\tallele_index\tunitig_id\tlength\tmean_coverage\tleft_support\tright_support\tphysically_flanked\tpath"
+    )?;
+    for allele in alleles {
+        let path_text = allele
+            .path
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}",
+            allele.bubble_id,
+            allele.allele_index,
+            allele.unitig_id,
+            allele.length,
+            allele.mean_coverage,
+            allele.left_support,
+            allele.right_support,
+            allele.physically_flanked,
+            path_text
+        )?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn write_gfa(product: &AssemblyProduct, path: &Path) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
@@ -78,17 +176,20 @@ fn write_gfa(product: &AssemblyProduct, path: &Path) -> Result<()> {
             unitig.mean_coverage
         )?;
     }
-    let mut transitions: Vec<_> = product.transitions.iter().collect();
-    transitions.sort_unstable_by_key(|(edge, _)| **edge);
-    for (&(source, target), evidence) in transitions {
-        if evidence.direct_reads == 0 {
-            continue;
+    for source in 0..product.unitig_graph.unitigs.len() as u32 {
+        for edge_index in product.unitig_graph.out_range(source) {
+            let target = product.unitig_graph.out_targets[edge_index];
+            let evidence = product.transitions.get(&(source, target)).copied().unwrap_or_default();
+            writeln!(
+                writer,
+                "L\tu{}\t+\tu{}\t+\t{}M\tDR:i:{}\tPE:i:{}",
+                source,
+                target,
+                product.unitig_graph.k,
+                evidence.direct_reads,
+                evidence.read_pairs
+            )?;
         }
-        writeln!(
-            writer,
-            "L\tu{}\t+\tu{}\t+\t{}M\tDR:i:{}\tPE:i:{}",
-            source, target, product.unitig_graph.k, evidence.direct_reads, evidence.read_pairs
-        )?;
     }
     writer.flush()?;
     Ok(())
