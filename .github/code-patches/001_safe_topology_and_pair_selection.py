@@ -23,6 +23,15 @@ struct TransitionCandidate {
     read_pairs: u32,
     solid_topology: bool,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct PathSelectionConfig {
+    min_read_support: u32,
+    min_pair_support: u32,
+    min_primary_support: u32,
+    min_count: u32,
+    dominance: f32,
+}
 '''
 if old not in text:
     raise SystemExit("TransitionEvidence block not found")
@@ -33,11 +42,13 @@ old = '''        config.min_read_support,
         config.primary_dominance,
     );
 '''
-new = '''        config.min_read_support,
-        config.min_pair_support,
-        config.min_primary_support,
-        config.min_count,
-        config.primary_dominance,
+new = '''        PathSelectionConfig {
+            min_read_support: config.min_read_support,
+            min_pair_support: config.min_pair_support,
+            min_primary_support: config.min_primary_support,
+            min_count: config.min_count,
+            dominance: config.primary_dominance,
+        },
     );
 '''
 if old not in text:
@@ -53,11 +64,7 @@ old = '''    min_read_support: u32,
     let mut outgoing_candidates: Vec<Vec<(u32, u32)>> = vec![Vec::new(); unitig_count];
     let mut incoming_candidates: Vec<Vec<(u32, u32)>> = vec![Vec::new(); unitig_count];
 '''
-new = '''    min_read_support: u32,
-    min_pair_support: u32,
-    min_primary_support: u32,
-    min_count: u32,
-    dominance: f32,
+new = '''    selection: PathSelectionConfig,
 ) -> (Vec<Vec<u32>>, usize) {
     let unitig_count = unitigs.unitigs.len();
     let excluded = non_primary_bubble_alleles(bubble_alleles);
@@ -75,8 +82,8 @@ old = '''            let support = transitions
             incoming_candidates[target as usize].push((source, support));
 '''
 new = '''            let evidence = transitions.get(&(source, target)).copied().unwrap_or_default();
-            let solid_topology = unitigs.unitigs[source as usize].min_coverage >= min_count
-                && unitigs.unitigs[target as usize].min_coverage >= min_count;
+            let solid_topology = unitigs.unitigs[source as usize].min_coverage >= selection.min_count
+                && unitigs.unitigs[target as usize].min_coverage >= selection.min_count;
             outgoing_candidates[source as usize].push(TransitionCandidate {
                 node: target,
                 direct_reads: evidence.direct_reads,
@@ -98,10 +105,10 @@ old = '''            choose_transition(candidates, min_read_support, min_primary
 '''
 new = '''            choose_transition(
                 candidates,
-                min_read_support,
-                min_pair_support,
-                min_primary_support,
-                dominance,
+                selection.min_read_support,
+                selection.min_pair_support,
+                selection.min_primary_support,
+                selection.dominance,
             )
 '''
 if text.count(old) != 2:
