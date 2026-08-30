@@ -1,5 +1,5 @@
 use bridgeasm::assembler::{assemble, AssembleConfig};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 
 fn write_reads(path: &std::path::Path, genome: &[u8], read_length: usize, step: usize) {
@@ -85,14 +85,20 @@ fn preserves_a_supported_strain_bubble() {
     append_reads(&mut file, "major", major, 90, 4, 4);
     append_reads(&mut file, "minor", &minor, 90, 4, 1);
     drop(file);
-    let _ = OpenOptions::new().append(true).open(&reads).unwrap();
 
     let product = assemble(&config(reads, output, 31)).unwrap();
 
     assert!(product.stats.simple_bubbles >= 1);
     assert!(product.stats.variant_alleles >= 2);
-    assert!(product
+    let min_coverage = product
         .bubble_alleles
         .iter()
-        .any(|allele| allele.mean_coverage < 10.0));
+        .map(|allele| allele.mean_coverage)
+        .fold(f32::INFINITY, f32::min);
+    let max_coverage = product
+        .bubble_alleles
+        .iter()
+        .map(|allele| allele.mean_coverage)
+        .fold(0.0_f32, f32::max);
+    assert!(min_coverage < max_coverage * 0.5);
 }
