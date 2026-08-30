@@ -1,0 +1,61 @@
+name: Protein-guide autofix
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/proteinguide-autofix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgeasm-rust-v0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Factor path-cover return type
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/bin/bridgeasm-proteinguide.rs")
+          text = path.read_text()
+          old = '''fn select_path_cover(
+              ranked: &mut [RankedCandidate],
+              segment_count: usize,
+          ) -> (
+              Vec<Option<Candidate>>,
+              Vec<Option<usize>>,
+              Vec<Option<bool>>,
+          ) {'''
+          new = '''type PathCover = (
+              Vec<Option<Candidate>>,
+              Vec<Option<usize>>,
+              Vec<Option<bool>>,
+          );
+
+          fn select_path_cover(
+              ranked: &mut [RankedCandidate],
+              segment_count: usize,
+          ) -> PathCover {'''
+          if old not in text:
+              raise SystemExit("expected select_path_cover signature not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/bin/bridgeasm-proteinguide.rs
+          git commit -m "refactor: factor protein-guide path cover type"
+          git push origin HEAD:codex/bridgeasm-rust-v0
