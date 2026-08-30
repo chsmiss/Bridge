@@ -128,9 +128,9 @@ impl KmerKey {
 
     pub fn to_sequence(self, k: usize) -> Vec<u8> {
         let mut sequence = vec![b'A'; k];
-        for position in 0..k {
+        for (position, base) in sequence.iter_mut().enumerate() {
             let offset = 2 * (k - 1 - position);
-            sequence[position] = bits_base(self.get_two_bits(offset));
+            *base = bits_base(self.get_two_bits(offset));
         }
         sequence
     }
@@ -307,9 +307,7 @@ mod tests {
     #[test]
     fn packed_key_supports_long_kmers() {
         for k in [1, 21, 31, 41, 63, 71, 91, 111, 127] {
-            let sequence: Vec<u8> = (0..k)
-                .map(|index| [b'A', b'C', b'G', b'T'][index % 4])
-                .collect();
+            let sequence: Vec<u8> = (0..k).map(|index| b"ACGT"[index % 4]).collect();
             let key = KmerKey::from_sequence(&sequence).unwrap();
             assert_eq!(key.to_sequence(k), sequence);
             let rc = key.reverse_complement(k);
