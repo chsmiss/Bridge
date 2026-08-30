@@ -1,4 +1,4 @@
-# benchmark revision: safe topology and paired-edge selection
+# benchmark revision: short-gap read-threading recovery
 name: Real Zymo Log smoke
 
 on:
