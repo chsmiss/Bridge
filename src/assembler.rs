@@ -27,6 +27,7 @@ pub struct AssembleConfig {
     pub min_pair_support: u32,
     pub min_primary_support: u32,
     pub primary_dominance: f32,
+    pub threaded_path_cover: bool,
     pub min_contig_length: usize,
     pub scaffold_gap_bases: usize,
     pub max_pairs: Option<usize>,
@@ -48,6 +49,17 @@ struct TransitionCandidate {
     solid_topology: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TripletCandidate {
+    left: u32,
+    middle: u32,
+    right: u32,
+    support: u32,
+    edge_direct_min: u32,
+    edge_pair_min: u32,
+    solid_topology: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PathSelectionConfig {
     min_read_support: u32,
@@ -55,6 +67,7 @@ struct PathSelectionConfig {
     min_primary_support: u32,
     min_count: u32,
     dominance: f32,
+    threaded_path_cover: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +104,8 @@ pub struct AssemblyStats {
     pub direct_transitions: usize,
     pub gapped_transitions: usize,
     pub pair_bridges: usize,
+    pub threaded_triplet_classes: usize,
+    pub threaded_path_transitions: usize,
     pub dominant_transitions: usize,
     pub simple_bubbles: usize,
     pub variant_alleles: usize,
@@ -124,6 +139,7 @@ pub struct AssemblyProduct {
 #[derive(Debug)]
 struct ThreadingResult {
     transitions: FxHashMap<(u32, u32), TransitionEvidence>,
+    triplets: FxHashMap<(u32, u32, u32), u32>,
     threaded_reads: u64,
     threaded_pairs: u64,
 }
@@ -186,6 +202,7 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
     let started = Instant::now();
     let ThreadingResult {
         transitions,
+        triplets,
         threaded_reads,
         threaded_pairs,
     } = thread_reads(
@@ -194,6 +211,7 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         &raw_graph,
         &unitig_graph,
         config.max_pairs,
+        config.threaded_path_cover,
     )?;
     timings.insert(
         "read_pair_threading".to_string(),
@@ -207,9 +225,10 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         config.min_read_support,
         config.min_contig_length,
     );
-    let (primary_paths, dominant_transitions) = primary_paths(
+    let (primary_paths, dominant_transitions, threaded_path_transitions) = primary_paths(
         &unitig_graph,
         &transitions,
+        &triplets,
         &bubble_alleles,
         PathSelectionConfig {
             min_read_support: config.min_read_support,
@@ -217,6 +236,7 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
             min_primary_support: config.min_primary_support,
             min_count: config.min_count,
             dominance: config.primary_dominance,
+            threaded_path_cover: config.threaded_path_cover,
         },
     );
     let mut primary_sequences =
@@ -286,6 +306,8 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         direct_transitions,
         gapped_transitions,
         pair_bridges,
+        threaded_triplet_classes: triplets.len(),
+        threaded_path_transitions,
         dominant_transitions,
         simple_bubbles,
         variant_alleles: bubble_alleles.len(),
@@ -322,6 +344,7 @@ fn thread_reads(
     graph: &RawGraph,
     unitigs: &UnitigGraph,
     max_pairs: Option<usize>,
+    collect_triplets: bool,
 ) -> Result<ThreadingResult> {
     let node_index: FxHashMap<_, _> = graph
         .keys
@@ -330,6 +353,7 @@ fn thread_reads(
         .map(|(node_id, key)| (*key, node_id as u32))
         .collect();
     let mut transitions: FxHashMap<(u32, u32), TransitionEvidence> = FxHashMap::default();
+    let mut triplets: FxHashMap<(u32, u32, u32), u32> = FxHashMap::default();
     let mut threaded_reads = 0_u64;
     let mut threaded_pairs = 0_u64;
 
@@ -337,14 +361,26 @@ fn thread_reads(
         let left_segments = thread_record(&left.sequence, graph.k, &node_index, unitigs)?;
         if !left_segments.is_empty() {
             threaded_reads += 1;
-            add_direct_transitions(&left_segments, unitigs, &mut transitions);
+            add_direct_transitions(
+                &left_segments,
+                unitigs,
+                &mut transitions,
+                &mut triplets,
+                collect_triplets,
+            );
         }
 
         if let Some(right) = right {
             let right_segments = thread_record(&right.sequence, graph.k, &node_index, unitigs)?;
             if !right_segments.is_empty() {
                 threaded_reads += 1;
-                add_direct_transitions(&right_segments, unitigs, &mut transitions);
+                add_direct_transitions(
+                    &right_segments,
+                    unitigs,
+                    &mut transitions,
+                    &mut triplets,
+                    collect_triplets,
+                );
             }
             if let (Some(left_end), Some(right_start)) = (
                 last_threaded_unitig(&left_segments),
@@ -362,6 +398,7 @@ fn thread_reads(
 
     Ok(ThreadingResult {
         transitions,
+        triplets,
         threaded_reads,
         threaded_pairs,
     })
@@ -451,7 +488,10 @@ fn add_direct_transitions(
     segments: &[ThreadedSegment],
     unitigs: &UnitigGraph,
     transitions: &mut FxHashMap<(u32, u32), TransitionEvidence>,
+    triplets: &mut FxHashMap<(u32, u32, u32), u32>,
+    collect_triplets: bool,
 ) {
+    let mut observed_triplets: FxHashSet<(u32, u32, u32)> = FxHashSet::default();
     for segment in segments {
         for pair in segment.unitigs.windows(2) {
             if pair[0] == pair[1] {
@@ -460,6 +500,18 @@ fn add_direct_transitions(
             let evidence = transitions.entry((pair[0], pair[1])).or_default();
             evidence.direct_reads = evidence.direct_reads.saturating_add(1);
         }
+        if collect_triplets {
+            for path in segment.unitigs.windows(3) {
+                if path[0] == path[1] || path[1] == path[2] || path[0] == path[2] {
+                    continue;
+                }
+                observed_triplets.insert((path[0], path[1], path[2]));
+            }
+        }
+    }
+    for triplet in observed_triplets {
+        let support = triplets.entry(triplet).or_insert(0);
+        *support = support.saturating_add(1);
     }
 
     // Exact k-mer threading can be interrupted by a short filtered or
@@ -495,9 +547,10 @@ fn add_direct_transitions(
 fn primary_paths(
     unitigs: &UnitigGraph,
     transitions: &FxHashMap<(u32, u32), TransitionEvidence>,
+    triplets: &FxHashMap<(u32, u32, u32), u32>,
     bubble_alleles: &[BubbleAllele],
     selection: PathSelectionConfig,
-) -> (Vec<Vec<u32>>, usize) {
+) -> (Vec<Vec<u32>>, usize, usize) {
     let unitig_count = unitigs.unitigs.len();
     let excluded = non_primary_bubble_alleles(bubble_alleles);
     let mut outgoing_candidates: Vec<Vec<TransitionCandidate>> = vec![Vec::new(); unitig_count];
@@ -564,6 +617,56 @@ fn primary_paths(
         })
         .collect();
 
+    let (successor, predecessor, dominant_transitions, threaded_path_transitions) =
+        if selection.threaded_path_cover {
+            build_threaded_path_cover(
+                unitigs,
+                transitions,
+                triplets,
+                &excluded,
+                &outgoing_candidates,
+                &incoming_candidates,
+                &selected_out,
+                &selected_in,
+                selection,
+            )
+        } else {
+            build_reciprocal_path_cover(
+                &excluded,
+                &outgoing_candidates,
+                &incoming_candidates,
+                &selected_out,
+                &selected_in,
+            )
+        };
+
+    let mut used = vec![false; unitig_count];
+    for &unitig_id in &excluded {
+        used[unitig_id as usize] = true;
+    }
+    let mut paths = Vec::new();
+    for start in 0..unitig_count as u32 {
+        if used[start as usize] || predecessor[start as usize].is_some() {
+            continue;
+        }
+        paths.push(extend_selected_path(start, &successor, &mut used));
+    }
+    for start in 0..unitig_count as u32 {
+        if !used[start as usize] {
+            paths.push(extend_selected_path(start, &successor, &mut used));
+        }
+    }
+    (paths, dominant_transitions, threaded_path_transitions)
+}
+
+fn build_reciprocal_path_cover(
+    excluded: &FxHashSet<u32>,
+    outgoing_candidates: &[Vec<TransitionCandidate>],
+    incoming_candidates: &[Vec<TransitionCandidate>],
+    selected_out: &[Option<u32>],
+    selected_in: &[Option<u32>],
+) -> (Vec<Option<u32>>, Vec<Option<u32>>, usize, usize) {
+    let unitig_count = outgoing_candidates.len();
     let mut successor = vec![None; unitig_count];
     let mut predecessor = vec![None; unitig_count];
     let mut dominant_transitions = 0_usize;
@@ -584,24 +687,210 @@ fn primary_paths(
             }
         }
     }
+    (successor, predecessor, dominant_transitions, 0)
+}
 
-    let mut used = vec![false; unitig_count];
-    for &unitig_id in &excluded {
-        used[unitig_id as usize] = true;
-    }
-    let mut paths = Vec::new();
-    for start in 0..unitig_count as u32 {
-        if used[start as usize] || predecessor[start as usize].is_some() {
+#[allow(clippy::too_many_arguments)]
+fn build_threaded_path_cover(
+    unitigs: &UnitigGraph,
+    transitions: &FxHashMap<(u32, u32), TransitionEvidence>,
+    triplets: &FxHashMap<(u32, u32, u32), u32>,
+    excluded: &FxHashSet<u32>,
+    outgoing_candidates: &[Vec<TransitionCandidate>],
+    incoming_candidates: &[Vec<TransitionCandidate>],
+    selected_out: &[Option<u32>],
+    selected_in: &[Option<u32>],
+    selection: PathSelectionConfig,
+) -> (Vec<Option<u32>>, Vec<Option<u32>>, usize, usize) {
+    let unitig_count = unitigs.unitigs.len();
+    let (mut successor, mut predecessor, mut dominant_transitions, _) =
+        build_reciprocal_path_cover(
+            excluded,
+            outgoing_candidates,
+            incoming_candidates,
+            selected_out,
+            selected_in,
+        );
+
+    // A candidate is a complete same-read observation of
+    // left -> middle -> right. Requiring dominance for the prefix, suffix and
+    // the branching middle prevents independently selected incoming/outgoing
+    // edges from being combined into a strain switch.
+    let mut prefix_totals: FxHashMap<(u32, u32), u64> = FxHashMap::default();
+    let mut suffix_totals: FxHashMap<(u32, u32), u64> = FxHashMap::default();
+    let mut middle_totals: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut valid_triplets = Vec::new();
+    for (&(left, middle, right), &support) in triplets {
+        if support == 0
+            || left == middle
+            || middle == right
+            || left == right
+            || excluded.contains(&left)
+            || excluded.contains(&middle)
+            || excluded.contains(&right)
+            || !unitigs.has_edge(left, middle)
+            || !unitigs.has_edge(middle, right)
+        {
             continue;
         }
-        paths.push(extend_selected_path(start, &successor, &mut used));
+        valid_triplets.push((left, middle, right, support));
+        *prefix_totals.entry((left, middle)).or_insert(0) += u64::from(support);
+        *suffix_totals.entry((middle, right)).or_insert(0) += u64::from(support);
+        *middle_totals.entry(middle).or_insert(0) += u64::from(support);
     }
-    for start in 0..unitig_count as u32 {
-        if !used[start as usize] {
-            paths.push(extend_selected_path(start, &successor, &mut used));
+
+    let mut candidates = Vec::new();
+    for (left, middle, right, support) in valid_triplets {
+        if support < selection.min_primary_support {
+            continue;
+        }
+        let prefix_fraction = support as f32 / prefix_totals[&(left, middle)].max(1) as f32;
+        let suffix_fraction = support as f32 / suffix_totals[&(middle, right)].max(1) as f32;
+        let middle_fraction = support as f32 / middle_totals[&middle].max(1) as f32;
+        if prefix_fraction < selection.dominance
+            || suffix_fraction < selection.dominance
+            || middle_fraction < selection.dominance
+        {
+            continue;
+        }
+        candidates.push(triplet_candidate(
+            left,
+            middle,
+            right,
+            support,
+            unitigs,
+            transitions,
+            selection.min_count,
+        ));
+    }
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .support
+            .cmp(&left.support)
+            .then_with(|| right.edge_direct_min.cmp(&left.edge_direct_min))
+            .then_with(|| right.edge_pair_min.cmp(&left.edge_pair_min))
+            .then_with(|| right.solid_topology.cmp(&left.solid_topology))
+            .then_with(|| left.left.cmp(&right.left))
+            .then_with(|| left.middle.cmp(&right.middle))
+            .then_with(|| left.right.cmp(&right.right))
+    });
+
+    // Start from the conservative reciprocal path cover. Add a triplet
+    // atomically: existing edges must agree with it, and all missing edges are
+    // added together or not at all. This allows overlapping read triplets to
+    // grow long paths without mixing two different observed haplotypes.
+    let mut parent: Vec<u32> = (0..unitig_count as u32).collect();
+    for (source, target) in successor.iter().enumerate() {
+        if let Some(target) = target {
+            union_components(&mut parent, source as u32, *target);
         }
     }
-    (paths, dominant_transitions)
+
+    let mut threaded_path_transitions = 0_usize;
+    for candidate in candidates {
+        let left = candidate.left as usize;
+        let middle = candidate.middle as usize;
+        let right = candidate.right as usize;
+        if !successor[left].is_none_or(|target| target == candidate.middle)
+            || !predecessor[middle].is_none_or(|source| source == candidate.left)
+            || !successor[middle].is_none_or(|target| target == candidate.right)
+            || !predecessor[right].is_none_or(|source| source == candidate.middle)
+        {
+            continue;
+        }
+
+        let add_left = successor[left].is_none();
+        let add_right = successor[middle].is_none();
+        if !add_left && !add_right {
+            continue;
+        }
+        let left_root = find_component(&mut parent, candidate.left);
+        let middle_root = find_component(&mut parent, candidate.middle);
+        let right_root = find_component(&mut parent, candidate.right);
+        if (add_left && left_root == middle_root)
+            || (add_right && middle_root == right_root)
+            || (add_left && add_right && left_root == right_root)
+        {
+            continue;
+        }
+
+        if add_left {
+            successor[left] = Some(candidate.middle);
+            predecessor[middle] = Some(candidate.left);
+            union_components(&mut parent, candidate.left, candidate.middle);
+            if outgoing_candidates[left].len() > 1 || incoming_candidates[middle].len() > 1 {
+                dominant_transitions += 1;
+            }
+            threaded_path_transitions += 1;
+        }
+        if add_right {
+            successor[middle] = Some(candidate.right);
+            predecessor[right] = Some(candidate.middle);
+            union_components(&mut parent, candidate.middle, candidate.right);
+            if outgoing_candidates[middle].len() > 1 || incoming_candidates[right].len() > 1 {
+                dominant_transitions += 1;
+            }
+            threaded_path_transitions += 1;
+        }
+    }
+
+    (
+        successor,
+        predecessor,
+        dominant_transitions,
+        threaded_path_transitions,
+    )
+}
+
+fn triplet_candidate(
+    left: u32,
+    middle: u32,
+    right: u32,
+    support: u32,
+    unitigs: &UnitigGraph,
+    transitions: &FxHashMap<(u32, u32), TransitionEvidence>,
+    min_count: u32,
+) -> TripletCandidate {
+    let left_evidence = transitions
+        .get(&(left, middle))
+        .copied()
+        .unwrap_or_default();
+    let right_evidence = transitions
+        .get(&(middle, right))
+        .copied()
+        .unwrap_or_default();
+    TripletCandidate {
+        left,
+        middle,
+        right,
+        support,
+        edge_direct_min: left_evidence.direct_reads.min(right_evidence.direct_reads),
+        edge_pair_min: left_evidence.read_pairs.min(right_evidence.read_pairs),
+        solid_topology: [left, middle, right]
+            .into_iter()
+            .all(|node| unitigs.unitigs[node as usize].min_coverage >= min_count),
+    }
+}
+
+fn find_component(parent: &mut [u32], mut node: u32) -> u32 {
+    let mut root = node;
+    while parent[root as usize] != root {
+        root = parent[root as usize];
+    }
+    while parent[node as usize] != node {
+        let next = parent[node as usize];
+        parent[node as usize] = root;
+        node = next;
+    }
+    root
+}
+
+fn union_components(parent: &mut [u32], left: u32, right: u32) {
+    let left_root = find_component(parent, left);
+    let right_root = find_component(parent, right);
+    if left_root != right_root {
+        parent[right_root as usize] = left_root;
+    }
 }
 
 fn non_primary_bubble_alleles(bubble_alleles: &[BubbleAllele]) -> FxHashSet<u32> {
@@ -871,6 +1160,7 @@ pub fn assemble_unitig_path(unitigs: &UnitigGraph, path: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod transition_selection_tests {
     use super::*;
+    use crate::graph::{Unitig, UnitigGraph};
 
     fn candidate(
         node: u32,
@@ -914,6 +1204,96 @@ mod transition_selection_tests {
     fn ambiguous_physical_evidence_remains_unresolved() {
         let candidates = [candidate(3, 0, 5, true), candidate(4, 0, 4, true)];
         assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), None);
+    }
+
+    #[test]
+    fn same_read_triplets_resolve_a_consistent_major_path() {
+        let unitigs = UnitigGraph {
+            k: 3,
+            unitigs: (0..5)
+                .map(|id| Unitig {
+                    id,
+                    states: Vec::new(),
+                    sequence: b"ACGT".to_vec(),
+                    start_state: id,
+                    end_state: id + 1,
+                    length: 4,
+                    mean_coverage: 10.0,
+                    min_coverage: 3,
+                    max_coverage: 10,
+                    circular: false,
+                })
+                .collect(),
+            edge_to_unitig: FxHashMap::default(),
+            reverse_unitig: vec![0, 1, 2, 3, 4],
+            out_offsets: vec![0, 1, 3, 4, 4, 4],
+            out_targets: vec![1, 3, 4, 1],
+            indegree: vec![0, 2, 0, 1, 1],
+        };
+        let mut transitions = FxHashMap::default();
+        for (edge, support) in [
+            ((0, 1), 10),
+            ((2, 1), 9),
+            ((1, 3), 10),
+            ((1, 4), 9),
+        ] {
+            transitions.insert(
+                edge,
+                TransitionEvidence {
+                    direct_reads: support,
+                    ..TransitionEvidence::default()
+                },
+            );
+        }
+        let triplets: FxHashMap<_, _> = [((0, 1, 3), 10), ((2, 1, 4), 2)]
+            .into_iter()
+            .collect();
+        let outgoing = vec![
+            vec![candidate(1, 10, 0, true)],
+            vec![candidate(3, 10, 0, true), candidate(4, 9, 0, true)],
+            vec![candidate(1, 9, 0, true)],
+            Vec::new(),
+            Vec::new(),
+        ];
+        let incoming = vec![
+            Vec::new(),
+            vec![candidate(0, 10, 0, true), candidate(2, 9, 0, true)],
+            Vec::new(),
+            vec![candidate(1, 10, 0, true)],
+            vec![candidate(1, 9, 0, true)],
+        ];
+        let selected_out: Vec<Option<u32>> = outgoing
+            .iter()
+            .map(|items| choose_transition(items, 2, 2, 5, 0.75))
+            .collect();
+        let selected_in: Vec<Option<u32>> = incoming
+            .iter()
+            .map(|items| choose_transition(items, 2, 2, 5, 0.75))
+            .collect();
+        let selection = PathSelectionConfig {
+            min_read_support: 2,
+            min_pair_support: 2,
+            min_primary_support: 5,
+            min_count: 2,
+            dominance: 0.75,
+            threaded_path_cover: true,
+        };
+        let (successor, predecessor, _, threaded) = build_threaded_path_cover(
+            &unitigs,
+            &transitions,
+            &triplets,
+            &FxHashSet::default(),
+            &outgoing,
+            &incoming,
+            &selected_out,
+            &selected_in,
+            selection,
+        );
+        assert_eq!(successor[0], Some(1));
+        assert_eq!(successor[1], Some(3));
+        assert_eq!(predecessor[1], Some(0));
+        assert_eq!(predecessor[3], Some(1));
+        assert_eq!(threaded, 2);
     }
 }
 
@@ -964,10 +1344,38 @@ mod gapped_threading_tests {
             },
         ];
         let mut transitions = FxHashMap::default();
-        add_direct_transitions(&segments, &two_unitig_graph(true), &mut transitions);
+        add_direct_transitions(
+            &segments,
+            &two_unitig_graph(true),
+            &mut transitions,
+            &mut FxHashMap::default(),
+            false,
+        );
         let evidence = transitions.get(&(0, 1)).copied().unwrap_or_default();
         assert_eq!(evidence.direct_reads, 1);
         assert_eq!(evidence.gapped_reads, 1);
+    }
+
+    #[test]
+    fn contiguous_read_path_records_triplet_support() {
+        let segments = vec![ThreadedSegment {
+            unitigs: vec![0, 1, 2],
+            start_edge_position: 0,
+            end_edge_position: 6,
+        }];
+        let graph = UnitigGraph {
+            k: 3,
+            unitigs: vec![unitig(0), unitig(1), unitig(2)],
+            edge_to_unitig: FxHashMap::default(),
+            reverse_unitig: vec![0, 1, 2],
+            out_offsets: vec![0, 1, 2, 2],
+            out_targets: vec![1, 2],
+            indegree: vec![0, 1, 1],
+        };
+        let mut transitions = FxHashMap::default();
+        let mut triplets = FxHashMap::default();
+        add_direct_transitions(&segments, &graph, &mut transitions, &mut triplets, true);
+        assert_eq!(triplets.get(&(0, 1, 2)), Some(&1));
     }
 
     #[test]
@@ -985,7 +1393,13 @@ mod gapped_threading_tests {
             },
         ];
         let mut transitions = FxHashMap::default();
-        add_direct_transitions(&segments, &two_unitig_graph(false), &mut transitions);
+        add_direct_transitions(
+            &segments,
+            &two_unitig_graph(false),
+            &mut transitions,
+            &mut FxHashMap::default(),
+            false,
+        );
         assert!(!transitions.contains_key(&(0, 1)));
     }
 }

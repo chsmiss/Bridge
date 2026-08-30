@@ -44,6 +44,9 @@ enum Command {
         min_primary_support: u32,
         #[arg(long, default_value_t = 0.75)]
         primary_dominance: f32,
+        /// Use dominant same-read unitig triplets to resolve a global path cover.
+        #[arg(long, default_value_t = false)]
+        threaded_path_cover: bool,
         #[arg(long, default_value_t = 200)]
         min_contig_length: usize,
         #[arg(long, default_value_t = 100)]
@@ -71,6 +74,7 @@ fn main() -> Result<()> {
             min_pair_support,
             min_primary_support,
             primary_dominance,
+            threaded_path_cover,
             min_contig_length,
             scaffold_gap_bases,
             max_pairs,
@@ -95,6 +99,7 @@ fn main() -> Result<()> {
                 min_pair_support,
                 min_primary_support,
                 primary_dominance,
+                threaded_path_cover,
                 min_contig_length,
                 scaffold_gap_bases,
                 max_pairs,
