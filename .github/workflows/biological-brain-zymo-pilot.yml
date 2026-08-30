@@ -1,0 +1,235 @@
+name: Biological Brain matched Zymo pilot
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/biological-brain-zymo-pilot.yml
+      - biological_brain/**
+      - src/bin/bridgeasm-evidence-path.rs
+  workflow_dispatch:
+    inputs:
+      read_pairs:
+        description: Number of paired reads streamed for the Plass pilot
+        required: false
+        default: "25000"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  PILOT_READ_PAIRS: ${{ inputs.read_pairs || '25000' }}
+
+jobs:
+  matched-protein-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bridge-plass
+          create-args: >-
+            -c conda-forge
+            -c bioconda
+            python=3.11
+            plass
+          cache-environment: true
+          init-shell: bash
+
+      - name: Find a successful graph artifact from the same branch
+        run: |
+          set -euo pipefail
+          mkdir -p source_artifacts
+          selected=""
+          for workflow in \
+            zymo-cleanpath-500k.yml \
+            zymo-flowpath-500k.yml \
+            zymo-midk-500k-sweep.yml \
+            zymo-reference-smoke.yml
+          do
+            test -f ".github/workflows/${workflow}" || continue
+            mapfile -t runs < <(
+              gh api -X GET \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs" \
+                -f branch="${GITHUB_REF_NAME}" \
+                -f status=success \
+                -f per_page=20 \
+                --jq '.workflow_runs[].id' 2>/dev/null || true
+            )
+            for run_id in "${runs[@]}"; do
+              artifact_count=$(gh api \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
+                --jq '.total_count' 2>/dev/null || echo 0)
+              if [[ "${artifact_count}" == "0" ]]; then
+                continue
+              fi
+              rm -rf source_artifacts/*
+              if ! gh run download "${run_id}" --repo "${GITHUB_REPOSITORY}" --dir source_artifacts; then
+                continue
+              fi
+              candidate=$(find source_artifacts -type f -name '*.gfa' -printf '%s\t%p\n' \
+                | sort -nr | head -n 1 | cut -f2- || true)
+              if [[ -z "${candidate}" ]]; then
+                compressed=$(find source_artifacts -type f -name '*.gfa.gz' -printf '%s\t%p\n' \
+                  | sort -nr | head -n 1 | cut -f2- || true)
+                if [[ -n "${compressed}" ]]; then
+                  gzip -dc "${compressed}" > source_artifacts/matched_graph.gfa
+                  candidate=source_artifacts/matched_graph.gfa
+                fi
+              fi
+              if [[ -n "${candidate}" && -s "${candidate}" ]]; then
+                selected="${candidate}"
+                echo "SOURCE_WORKFLOW=${workflow}" >> "${GITHUB_ENV}"
+                echo "SOURCE_RUN_ID=${run_id}" >> "${GITHUB_ENV}"
+                echo "MATCHED_GFA=${candidate}" >> "${GITHUB_ENV}"
+                break 2
+              fi
+            done
+          done
+          if [[ -z "${selected}" ]]; then
+            echo "No successful artifact containing a GFA was found" >&2
+            exit 2
+          fi
+          echo "Using ${selected} from ${SOURCE_WORKFLOW:-selected workflow}"
+
+      - name: Resolve the exact FASTQ pair used by the source workflow
+        run: |
+          python biological_brain/extract_fastq_urls.py \
+            --workflow ".github/workflows/${SOURCE_WORKFLOW}" \
+            --github-env "${GITHUB_ENV}"
+
+      - name: Stream a bounded paired-read subset
+        run: |
+          mkdir -p pilot
+          python - <<'PY'
+          import gzip
+          import os
+          import urllib.request
+
+          pairs = int(os.environ['PILOT_READ_PAIRS'])
+          for url_key, output in [('READ1_URL', 'pilot/r1.fastq'), ('READ2_URL', 'pilot/r2.fastq')]:
+              url = os.environ[url_key]
+              request = urllib.request.Request(url, headers={'User-Agent': 'BridgeAsm-protein-pilot'})
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  with gzip.GzipFile(fileobj=response) as compressed:
+                      with open(output, 'wb') as handle:
+                          for _ in range(pairs * 4):
+                              line = compressed.readline()
+                              if not line:
+                                  break
+                              handle.write(line)
+              lines = sum(1 for _ in open(output, 'rb'))
+              if lines < 4:
+                  raise SystemExit(f'no FASTQ records streamed from {url}')
+              if lines % 4:
+                  raise SystemExit(f'truncated FASTQ record in {output}: {lines} lines')
+              print(output, 'records=', lines // 4, 'url=', url)
+          PY
+          cat pilot/r1.fastq pilot/r2.fastq > pilot/reads.fastq
+
+      - name: Run Plass protein preassembly
+        run: |
+          mkdir -p pilot/plass_tmp
+          plass assemble \
+            pilot/reads.fastq \
+            pilot/plass_proteins.faa \
+            pilot/plass_tmp \
+            --threads 2
+          test -s pilot/plass_proteins.faa
+          echo "Plass proteins: $(grep -c '^>' pilot/plass_proteins.faa)"
+
+      - name: Back-project protein paths to existing graph links
+        run: |
+          python biological_brain/protein_bridge_evidence.py \
+            --gfa "${MATCHED_GFA}" \
+            --proteins pilot/plass_proteins.faa \
+            --output pilot/protein_evidence.tsv \
+            --junction-nt 300 \
+            --max-kmer-occurrences 24
+          python biological_brain/kmer_junction_lm.py \
+            --gfa "${MATCHED_GFA}" \
+            --output pilot/dna_lm.tsv
+
+      - name: Build evidence-aware consensus paths
+        run: |
+          cargo run --release --quiet --bin bridgeasm-evidence-path -- \
+            --gfa "${MATCHED_GFA}" \
+            --edge-evidence pilot/protein_evidence.tsv \
+            --dna-lm-scores pilot/dna_lm.tsv \
+            --output pilot/evidence_contigs.fasta \
+            --report pilot/evidence_path_report.tsv \
+            --mode balanced \
+            --min-length 200
+
+      - name: Summarize without overclaiming reference accuracy
+        run: |
+          python biological_brain/assembly_stats.py \
+            --input "${MATCHED_GFA}" \
+            --format gfa \
+            --minimum 200 \
+            --label source_gfa_segments \
+            --output pilot/source_stats.json
+          python biological_brain/assembly_stats.py \
+            --input pilot/evidence_contigs.fasta \
+            --format fasta \
+            --minimum 200 \
+            --evidence pilot/protein_evidence.tsv \
+            --label protein_evidence_paths \
+            --output pilot/evidence_stats.json
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          from collections import Counter
+
+          classes = Counter()
+          supported = 0
+          with open('pilot/protein_evidence.tsv', newline='') as handle:
+              for row in csv.DictReader(handle, delimiter='\t'):
+                  classes[row['breakpoint_class']] += 1
+                  supported += row['breakpoint_class'] == 'same_orf_supported'
+          selected = 0
+          selected_protein = 0
+          with open('pilot/evidence_path_report.tsv', newline='') as handle:
+              for row in csv.DictReader(handle, delimiter='\t'):
+                  if row['selected'] == 'true':
+                      selected += 1
+                      selected_protein += row['protein_ok'] == 'true'
+          summary = {
+              'source_workflow': os.environ['SOURCE_WORKFLOW'],
+              'source_run_id': int(os.environ['SOURCE_RUN_ID']),
+              'read_pairs': int(os.environ['PILOT_READ_PAIRS']),
+              'protein_evidence_classes': dict(classes),
+              'supported_existing_edges': supported,
+              'selected_edges': selected,
+              'selected_protein_supported_edges': selected_protein,
+              'note': 'No reference-based correctness claim is made in this pilot; run MetaQUAST before accepting an N50 change.',
+          }
+          with open('pilot/pilot_summary.json', 'w') as handle:
+              json.dump(summary, handle, indent=2, sort_keys=True)
+              handle.write('\n')
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: biological-brain-zymo-pilot
+          path: |
+            pilot/plass_proteins.faa
+            pilot/protein_evidence.tsv
+            pilot/dna_lm.tsv
+            pilot/evidence_contigs.fasta
+            pilot/evidence_path_report.tsv
+            pilot/source_stats.json
+            pilot/evidence_stats.json
+            pilot/pilot_summary.json
+          if-no-files-found: warn
