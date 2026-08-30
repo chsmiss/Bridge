@@ -1,3 +1,4 @@
+# benchmark revision: fragment-aware mercy quality sweep
 name: Zymo Log reference benchmark
 
 on:
@@ -23,7 +24,7 @@ permissions:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       PAIRS: ${{ inputs.pairs || '50000' }}
     steps:
@@ -38,6 +39,7 @@ jobs:
           tar -xzf /tmp/quast.tar.gz -C /tmp
       - name: Download Zymo reads and official references
         run: |
+          mkdir -p benchmark
           python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
           curl -L --retry 3 -o /tmp/zymo-refs.zip \
             'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
@@ -46,12 +48,12 @@ jobs:
           find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
             | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
           test -s /tmp/zymo-references.fasta
-          grep -c '^>' /tmp/zymo-references.fasta | tee benchmark-reference-count.txt
+          grep -c '^>' /tmp/zymo-references.fasta | tee benchmark/benchmark-reference-count.txt
       - name: Build BridgeAsm
         run: cargo build --release
       - name: Run BridgeAsm configurations
         run: |
-          mkdir -p benchmark
+          mkdir -p benchmark/assemblies
           run_bridgeasm() {
             name=$1
             shift
@@ -65,12 +67,25 @@ jobs:
                 --min-read-support 2 --min-pair-support 2 \
                 --min-primary-support 5 --primary-dominance 0.75 \
                 --min-contig-length 200 --threads 2 "$@"
+            cp "benchmark/$name/primary_contigs.fasta" "benchmark/assemblies/$name.primary.fasta"
+            cp "benchmark/$name/unitigs.fasta" "benchmark/assemblies/$name.unitigs.fasta"
+            cat "benchmark/$name/primary_contigs.fasta" \
+                "benchmark/$name/variants.fasta" \
+                "benchmark/$name/haplotigs.fasta" \
+                > "benchmark/assemblies/$name.all.fasta"
             python3 scripts/fasta_stats.py "benchmark/$name/primary_contigs.fasta" \
               --json "benchmark/$name.stats.json" | tee "benchmark/$name.stats.tsv"
           }
-          run_bridgeasm bridgeasm-default --mercy-max-kmers 16 --mercy-min-support 1
-          run_bridgeasm bridgeasm-long-mercy1 --mercy-max-kmers 64 --mercy-min-support 1
-          run_bridgeasm bridgeasm-long-mercy2 --mercy-max-kmers 64 --mercy-min-support 2
+          run_bridgeasm bridgeasm-default-q25 \
+            --mercy-max-kmers 16 --mercy-min-support 1 --mercy-min-quality 25
+          run_bridgeasm bridgeasm-long-q25 \
+            --mercy-max-kmers 64 --mercy-min-support 1 --mercy-min-quality 25
+          run_bridgeasm bridgeasm-long-q30 \
+            --mercy-max-kmers 64 --mercy-min-support 1 --mercy-min-quality 30
+          run_bridgeasm bridgeasm-long-q35 \
+            --mercy-max-kmers 64 --mercy-min-support 1 --mercy-min-quality 35
+          run_bridgeasm bridgeasm-long-support2-q25 \
+            --mercy-max-kmers 64 --mercy-min-support 2 --mercy-min-quality 25
       - name: Run MEGAHIT
         run: |
           /usr/bin/time -v -o benchmark/megahit.time.txt \
@@ -78,6 +93,7 @@ jobs:
               -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
               -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
               -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
           python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
             --json benchmark/megahit.stats.json | tee benchmark/megahit.stats.tsv
       - name: Run metaSPAdes
@@ -87,23 +103,33 @@ jobs:
               -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
               -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
               -o benchmark/metaspades -t 2 -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
           python3 scripts/fasta_stats.py benchmark/metaspades/contigs.fasta \
             --json benchmark/metaspades.stats.json | tee benchmark/metaspades.stats.tsv
-      - name: Run MetaQUAST
+      - name: Run MetaQUAST on primary and recovery layers
         run: |
           python3 /tmp/quast-5.3.0/metaquast.py \
-            benchmark/bridgeasm-default/primary_contigs.fasta \
-            benchmark/bridgeasm-long-mercy1/primary_contigs.fasta \
-            benchmark/bridgeasm-long-mercy2/primary_contigs.fasta \
-            benchmark/megahit/final.contigs.fa \
-            benchmark/metaspades/contigs.fasta \
+            benchmark/assemblies/bridgeasm-default-q25.primary.fasta \
+            benchmark/assemblies/bridgeasm-default-q25.unitigs.fasta \
+            benchmark/assemblies/bridgeasm-default-q25.all.fasta \
+            benchmark/assemblies/bridgeasm-long-q25.primary.fasta \
+            benchmark/assemblies/bridgeasm-long-q25.unitigs.fasta \
+            benchmark/assemblies/bridgeasm-long-q25.all.fasta \
+            benchmark/assemblies/bridgeasm-long-q30.primary.fasta \
+            benchmark/assemblies/bridgeasm-long-q30.all.fasta \
+            benchmark/assemblies/bridgeasm-long-q35.primary.fasta \
+            benchmark/assemblies/bridgeasm-long-q35.all.fasta \
+            benchmark/assemblies/bridgeasm-long-support2-q25.primary.fasta \
+            benchmark/assemblies/bridgeasm-long-support2-q25.all.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
             -r /tmp/zymo-references.fasta \
             -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
       - name: Save provenance
         run: |
           cp /tmp/zymo-log/subset_provenance.json benchmark/
-          cp benchmark-reference-count.txt benchmark/
-          printf 'commit\t%s\nread_pairs\t%s\n' "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+          printf 'commit\t%s\nread_pairs\t%s\nmercy_semantics\tindependent_fragment_continuous_span\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
       - uses: actions/upload-artifact@v4
         with:
           name: zymo-log-reference-benchmark
