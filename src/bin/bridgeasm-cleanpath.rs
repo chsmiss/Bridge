@@ -127,7 +127,10 @@ fn main() -> Result<()> {
         write_report(path, &segments, &links, &round_stats)?;
     }
 
-    let mut lengths = records.iter().map(|(_, sequence)| sequence.len()).collect::<Vec<_>>();
+    let mut lengths = records
+        .iter()
+        .map(|(_, sequence)| sequence.len())
+        .collect::<Vec<_>>();
     let total: usize = lengths.iter().sum();
     let n50 = n50(&mut lengths);
     let largest = lengths.iter().copied().max().unwrap_or(0);
@@ -217,8 +220,7 @@ fn read_gfa(path: &PathBuf) -> Result<(Vec<Segment>, Vec<Link>)> {
     let mut links = Vec::with_capacity(raw_links.len());
     for line in raw_links {
         let fields = line.split('\t').collect::<Vec<_>>();
-        let (Some(&source), Some(&target)) =
-            (name_to_id.get(fields[1]), name_to_id.get(fields[3]))
+        let (Some(&source), Some(&target)) = (name_to_id.get(fields[1]), name_to_id.get(fields[3]))
         else {
             continue;
         };
@@ -286,14 +288,21 @@ fn remove_weak_tips(segments: &mut [Segment], links: &mut [Link], cli: &Cli) -> 
             .chain(outgoing[node].iter())
             .copied()
             .collect::<Vec<_>>();
-        if incident.iter().any(|&edge_id| physical(&links[edge_id], cli)) {
+        if incident
+            .iter()
+            .any(|&edge_id| physical(&links[edge_id], cli))
+        {
             continue;
         }
         let neighbor_cov = incident
             .iter()
             .map(|&edge_id| {
                 let link = links[edge_id];
-                let other = if link.source == node { link.target } else { link.source };
+                let other = if link.source == node {
+                    link.target
+                } else {
+                    link.source
+                };
                 segments[other].coverage
             })
             .fold(0.0_f32, f32::max);
@@ -363,7 +372,10 @@ fn pop_simple_bubbles(segments: &mut [Segment], links: &mut [Link], cli: &Cli) -
         for &first_edge_id in &outgoing[source] {
             let first = links[first_edge_id];
             let middle = first.target;
-            if !segments[middle].active || incoming[middle].len() != 1 || outgoing[middle].len() != 1 {
+            if !segments[middle].active
+                || incoming[middle].len() != 1
+                || outgoing[middle].len() != 1
+            {
                 continue;
             }
             let second_edge_id = outgoing[middle][0];
@@ -496,7 +508,11 @@ fn assemble_path(path: &[usize], segments: &[Segment], links: &[Link]) -> Vec<u8
 
 fn canonical_sequence(sequence: Vec<u8>) -> Vec<u8> {
     let reverse = reverse_complement(&sequence);
-    if reverse < sequence { reverse } else { sequence }
+    if reverse < sequence {
+        reverse
+    } else {
+        sequence
+    }
 }
 
 fn reverse_complement(sequence: &[u8]) -> Vec<u8> {

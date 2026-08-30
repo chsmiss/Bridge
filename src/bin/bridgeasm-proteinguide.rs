@@ -248,13 +248,8 @@ fn main() -> Result<()> {
         FxHashMap::default()
     };
     let config = SelectionConfig::from(&cli);
-    let (mut ranked, rejection_counts) = build_candidates(
-        &graph,
-        &guides,
-        &anchors_by_guide,
-        &model_evidence,
-        config,
-    );
+    let (mut ranked, rejection_counts) =
+        build_candidates(&graph, &guides, &anchors_by_guide, &model_evidence, config);
     let (successor, predecessor, orientation) =
         select_path_cover(&mut ranked, graph.segments.len());
     let records = build_output_records(
@@ -302,8 +297,8 @@ fn main() -> Result<()> {
             .collect(),
     };
     if let Some(path) = cli.summary.as_deref() {
-        let file = File::create(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        let file =
+            File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
         serde_json::to_writer_pretty(BufWriter::new(file), &summary)
             .context("failed to write protein-guide summary")?;
     }
@@ -548,7 +543,18 @@ fn read_unique_anchors(
             fields[10].parse::<usize>(),
             fields[11].parse::<u8>(),
         );
-        let (Ok(query_len), Ok(query_start), Ok(query_end), Ok(target_len), Ok(target_start), Ok(target_end), Ok(matches), Ok(aligned_length), Ok(mapq)) = parsed else {
+        let (
+            Ok(query_len),
+            Ok(query_start),
+            Ok(query_end),
+            Ok(target_len),
+            Ok(target_start),
+            Ok(target_end),
+            Ok(matches),
+            Ok(aligned_length),
+            Ok(mapq),
+        ) = parsed
+        else {
             stats.malformed_or_unknown += 1;
             continue;
         };
@@ -659,7 +665,10 @@ fn project_full_span(
             target_end as i64 + query_right,
         )
     };
-    (start.clamp(0, target_len as i64), end.clamp(0, target_len as i64))
+    (
+        start.clamp(0, target_len as i64),
+        end.clamp(0, target_len as i64),
+    )
 }
 
 fn same_locus(left: &Anchor, right: &Anchor) -> bool {
@@ -692,13 +701,24 @@ fn read_model_scores(
             continue;
         }
         if fields.len() < 3 {
-            bail!("model score line {} has fewer than three columns", line_index + 1);
+            bail!(
+                "model score line {} has fewer than three columns",
+                line_index + 1
+            );
         }
         let source = parse_oriented_label(fields[0], name_to_id).with_context(|| {
-            format!("unknown model-score source {} on line {}", fields[0], line_index + 1)
+            format!(
+                "unknown model-score source {} on line {}",
+                fields[0],
+                line_index + 1
+            )
         })?;
         let target = parse_oriented_label(fields[1], name_to_id).with_context(|| {
-            format!("unknown model-score target {} on line {}", fields[1], line_index + 1)
+            format!(
+                "unknown model-score target {} on line {}",
+                fields[1],
+                line_index + 1
+            )
         })?;
         let score: f64 = fields[2]
             .parse()
@@ -706,11 +726,13 @@ fn read_model_scores(
         if !score.is_finite() {
             bail!("model score on line {} is not finite", line_index + 1);
         }
-        let decision = fields.get(3).copied().unwrap_or("neutral").to_ascii_lowercase();
+        let decision = fields
+            .get(3)
+            .copied()
+            .unwrap_or("neutral")
+            .to_ascii_lowercase();
         let scorer = fields.get(4).copied().unwrap_or("external").to_string();
-        let entry = evidence
-            .entry(EdgeKey { source, target })
-            .or_default();
+        let entry = evidence.entry(EdgeKey { source, target }).or_default();
         entry.score_sum += score;
         entry.votes += 1;
         entry.veto |= matches!(decision.as_str(), "veto" | "reject");
@@ -752,13 +774,7 @@ fn build_candidates(
         };
         let chain = monotonic_chain(anchors.clone());
         for pair in chain.windows(2) {
-            match make_candidate(
-                &pair[0],
-                &pair[1],
-                guide_sequence,
-                graph,
-                config,
-            ) {
+            match make_candidate(&pair[0], &pair[1], guide_sequence, graph, config) {
                 Ok(candidate) => {
                     let key = candidate.key;
                     if let Some(aggregate) = aggregates.get_mut(&key) {
@@ -914,12 +930,9 @@ fn make_candidate(
         overlap = graph_overlap;
     } else if projected_gap < 0 {
         let expected = (-projected_gap) as usize;
-        let Some((validated_overlap, _identity)) = find_suffix_prefix_overlap(
-            &left_sequence,
-            &right_sequence,
-            expected,
-            config,
-        ) else {
+        let Some((validated_overlap, _identity)) =
+            find_suffix_prefix_overlap(&left_sequence, &right_sequence, expected, config)
+        else {
             return Err("unvalidated_overlap");
         };
         overlap = validated_overlap;
