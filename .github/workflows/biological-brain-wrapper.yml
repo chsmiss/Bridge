@@ -1,0 +1,49 @@
+name: Biological Brain wrapper smoke
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - biological_brain/run_pipeline.sh
+      - biological_brain/*.py
+      - src/bin/bridgeasm-evidence-path.rs
+      - tests/make_plass_bridge_fixture.py
+      - tests/check_plass_bridge_fixture.py
+      - .github/workflows/biological-brain-wrapper.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wrapper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate fixture
+        run: python tests/make_plass_bridge_fixture.py --output fixture
+      - name: Run the complete wrapper with preassembled proteins
+        run: |
+          bash -n biological_brain/run_pipeline.sh
+          bash biological_brain/run_pipeline.sh \
+            --gfa fixture/graph.gfa \
+            --proteins fixture/reference_protein.faa \
+            --output-dir fixture/wrapper_result \
+            --mode balanced
+      - name: Verify wrapper output
+        run: |
+          python tests/check_plass_bridge_fixture.py \
+            --expected fixture/expected_dna.fasta \
+            --evidence fixture/wrapper_result/protein_evidence.tsv \
+            --report fixture/wrapper_result/evidence_path_report.tsv \
+            --contigs fixture/wrapper_result/evidence_contigs.fasta \
+            --plass-proteins fixture/reference_protein.faa
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: biological-brain-wrapper-smoke
+          path: fixture/wrapper_result
+          if-no-files-found: warn
