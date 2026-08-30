@@ -34,6 +34,8 @@ enum Command {
         mercy_max_kmers: usize,
         #[arg(long, default_value_t = 1)]
         mercy_min_support: u16,
+        #[arg(long, default_value_t = 25.0)]
+        mercy_min_quality: f32,
         #[arg(long, default_value_t = 2)]
         min_read_support: u32,
         #[arg(long, default_value_t = 2)]
@@ -62,6 +64,7 @@ fn main() -> Result<()> {
             min_count,
             mercy_max_kmers,
             mercy_min_support,
+            mercy_min_quality,
             min_read_support,
             min_pair_support,
             min_primary_support,
@@ -73,6 +76,9 @@ fn main() -> Result<()> {
             if k == 0 || k > MAX_K {
                 anyhow::bail!("k must be in 1..={MAX_K}");
             }
+            if !(0.0..=60.0).contains(&mercy_min_quality) {
+                anyhow::bail!("mercy minimum quality must be in 0..=60");
+            }
             let config = AssembleConfig {
                 read1,
                 read2,
@@ -81,6 +87,7 @@ fn main() -> Result<()> {
                 min_count,
                 mercy_max_kmers,
                 mercy_min_support,
+                mercy_min_quality,
                 min_read_support,
                 min_pair_support,
                 min_primary_support,

@@ -35,6 +35,7 @@ fn config(reads: std::path::PathBuf, output: std::path::PathBuf, k: usize) -> As
         min_count: 1,
         mercy_max_kmers: 0,
         mercy_min_support: 1,
+        mercy_min_quality: 25.0,
         min_read_support: 1,
         min_pair_support: 1,
         min_primary_support: 2,

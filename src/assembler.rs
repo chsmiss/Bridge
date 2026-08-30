@@ -3,7 +3,7 @@ use crate::fastq::for_each_pair;
 use crate::graph::{
     build_raw_graph, compact_unitigs, summarize, GraphSummary, RawGraph, UnitigGraph,
 };
-use crate::kmer::{count_and_filter, KmerCountSummary};
+use crate::kmer::{count_and_filter, KmerCountSummary, KmerFilterConfig};
 use anyhow::{Context, Result};
 use rayon::ThreadPoolBuilder;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -21,6 +21,7 @@ pub struct AssembleConfig {
     pub min_count: u32,
     pub mercy_max_kmers: usize,
     pub mercy_min_support: u16,
+    pub mercy_min_quality: f32,
     pub min_read_support: u32,
     pub min_pair_support: u32,
     pub min_primary_support: u32,
@@ -141,11 +142,14 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
     let kmer_set = count_and_filter(
         &config.read1,
         config.read2.as_deref(),
-        config.k,
-        config.min_count,
-        config.mercy_max_kmers,
-        config.mercy_min_support,
-        config.max_pairs,
+        KmerFilterConfig {
+            k: config.k,
+            min_count: config.min_count,
+            mercy_max_kmers: config.mercy_max_kmers,
+            mercy_min_support: config.mercy_min_support,
+            mercy_min_quality: config.mercy_min_quality,
+            max_pairs: config.max_pairs,
+        },
     )?;
     timings.insert(
         "kmer_count_filter".to_string(),

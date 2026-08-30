@@ -43,21 +43,39 @@ pub struct KmerSet {
     pub summary: KmerCountSummary,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct KmerFilterConfig {
+    pub k: usize,
+    pub min_count: u32,
+    pub mercy_max_kmers: usize,
+    pub mercy_min_support: u16,
+    pub mercy_min_quality: f32,
+    pub max_pairs: Option<usize>,
+}
+
 pub fn count_and_filter(
     read1: &Path,
     read2: Option<&Path>,
-    k: usize,
-    min_count: u32,
-    mercy_max_kmers: usize,
-    mercy_min_support: u16,
-    max_pairs: Option<usize>,
+    config: KmerFilterConfig,
 ) -> Result<KmerSet> {
+    let KmerFilterConfig {
+        k,
+        min_count,
+        mercy_max_kmers,
+        mercy_min_support,
+        mercy_min_quality,
+        max_pairs,
+    } = config;
     // Keep the public API stable while making the production min-count=2 path
     // quality- and independent-fragment-aware. Tests and explicitly permissive
     // runs using min-count=1 retain the historical behavior.
     let min_fragment_support = if min_count <= 1 { 1 } else { 2 };
     let min_mean_quality = if min_count <= 1 { 0.0 } else { 20.0 };
-    let mercy_min_quality = if min_count <= 1 { 0.0 } else { 25.0 };
+    let mercy_min_quality = if min_count <= 1 {
+        0.0
+    } else {
+        mercy_min_quality
+    };
 
     let mut evidence: FxHashMap<KmerKey, KmerEvidence> = FxHashMap::default();
     let mut observations = 0_u64;
