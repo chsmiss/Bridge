@@ -457,7 +457,19 @@ fn non_primary_bubble_alleles(bubble_alleles: &[BubbleAllele]) -> FxHashSet<u32>
 
     let mut excluded = FxHashSet::default();
     for alleles in groups.values() {
-        let Some(primary) = alleles.iter().copied().max_by(|left, right| {
+        // Sharing graph boundaries is not enough to prove a biological
+        // bubble. Collapse alternatives only when at least two alleles have
+        // independent direct-read support on both flanks. This prevents
+        // repeat/orientation artefacts from truncating a linear primary path.
+        let supported: Vec<&BubbleAllele> = alleles
+            .iter()
+            .copied()
+            .filter(|allele| allele.physically_flanked)
+            .collect();
+        if supported.len() < 2 {
+            continue;
+        }
+        let Some(primary) = supported.iter().copied().max_by(|left, right| {
             left.mean_coverage
                 .total_cmp(&right.mean_coverage)
                 .then_with(|| {
@@ -468,7 +480,7 @@ fn non_primary_bubble_alleles(bubble_alleles: &[BubbleAllele]) -> FxHashSet<u32>
         }) else {
             continue;
         };
-        for allele in alleles {
+        for allele in supported {
             if allele.unitig_id != primary.unitig_id {
                 excluded.insert(allele.unitig_id);
             }
