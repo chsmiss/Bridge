@@ -1,0 +1,65 @@
+name: Zymo Log 500k flowpath fast screen
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-flowpath-fast.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgeasm-rust-v0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download 500k Zymo pairs
+        run: python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs 500000
+      - name: Build
+        run: cargo build --release
+      - name: Assemble k31 relaxed
+        run: |
+          mkdir -p benchmark/k31-relaxed benchmark/fast
+          target/release/bridgeasm assemble \
+            -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/k31-relaxed -k 31 \
+            --min-count 2 --mercy-max-kmers 48 \
+            --mercy-min-support 1 --mercy-min-quality 25 \
+            --min-read-support 1 --min-pair-support 2 \
+            --min-primary-support 3 --primary-dominance 0.60 \
+            --min-contig-length 200 --threads 2
+          python3 scripts/fasta_stats.py benchmark/k31-relaxed/primary_contigs.fasta > benchmark/fast/baseline.tsv
+      - name: Flowpath N50 screen
+        run: |
+          for spec in \
+            'conservative 0.10 0.20 0.10' \
+            'megahit 0.10 0.20 0.10' \
+            'megahit 0.05 0.10 0.05' \
+            'aggressive 0.10 0.20 0.10' \
+            'aggressive 0.05 0.10 0.05' \
+            'coverage 0.10 0.20 0.10'; do
+            set -- $spec
+            mode=$1; dr=$2; lr=$3; sr=$4
+            name="${mode}-${dr}-${lr}-${sr}"
+            target/release/bridgeasm-flowpath \
+              --gfa benchmark/k31-relaxed/assembly.gfa \
+              --output "benchmark/fast/${name}.fasta" \
+              --mode "$mode" --min-direct 2 --min-pair 2 \
+              --disconnect-ratio "$dr" --low-local-ratio "$lr" --sibling-ratio "$sr" \
+              --min-length 200
+            python3 scripts/fasta_stats.py "benchmark/fast/${name}.fasta" > "benchmark/fast/${name}.tsv"
+          done
+          cat benchmark/fast/*.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-flowpath-fast
+          path: benchmark/fast/*.tsv
+          retention-days: 7
