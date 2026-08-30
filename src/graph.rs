@@ -14,6 +14,7 @@ pub struct RawGraph {
     pub out_offsets: Vec<u64>,
     pub out_targets: Vec<u32>,
     pub indegree: Vec<u32>,
+    pub singleton_solid_edges: usize,
 }
 
 impl RawGraph {
@@ -116,6 +117,7 @@ pub struct GraphSummary {
     pub canonical_nodes: usize,
     pub oriented_states: usize,
     pub directed_edges: usize,
+    pub singleton_solid_edges: usize,
     pub unitigs: usize,
     pub unitig_edges: usize,
     pub branching_unitigs: usize,
@@ -146,9 +148,12 @@ pub fn build_raw_graph(
         .collect();
 
     // Count (k+1)-mer transitions rather than materializing every observed
-    // adjacency. This follows the edge-centric logic used by succinct DBG
-    // assemblers and removes many one-off error branches that survive node-only
-    // abundance filtering. Mercy-rescued paths remain eligible at count one.
+    // adjacency. A single sequencing substitution normally creates weak
+    // endpoint k-mers, so a once-observed edge whose two endpoints both passed
+    // the independent-fragment and quality gates is substantially stronger
+    // evidence than an arbitrary singleton edge. Retain that edge to avoid
+    // shredding genuinely sparse sequence; ambiguous exits are still resolved
+    // later by full-read and paired-fragment evidence.
     let mut edge_counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     for_each_pair(read1, read2, max_pairs, |_pair_index, left, right| {
         add_record_edges(&left.sequence, kmer_set.summary.k, &index, &mut edge_counts)?;
@@ -164,16 +169,24 @@ pub fn build_raw_graph(
     })?;
 
     let min_edge_count = kmer_set.summary.min_count.max(1);
-    let mut edges: Vec<(u32, u32)> = edge_counts
-        .into_iter()
-        .filter_map(|((source, target), support)| {
-            let source_key = keys[(source / 2) as usize];
-            let target_key = keys[(target / 2) as usize];
-            let mercy_edge =
-                kmer_set.rescued.contains(&source_key) || kmer_set.rescued.contains(&target_key);
-            (support >= min_edge_count || mercy_edge).then_some((source, target))
-        })
-        .collect();
+    let mut singleton_solid_edges = 0_usize;
+    let mut edges = Vec::with_capacity(edge_counts.len());
+    for ((source, target), support) in edge_counts {
+        let source_key = keys[(source / 2) as usize];
+        let target_key = keys[(target / 2) as usize];
+        let source_rescued = kmer_set.rescued.contains(&source_key);
+        let target_rescued = kmer_set.rescued.contains(&target_key);
+        let mercy_edge = source_rescued || target_rescued;
+        let both_solid = !source_rescued && !target_rescued;
+        let retain = support >= min_edge_count || mercy_edge || both_solid;
+        if !retain {
+            continue;
+        }
+        if support < min_edge_count && both_solid {
+            singleton_solid_edges += 1;
+        }
+        edges.push((source, target));
+    }
     edges.sort_unstable();
 
     let state_count = keys.len() * 2;
@@ -195,6 +208,7 @@ pub fn build_raw_graph(
         out_offsets,
         out_targets,
         indegree,
+        singleton_solid_edges,
     })
 }
 
@@ -434,6 +448,7 @@ pub fn summarize(graph: &RawGraph, unitigs: &UnitigGraph) -> GraphSummary {
         canonical_nodes: graph.keys.len(),
         oriented_states: graph.state_count(),
         directed_edges: graph.out_targets.len(),
+        singleton_solid_edges: graph.singleton_solid_edges,
         unitigs: unitigs.unitigs.len(),
         unitig_edges: unitigs.out_targets.len(),
         branching_unitigs,
