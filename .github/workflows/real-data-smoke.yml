@@ -62,15 +62,19 @@ jobs:
           python3 scripts/fasta_stats.py benchmark/bridgeasm-k51/primary_contigs.fasta \
             --json benchmark/bridgeasm-k51.stats.json | tee benchmark/bridgeasm-k51.stats.tsv
       - name: Run MEGAHIT
-        if: ${{ hashFiles('/usr/bin/megahit') != '' }}
+        shell: bash
         run: |
-          /usr/bin/time -v -o benchmark/megahit.time.txt \
-            megahit \
-              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
-              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
-              -o benchmark/megahit --min-contig-len 200 -t 2
-          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
-            --json benchmark/megahit.stats.json | tee benchmark/megahit.stats.tsv
+          if command -v megahit >/dev/null 2>&1; then
+            /usr/bin/time -v -o benchmark/megahit.time.txt \
+              megahit \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o benchmark/megahit --min-contig-len 200 -t 2
+            python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+              --json benchmark/megahit.stats.json | tee benchmark/megahit.stats.tsv
+          else
+            echo "megahit unavailable" | tee benchmark/megahit-unavailable.txt
+          fi
       - name: Run metaSPAdes
         shell: bash
         run: |
