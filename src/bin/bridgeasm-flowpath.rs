@@ -28,22 +28,16 @@ struct Cli {
     report: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = Mode::Megahit)]
     mode: Mode,
-    /// Minimum direct-read transition support that always makes an edge eligible.
     #[arg(long, default_value_t = 2)]
     min_direct: u32,
-    /// Minimum paired-end support that always makes an edge eligible.
     #[arg(long, default_value_t = 2)]
     min_pair: u32,
-    /// MEGAHIT-like sibling disconnect ratio.
     #[arg(long, default_value_t = 0.10)]
     disconnect_ratio: f32,
-    /// Minimum coverage compatibility between incident unitigs for topology-only joins.
     #[arg(long, default_value_t = 0.20)]
     low_local_ratio: f32,
-    /// Minimum coverage of a topology-only target relative to its strongest sibling.
     #[arg(long, default_value_t = 0.10)]
     sibling_ratio: f32,
-    /// Ignore short terminal unitigs below this length when they have much lower coverage.
     #[arg(long, default_value_t = 200)]
     max_tip_len: usize,
     #[arg(long, default_value_t = 200)]
@@ -111,7 +105,10 @@ fn main() -> Result<()> {
         write_report(report, &segments, &ranked, &selected)?;
     }
 
-    let mut lengths: Vec<usize> = sequences.iter().map(|(_, sequence)| sequence.len()).collect();
+    let mut lengths: Vec<usize> = sequences
+        .iter()
+        .map(|(_, sequence)| sequence.len())
+        .collect();
     let total: usize = lengths.iter().sum();
     let n50 = n50(&mut lengths);
     let largest = lengths.iter().copied().max().unwrap_or(0);
@@ -285,8 +282,15 @@ fn select_links(
         let physical_score = f64::from(link.direct) * 1000.0
             + f64::from(link.gapped) * 350.0
             + f64::from(link.pairs) * 180.0;
-        let topology_bonus = if outgoing[link.source].len() == 1 { 250.0 } else { 0.0 }
-            + if incoming[link.target].len() == 1 { 250.0 } else { 0.0 };
+        let topology_bonus = if outgoing[link.source].len() == 1 {
+            250.0
+        } else {
+            0.0
+        } + if incoming[link.target].len() == 1 {
+            250.0
+        } else {
+            0.0
+        };
         let coverage_score = f64::from(coverage_ratio) * 600.0
             + f64::from(source_fraction.min(1.0)) * 250.0
             + f64::from(target_fraction.min(1.0)) * 250.0;
@@ -338,8 +342,7 @@ fn select_links(
 
 fn build_paths(node_count: usize, successor: &FxHashMap<usize, Link>) -> Vec<Vec<usize>> {
     let mut predecessor = vec![None; node_count];
-    for (&source, link) in successor {
-        let _ = source;
+    for link in successor.values() {
         predecessor[link.target] = Some(link.source);
     }
     let mut used = vec![false; node_count];
@@ -364,11 +367,7 @@ fn build_paths(node_count: usize, successor: &FxHashMap<usize, Link>) -> Vec<Vec
     paths
 }
 
-fn extend_path(
-    start: usize,
-    successor: &FxHashMap<usize, Link>,
-    used: &mut [bool],
-) -> Vec<usize> {
+fn extend_path(start: usize, successor: &FxHashMap<usize, Link>, used: &mut [bool]) -> Vec<usize> {
     let mut path = Vec::new();
     let mut current = start;
     for _ in 0..used.len() {
@@ -408,7 +407,11 @@ fn assemble_path(
 
 fn canonical_sequence(sequence: Vec<u8>) -> Vec<u8> {
     let reverse = reverse_complement(&sequence);
-    if reverse < sequence { reverse } else { sequence }
+    if reverse < sequence {
+        reverse
+    } else {
+        sequence
+    }
 }
 
 fn reverse_complement(sequence: &[u8]) -> Vec<u8> {
