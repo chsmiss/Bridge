@@ -703,14 +703,13 @@ fn build_threaded_path_cover(
     selection: PathSelectionConfig,
 ) -> (Vec<Option<u32>>, Vec<Option<u32>>, usize, usize) {
     let unitig_count = unitigs.unitigs.len();
-    let (mut successor, mut predecessor, mut dominant_transitions, _) =
-        build_reciprocal_path_cover(
-            excluded,
-            outgoing_candidates,
-            incoming_candidates,
-            selected_out,
-            selected_in,
-        );
+    let (mut successor, mut predecessor, mut dominant_transitions, _) = build_reciprocal_path_cover(
+        excluded,
+        outgoing_candidates,
+        incoming_candidates,
+        selected_out,
+        selected_in,
+    );
 
     // A candidate is a complete same-read observation of
     // left -> middle -> right. Requiring dominance for the prefix, suffix and
@@ -1231,12 +1230,7 @@ mod transition_selection_tests {
             indegree: vec![0, 2, 0, 1, 1],
         };
         let mut transitions = FxHashMap::default();
-        for (edge, support) in [
-            ((0, 1), 10),
-            ((2, 1), 9),
-            ((1, 3), 10),
-            ((1, 4), 9),
-        ] {
+        for (edge, support) in [((0, 1), 10), ((2, 1), 9), ((1, 3), 10), ((1, 4), 9)] {
             transitions.insert(
                 edge,
                 TransitionEvidence {
@@ -1245,9 +1239,7 @@ mod transition_selection_tests {
                 },
             );
         }
-        let triplets: FxHashMap<_, _> = [((0, 1, 3), 10), ((2, 1, 4), 2)]
-            .into_iter()
-            .collect();
+        let triplets: FxHashMap<_, _> = [((0, 1, 3), 10), ((2, 1, 4), 2)].into_iter().collect();
         let outgoing = vec![
             vec![candidate(1, 10, 0, true)],
             vec![candidate(3, 10, 0, true), candidate(4, 9, 0, true)],
