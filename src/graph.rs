@@ -57,6 +57,8 @@ pub struct Unitig {
     pub states: Vec<u32>,
     #[serde(skip_serializing)]
     pub sequence: Vec<u8>,
+    pub start_state: u32,
+    pub end_state: u32,
     pub length: usize,
     pub mean_coverage: f32,
     pub min_coverage: u32,
@@ -70,6 +72,36 @@ pub struct UnitigGraph {
     pub unitigs: Vec<Unitig>,
     pub edge_to_unitig: FxHashMap<(u32, u32), u32>,
     pub reverse_unitig: Vec<u32>,
+    pub out_offsets: Vec<u64>,
+    pub out_targets: Vec<u32>,
+    pub indegree: Vec<u32>,
+}
+
+impl UnitigGraph {
+    #[inline]
+    pub fn out_range(&self, unitig: u32) -> std::ops::Range<usize> {
+        let unitig = unitig as usize;
+        self.out_offsets[unitig] as usize..self.out_offsets[unitig + 1] as usize
+    }
+
+    #[inline]
+    pub fn outdegree(&self, unitig: u32) -> usize {
+        self.out_range(unitig).len()
+    }
+
+    pub fn incoming_at_state(&self, state: u32) -> Vec<u32> {
+        self.unitigs
+            .iter()
+            .filter_map(|unitig| (unitig.end_state == state).then_some(unitig.id))
+            .collect()
+    }
+
+    pub fn outgoing_at_state(&self, state: u32) -> Vec<u32> {
+        self.unitigs
+            .iter()
+            .filter_map(|unitig| (unitig.start_state == state).then_some(unitig.id))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -78,6 +110,8 @@ pub struct GraphSummary {
     pub oriented_states: usize,
     pub directed_edges: usize,
     pub unitigs: usize,
+    pub unitig_edges: usize,
+    pub branching_unitigs: usize,
     pub unitig_bases: usize,
     pub unitig_n50: usize,
     pub largest_unitig: usize,
@@ -211,11 +245,15 @@ pub fn compact_unitigs(graph: &RawGraph) -> UnitigGraph {
     }
 
     let reverse_unitig = compute_reverse_unitigs(&unitigs);
+    let (out_offsets, out_targets, indegree) = build_unitig_adjacency(&unitigs);
     UnitigGraph {
         k: graph.k,
         unitigs,
         edge_to_unitig,
         reverse_unitig,
+        out_offsets,
+        out_targets,
+        indegree,
     }
 }
 
@@ -258,7 +296,9 @@ fn push_unitig(
         return;
     }
     let id = unitigs.len() as u32;
-    let mut sequence = graph.state_sequence(states[0]);
+    let start_state = states[0];
+    let end_state = *states.last().expect("nonempty unitig states");
+    let mut sequence = graph.state_sequence(start_state);
     for &state in states.iter().skip(1) {
         let state_sequence = graph.state_sequence(state);
         if let Some(&base) = state_sequence.last() {
@@ -288,12 +328,46 @@ fn push_unitig(
         id,
         states,
         sequence,
+        start_state,
+        end_state,
         length,
         mean_coverage: coverage_sum as f32 / state_count as f32,
         min_coverage,
         max_coverage,
         circular,
     });
+}
+
+fn build_unitig_adjacency(unitigs: &[Unitig]) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
+    let mut starts: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for unitig in unitigs {
+        starts.entry(unitig.start_state).or_default().push(unitig.id);
+    }
+
+    let mut edges = Vec::new();
+    for unitig in unitigs {
+        if let Some(targets) = starts.get(&unitig.end_state) {
+            for &target in targets {
+                if target != unitig.id {
+                    edges.push((unitig.id, target));
+                }
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+
+    let mut out_offsets = vec![0_u64; unitigs.len() + 1];
+    let mut indegree = vec![0_u32; unitigs.len()];
+    for &(source, target) in &edges {
+        out_offsets[source as usize + 1] += 1;
+        indegree[target as usize] = indegree[target as usize].saturating_add(1);
+    }
+    for index in 1..out_offsets.len() {
+        out_offsets[index] += out_offsets[index - 1];
+    }
+    let out_targets = edges.into_iter().map(|(_, target)| target).collect();
+    (out_offsets, out_targets, indegree)
 }
 
 fn compute_reverse_unitigs(unitigs: &[Unitig]) -> Vec<u32> {
@@ -315,11 +389,20 @@ pub fn summarize(graph: &RawGraph, unitigs: &UnitigGraph) -> GraphSummary {
     let unitig_bases = lengths.iter().sum();
     let largest_unitig = lengths.iter().copied().max().unwrap_or(0);
     let unitig_n50 = n50(&mut lengths);
+    let branching_unitigs = unitigs
+        .unitigs
+        .iter()
+        .filter(|unitig| {
+            unitigs.indegree[unitig.id as usize] > 1 || unitigs.outdegree(unitig.id) > 1
+        })
+        .count();
     GraphSummary {
         canonical_nodes: graph.keys.len(),
         oriented_states: graph.state_count(),
         directed_edges: graph.out_targets.len(),
         unitigs: unitigs.unitigs.len(),
+        unitig_edges: unitigs.out_targets.len(),
+        branching_unitigs,
         unitig_bases,
         unitig_n50,
         largest_unitig,
