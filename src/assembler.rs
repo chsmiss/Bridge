@@ -36,6 +36,23 @@ pub struct TransitionEvidence {
     pub read_pairs: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransitionCandidate {
+    node: u32,
+    direct_reads: u32,
+    read_pairs: u32,
+    solid_topology: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PathSelectionConfig {
+    min_read_support: u32,
+    min_pair_support: u32,
+    min_primary_support: u32,
+    min_count: u32,
+    dominance: f32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BubbleAllele {
     pub bubble_id: u32,
@@ -171,9 +188,13 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         &unitig_graph,
         &transitions,
         &bubble_alleles,
-        config.min_read_support,
-        config.min_primary_support,
-        config.primary_dominance,
+        PathSelectionConfig {
+            min_read_support: config.min_read_support,
+            min_pair_support: config.min_pair_support,
+            min_primary_support: config.min_primary_support,
+            min_count: config.min_count,
+            dominance: config.primary_dominance,
+        },
     );
     let mut primary_sequences =
         deduplicate_primary_sequences(&unitig_graph, &primary_paths, config.min_contig_length);
@@ -365,14 +386,12 @@ fn primary_paths(
     unitigs: &UnitigGraph,
     transitions: &FxHashMap<(u32, u32), TransitionEvidence>,
     bubble_alleles: &[BubbleAllele],
-    min_read_support: u32,
-    min_primary_support: u32,
-    dominance: f32,
+    selection: PathSelectionConfig,
 ) -> (Vec<Vec<u32>>, usize) {
     let unitig_count = unitigs.unitigs.len();
     let excluded = non_primary_bubble_alleles(bubble_alleles);
-    let mut outgoing_candidates: Vec<Vec<(u32, u32)>> = vec![Vec::new(); unitig_count];
-    let mut incoming_candidates: Vec<Vec<(u32, u32)>> = vec![Vec::new(); unitig_count];
+    let mut outgoing_candidates: Vec<Vec<TransitionCandidate>> = vec![Vec::new(); unitig_count];
+    let mut incoming_candidates: Vec<Vec<TransitionCandidate>> = vec![Vec::new(); unitig_count];
 
     // Use graph adjacency as the candidate set. Every retained unitig edge was
     // observed at least min_count times, or was explicitly mercy-rescued.
@@ -388,24 +407,50 @@ fn primary_paths(
             if excluded.contains(&target) || source == target {
                 continue;
             }
-            let support = transitions
+            let evidence = transitions
                 .get(&(source, target))
-                .map_or(0, |evidence| evidence.direct_reads);
-            outgoing_candidates[source as usize].push((target, support));
-            incoming_candidates[target as usize].push((source, support));
+                .copied()
+                .unwrap_or_default();
+            let solid_topology = unitigs.unitigs[source as usize].min_coverage
+                >= selection.min_count
+                && unitigs.unitigs[target as usize].min_coverage >= selection.min_count;
+            outgoing_candidates[source as usize].push(TransitionCandidate {
+                node: target,
+                direct_reads: evidence.direct_reads,
+                read_pairs: evidence.read_pairs,
+                solid_topology,
+            });
+            incoming_candidates[target as usize].push(TransitionCandidate {
+                node: source,
+                direct_reads: evidence.direct_reads,
+                read_pairs: evidence.read_pairs,
+                solid_topology,
+            });
         }
     }
 
     let selected_out: Vec<Option<u32>> = outgoing_candidates
         .iter()
         .map(|candidates| {
-            choose_transition(candidates, min_read_support, min_primary_support, dominance)
+            choose_transition(
+                candidates,
+                selection.min_read_support,
+                selection.min_pair_support,
+                selection.min_primary_support,
+                selection.dominance,
+            )
         })
         .collect();
     let selected_in: Vec<Option<u32>> = incoming_candidates
         .iter()
         .map(|candidates| {
-            choose_transition(candidates, min_read_support, min_primary_support, dominance)
+            choose_transition(
+                candidates,
+                selection.min_read_support,
+                selection.min_pair_support,
+                selection.min_primary_support,
+                selection.dominance,
+            )
         })
         .collect();
 
@@ -490,29 +535,77 @@ fn non_primary_bubble_alleles(bubble_alleles: &[BubbleAllele]) -> FxHashSet<u32>
 }
 
 fn choose_transition(
-    candidates: &[(u32, u32)],
+    candidates: &[TransitionCandidate],
     min_read_support: u32,
+    min_pair_support: u32,
     min_primary_support: u32,
     dominance: f32,
 ) -> Option<u32> {
     if candidates.is_empty() {
         return None;
     }
-    let mut candidates = candidates.to_vec();
-    candidates.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
     if candidates.len() == 1 {
         let candidate = candidates[0];
-        // A unique graph exit is itself positive sequence evidence. Mercy-only
-        // unique edges still require at least one direct read before emission.
-        return (candidate.1 >= min_read_support || candidate.1 > 0).then_some(candidate.0);
+        // A unique retained edge has already passed k-mer/edge filtering. It
+        // may be extended without a separately materialized read transition
+        // when both incident unitigs are solid. Mercy-only links still need
+        // direct-read or paired-fragment support.
+        return (candidate.direct_reads >= min_read_support
+            || candidate.read_pairs >= min_pair_support
+            || candidate.solid_topology)
+            .then_some(candidate.node);
     }
-    let total: u64 = candidates
+
+    let max_direct = candidates
         .iter()
-        .map(|candidate| u64::from(candidate.1))
+        .map(|candidate| candidate.direct_reads)
+        .max()
+        .unwrap_or(0);
+    let use_direct = max_direct >= min_read_support;
+    let mut ranked = candidates.to_vec();
+    if use_direct {
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .direct_reads
+                .cmp(&left.direct_reads)
+                .then_with(|| right.read_pairs.cmp(&left.read_pairs))
+                .then_with(|| right.solid_topology.cmp(&left.solid_topology))
+                .then_with(|| left.node.cmp(&right.node))
+        });
+    } else {
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .read_pairs
+                .cmp(&left.read_pairs)
+                .then_with(|| right.direct_reads.cmp(&left.direct_reads))
+                .then_with(|| right.solid_topology.cmp(&left.solid_topology))
+                .then_with(|| left.node.cmp(&right.node))
+        });
+    }
+
+    let total: u64 = ranked
+        .iter()
+        .map(|candidate| {
+            u64::from(if use_direct {
+                candidate.direct_reads
+            } else {
+                candidate.read_pairs
+            })
+        })
         .sum();
-    let best = candidates[0];
-    let fraction = best.1 as f32 / total.max(1) as f32;
-    (best.1 >= min_primary_support && fraction >= dominance).then_some(best.0)
+    let best = ranked[0];
+    let best_support = if use_direct {
+        best.direct_reads
+    } else {
+        best.read_pairs
+    };
+    let minimum = if use_direct {
+        min_primary_support
+    } else {
+        min_pair_support
+    };
+    let fraction = best_support as f32 / total.max(1) as f32;
+    (best_support >= minimum && fraction >= dominance).then_some(best.node)
 }
 
 fn extend_selected_path(start: u32, successor: &[Option<u32>], used: &mut [bool]) -> Vec<u32> {
@@ -663,4 +756,53 @@ pub fn assemble_unitig_path(unitigs: &UnitigGraph, path: &[u32]) -> Vec<u8> {
         sequence.extend_from_slice(&next[skip..]);
     }
     sequence
+}
+
+#[cfg(test)]
+mod transition_selection_tests {
+    use super::*;
+
+    fn candidate(
+        node: u32,
+        direct_reads: u32,
+        read_pairs: u32,
+        solid_topology: bool,
+    ) -> TransitionCandidate {
+        TransitionCandidate {
+            node,
+            direct_reads,
+            read_pairs,
+            solid_topology,
+        }
+    }
+
+    #[test]
+    fn unique_solid_topology_is_safe_without_materialized_transition() {
+        let candidates = [candidate(7, 0, 0, true)];
+        assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), Some(7));
+    }
+
+    #[test]
+    fn unique_mercy_like_edge_requires_physical_support() {
+        let candidates = [candidate(7, 0, 0, false)];
+        assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), None);
+    }
+
+    #[test]
+    fn pair_support_can_resolve_an_adjacent_edge_when_reads_do_not() {
+        let candidates = [candidate(3, 0, 7, false), candidate(4, 0, 1, true)];
+        assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), Some(3));
+    }
+
+    #[test]
+    fn direct_reads_take_precedence_when_they_clear_the_read_gate() {
+        let candidates = [candidate(3, 6, 0, true), candidate(4, 1, 20, true)];
+        assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), Some(3));
+    }
+
+    #[test]
+    fn ambiguous_physical_evidence_remains_unresolved() {
+        let candidates = [candidate(3, 0, 5, true), candidate(4, 0, 4, true)];
+        assert_eq!(choose_transition(&candidates, 2, 2, 5, 0.75), None);
+    }
 }
