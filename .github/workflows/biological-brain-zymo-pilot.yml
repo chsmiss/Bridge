@@ -6,6 +6,9 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - .github/workflows/biological-brain-zymo-pilot.yml
+      - biological_brain/dedup_proteins.py
+      - biological_brain/protein_bridge_evidence.py
+      - src/bin/bridgeasm-evidence-path.rs
   workflow_dispatch:
     inputs:
       read_pairs:
@@ -50,37 +53,17 @@ jobs:
           set -euo pipefail
           mkdir -p source_artifacts
           selected=""
-          for workflow in \
-            zymo-cleanpath-500k.yml \
-            zymo-flowpath-500k.yml \
-            zymo-midk-500k-sweep.yml \
-            zymo-reference-smoke.yml
-          do
+          for workflow in zymo-cleanpath-500k.yml zymo-flowpath-500k.yml zymo-midk-500k-sweep.yml zymo-reference-smoke.yml; do
             test -f ".github/workflows/${workflow}" || continue
-            mapfile -t runs < <(
-              gh api -X GET \
-                "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs" \
-                -f branch="${GITHUB_REF_NAME}" \
-                -f status=success \
-                -f per_page=20 \
-                --jq '.workflow_runs[].id' 2>/dev/null || true
-            )
+            mapfile -t runs < <(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs" -f branch="${GITHUB_REF_NAME}" -f status=success -f per_page=20 --jq '.workflow_runs[].id' 2>/dev/null || true)
             for run_id in "${runs[@]}"; do
-              artifact_count=$(gh api \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
-                --jq '.total_count' 2>/dev/null || echo 0)
-              if [[ "${artifact_count}" == "0" ]]; then
-                continue
-              fi
+              artifact_count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" --jq '.total_count' 2>/dev/null || echo 0)
+              [[ "${artifact_count}" != "0" ]] || continue
               rm -rf source_artifacts/*
-              if ! gh run download "${run_id}" --repo "${GITHUB_REPOSITORY}" --dir source_artifacts; then
-                continue
-              fi
-              candidate=$(find source_artifacts -type f -name '*.gfa' -printf '%s\t%p\n' \
-                | sort -nr | head -n 1 | cut -f2- || true)
+              gh run download "${run_id}" --repo "${GITHUB_REPOSITORY}" --dir source_artifacts || continue
+              candidate=$(find source_artifacts -type f -name '*.gfa' -printf '%s\t%p\n' | sort -nr | head -n 1 | cut -f2- || true)
               if [[ -z "${candidate}" ]]; then
-                compressed=$(find source_artifacts -type f -name '*.gfa.gz' -printf '%s\t%p\n' \
-                  | sort -nr | head -n 1 | cut -f2- || true)
+                compressed=$(find source_artifacts -type f -name '*.gfa.gz' -printf '%s\t%p\n' | sort -nr | head -n 1 | cut -f2- || true)
                 if [[ -n "${compressed}" ]]; then
                   gzip -dc "${compressed}" > source_artifacts/matched_graph.gfa
                   candidate=source_artifacts/matched_graph.gfa
@@ -95,38 +78,28 @@ jobs:
               fi
             done
           done
-          if [[ -z "${selected}" ]]; then
-            echo "No successful artifact containing a GFA was found" >&2
-            exit 2
-          fi
+          [[ -n "${selected}" ]] || { echo "No successful artifact containing a GFA was found" >&2; exit 2; }
           echo "Using ${selected} from ${SOURCE_WORKFLOW:-selected workflow}"
 
       - name: Resolve the exact FASTQ pair used by the source workflow
         run: |
-          python biological_brain/extract_fastq_urls.py \
-            --workflow ".github/workflows/${SOURCE_WORKFLOW}" \
-            --github-env "${GITHUB_ENV}"
+          python biological_brain/extract_fastq_urls.py --workflow ".github/workflows/${SOURCE_WORKFLOW}" --github-env "${GITHUB_ENV}"
 
       - name: Stream a bounded paired-read subset
         run: |
           mkdir -p pilot
           python - <<'PY'
-          import gzip
-          import os
-          import urllib.request
-
+          import gzip, os, urllib.request
           pairs = int(os.environ['PILOT_READ_PAIRS'])
           for url_key, output in [('READ1_URL', 'pilot/r1.fastq'), ('READ2_URL', 'pilot/r2.fastq')]:
               url = os.environ[url_key]
               request = urllib.request.Request(url, headers={'User-Agent': 'BridgeAsm-protein-pilot'})
-              with urllib.request.urlopen(request, timeout=120) as response:
-                  with gzip.GzipFile(fileobj=response) as compressed:
-                      with open(output, 'wb') as handle:
-                          for _ in range(pairs * 4):
-                              line = compressed.readline()
-                              if not line:
-                                  break
-                              handle.write(line)
+              with urllib.request.urlopen(request, timeout=120) as response, gzip.GzipFile(fileobj=response) as compressed, open(output, 'wb') as handle:
+                  for _ in range(pairs * 4):
+                      line = compressed.readline()
+                      if not line:
+                          break
+                      handle.write(line)
               lines = sum(1 for _ in open(output, 'rb'))
               if lines < 4 or lines % 4:
                   raise SystemExit(f'invalid FASTQ subset in {output}: {lines} lines')
@@ -134,78 +107,43 @@ jobs:
           PY
           cat pilot/r1.fastq pilot/r2.fastq > pilot/reads.fastq
 
-      - name: Run Plass protein preassembly and exact deduplication
+      - name: Run Plass protein preassembly and collapse technical fragments
         run: |
           mkdir -p pilot/plass_tmp
-          plass assemble \
-            pilot/reads.fastq \
-            pilot/plass_proteins.raw.faa \
-            pilot/plass_tmp \
-            --threads 2
+          plass assemble pilot/reads.fastq pilot/plass_proteins.raw.faa pilot/plass_tmp --threads 2
           test -s pilot/plass_proteins.raw.faa
           python biological_brain/dedup_proteins.py \
-            pilot/plass_proteins.raw.faa \
-            pilot/plass_proteins.faa \
+            pilot/plass_proteins.raw.faa pilot/plass_proteins.faa \
+            --collapse-contained \
             --mapping pilot/plass_proteins.dedup.tsv \
             --json pilot/plass_proteins.dedup.json
 
       - name: Back-project protein paths to existing graph links
         run: |
           python biological_brain/protein_bridge_evidence.py \
-            --gfa "${MATCHED_GFA}" \
-            --proteins pilot/plass_proteins.faa \
-            --output pilot/protein_evidence.tsv \
-            --junction-nt 300 \
-            --max-kmer-occurrences 24
-          python biological_brain/kmer_junction_lm.py \
-            --gfa "${MATCHED_GFA}" \
-            --output pilot/dna_lm.tsv
+            --gfa "${MATCHED_GFA}" --proteins pilot/plass_proteins.faa \
+            --output pilot/protein_evidence.tsv --junction-nt 300 --max-kmer-occurrences 24
+          python biological_brain/kmer_junction_lm.py --gfa "${MATCHED_GFA}" --output pilot/dna_lm.tsv
 
       - name: Build conservative physical-only and protein-ranked paths
         run: |
           cargo build --release --bin bridgeasm-evidence-path
-          common=(
-            --gfa "${MATCHED_GFA}"
-            --edge-evidence pilot/protein_evidence.tsv
-            --mode conservative
-            --min-length 200
-          )
-          target/release/bridgeasm-evidence-path \
-            "${common[@]}" \
-            --protein-weight 0 --esm-weight 0 --dna-lm-weight 0 \
-            --output pilot/physical_only.fasta \
-            --report pilot/physical_only.tsv
-          target/release/bridgeasm-evidence-path \
-            "${common[@]}" \
-            --protein-weight 2400 --esm-weight 0 --dna-lm-weight 0 \
-            --output pilot/physical_plus_plass.fasta \
-            --report pilot/physical_plus_plass.tsv
-          target/release/bridgeasm-evidence-path \
-            "${common[@]}" \
-            --dna-lm-scores pilot/dna_lm.tsv \
-            --protein-weight 2400 --esm-weight 0 --dna-lm-weight 180 \
-            --output pilot/physical_plus_plass_dna.fasta \
-            --report pilot/physical_plus_plass_dna.tsv
+          common=(--gfa "${MATCHED_GFA}" --edge-evidence pilot/protein_evidence.tsv --mode conservative --min-length 200)
+          target/release/bridgeasm-evidence-path "${common[@]}" --protein-weight 0 --esm-weight 0 --dna-lm-weight 0 --output pilot/physical_only.fasta --report pilot/physical_only.tsv
+          target/release/bridgeasm-evidence-path "${common[@]}" --protein-weight 2400 --esm-weight 0 --dna-lm-weight 0 --output pilot/physical_plus_plass.fasta --report pilot/physical_plus_plass.tsv
+          target/release/bridgeasm-evidence-path "${common[@]}" --dna-lm-scores pilot/dna_lm.tsv --protein-weight 2400 --esm-weight 0 --dna-lm-weight 180 --output pilot/physical_plus_plass_dna.fasta --report pilot/physical_plus_plass_dna.tsv
 
       - name: Download Zymo reference genomes
         run: |
-          curl -L --retry 3 -o pilot/zymo-refs.zip \
-            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          curl -L --retry 3 -o pilot/zymo-refs.zip 'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
           mkdir -p pilot/refs
           unzip -q pilot/zymo-refs.zip -d pilot/refs
-          find pilot/refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
-            | sort -z | xargs -0 cat > pilot/reference.fasta
+          find pilot/refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 | sort -z | xargs -0 cat > pilot/reference.fasta
           test -s pilot/reference.fasta
 
       - name: Reference-level nucleotide evaluation
         run: |
-          metaquast.py \
-            pilot/physical_only.fasta \
-            pilot/physical_plus_plass.fasta \
-            pilot/physical_plus_plass_dna.fasta \
-            -r pilot/reference.fasta \
-            -o pilot/metaquast \
-            --threads 2 --min-contig 200 --no-plots
+          metaquast.py pilot/physical_only.fasta pilot/physical_plus_plass.fasta pilot/physical_plus_plass_dna.fasta -r pilot/reference.fasta -o pilot/metaquast --threads 2 --min-contig 200 --no-plots
           cp pilot/metaquast/combined_reference/report.tsv pilot/nucleotide_report.tsv
           cp pilot/metaquast/combined_reference/transposed_report.tsv pilot/nucleotide_transposed.tsv
           cat pilot/nucleotide_report.tsv
@@ -217,13 +155,7 @@ jobs:
           for label in physical_only physical_plus_plass physical_plus_plass_dna; do
             prodigal -q -p meta -i "pilot/${label}.fasta" -a "pilot/protein/${label}.faa"
             rm -rf "/tmp/mmseqs-${label}"
-            mmseqs easy-search \
-              pilot/protein/reference.faa \
-              "pilot/protein/${label}.faa" \
-              "pilot/protein/${label}.m8" \
-              "/tmp/mmseqs-${label}" \
-              --threads 2 -s 7.5 -e 1e-3 --max-seqs 50 \
-              --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
+            mmseqs easy-search pilot/protein/reference.faa "pilot/protein/${label}.faa" "pilot/protein/${label}.m8" "/tmp/mmseqs-${label}" --threads 2 -s 7.5 -e 1e-3 --max-seqs 50 --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
           done
           python scripts/protein_recall.py \
             --reference pilot/protein/reference.faa \
@@ -231,32 +163,20 @@ jobs:
             --sample physical_plus_plass pilot/protein/physical_plus_plass.faa pilot/protein/physical_plus_plass.m8 \
             --sample physical_plus_plass_dna pilot/protein/physical_plus_plass_dna.faa pilot/protein/physical_plus_plass_dna.m8 \
             --min-identity 0.80 --min-query-coverage 0.80 --min-target-coverage 0.80 \
-            --json pilot/protein_recall.json \
-            | tee pilot/protein_recall.tsv
+            --json pilot/protein_recall.json | tee pilot/protein_recall.tsv
 
       - name: Summarize edge changes and safety deltas
         run: |
           python - <<'PY'
-          import csv
-          import json
-          import os
+          import csv, json, os
           from collections import Counter
-
           def selected(path):
-              out = set()
               with open(path, newline='') as handle:
-                  for row in csv.DictReader(handle, delimiter='\t'):
-                      if row['selected'] == 'true':
-                          out.add((row['source'], row['target']))
-              return out
-
+                  return {(r['source'], r['target']) for r in csv.DictReader(handle, delimiter='\t') if r['selected'] == 'true'}
           classes = Counter()
-          supported = 0
           with open('pilot/protein_evidence.tsv', newline='') as handle:
               for row in csv.DictReader(handle, delimiter='\t'):
                   classes[row['breakpoint_class']] += 1
-                  supported += row['breakpoint_class'] == 'same_orf_supported'
-
           control = selected('pilot/physical_only.tsv')
           plass = selected('pilot/physical_plus_plass.tsv')
           fused = selected('pilot/physical_plus_plass_dna.tsv')
@@ -265,7 +185,7 @@ jobs:
               'source_run_id': int(os.environ['SOURCE_RUN_ID']),
               'read_pairs_for_plass': int(os.environ['PILOT_READ_PAIRS']),
               'protein_evidence_classes': dict(classes),
-              'supported_existing_edges': supported,
+              'supported_existing_edges': classes['same_orf_supported'],
               'physical_only_edges': len(control),
               'plass_edges': len(plass),
               'plass_edges_changed_vs_control': len(control ^ plass),
@@ -274,8 +194,7 @@ jobs:
               'safety_rule': 'All three path runs use conservative mode; only physical GFA links are eligible.',
           }
           with open('pilot/pilot_summary.json', 'w') as handle:
-              json.dump(summary, handle, indent=2, sort_keys=True)
-              handle.write('\n')
+              json.dump(summary, handle, indent=2, sort_keys=True); handle.write('\n')
           print(json.dumps(summary, indent=2, sort_keys=True))
           PY
 
