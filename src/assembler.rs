@@ -60,6 +60,13 @@ pub struct AssemblyProduct {
     pub stats: AssemblyStats,
 }
 
+#[derive(Debug)]
+struct ThreadingResult {
+    transitions: FxHashMap<(u32, u32), TransitionEvidence>,
+    threaded_reads: u64,
+    threaded_pairs: u64,
+}
+
 pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
     fs::create_dir_all(&config.output_dir).with_context(|| {
         format!(
@@ -110,7 +117,11 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
     );
 
     let started = Instant::now();
-    let (transitions, threaded_reads, threaded_pairs) = thread_reads(
+    let ThreadingResult {
+        transitions,
+        threaded_reads,
+        threaded_pairs,
+    } = thread_reads(
         &config.read1,
         config.read2.as_deref(),
         &raw_graph,
@@ -178,7 +189,7 @@ fn thread_reads(
     graph: &RawGraph,
     unitigs: &UnitigGraph,
     max_pairs: Option<usize>,
-) -> Result<(FxHashMap<(u32, u32), TransitionEvidence>, u64, u64)> {
+) -> Result<ThreadingResult> {
     let node_index: FxHashMap<_, _> = graph
         .keys
         .iter()
@@ -218,7 +229,11 @@ fn thread_reads(
         Ok(())
     })?;
 
-    Ok((transitions, threaded_reads, threaded_pairs))
+    Ok(ThreadingResult {
+        transitions,
+        threaded_reads,
+        threaded_pairs,
+    })
 }
 
 fn thread_record(
