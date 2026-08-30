@@ -108,6 +108,8 @@ struct RawLink {
     tags: Vec<String>,
 }
 
+type GfaReadResult = (Vec<Segment>, Vec<Link>, FxHashMap<String, usize>, usize);
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     validate(&cli)?;
@@ -206,7 +208,7 @@ fn validate(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn read_gfa(path: &Path) -> Result<(Vec<Segment>, Vec<Link>, FxHashMap<String, usize>, usize)> {
+fn read_gfa(path: &Path) -> Result<GfaReadResult> {
     let reader = BufReader::new(
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
     );
