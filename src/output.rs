@@ -179,15 +179,15 @@ fn write_gfa(product: &AssemblyProduct, path: &Path) -> Result<()> {
     for source in 0..product.unitig_graph.unitigs.len() as u32 {
         for edge_index in product.unitig_graph.out_range(source) {
             let target = product.unitig_graph.out_targets[edge_index];
-            let evidence = product.transitions.get(&(source, target)).copied().unwrap_or_default();
+            let evidence = product
+                .transitions
+                .get(&(source, target))
+                .copied()
+                .unwrap_or_default();
             writeln!(
                 writer,
                 "L\tu{}\t+\tu{}\t+\t{}M\tDR:i:{}\tPE:i:{}",
-                source,
-                target,
-                product.unitig_graph.k,
-                evidence.direct_reads,
-                evidence.read_pairs
+                source, target, product.unitig_graph.k, evidence.direct_reads, evidence.read_pairs
             )?;
         }
     }
