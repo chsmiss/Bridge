@@ -1,7 +1,4 @@
-from pathlib import Path
-
-scaffold = Path("src/scaffold.rs")
-scaffold.write_text(r'''use crate::assembler::TransitionEvidence;
+use crate::assembler::TransitionEvidence;
 use crate::dna::reverse_complement;
 use crate::graph::UnitigGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -250,11 +247,7 @@ mod tests {
     fn graph() -> UnitigGraph {
         UnitigGraph {
             k: 3,
-            unitigs: vec![
-                unitig(0, b"AAAC"),
-                unitig(1, b"CCCG"),
-                unitig(2, b"GGGT"),
-            ],
+            unitigs: vec![unitig(0, b"AAAC"), unitig(1, b"CCCG"), unitig(2, b"GGGT")],
             edge_to_unitig: FxHashMap::default(),
             reverse_unitig: vec![0, 1, 2],
             out_offsets: vec![0, 0, 0, 0],
@@ -273,18 +266,13 @@ mod tests {
                 ..TransitionEvidence::default()
             },
         );
-        let result = build_scaffolds(
-            &graph(),
-            &[vec![0], vec![1]],
-            &transitions,
-            3,
-            0.75,
-            10,
-        );
+        let result = build_scaffolds(&graph(), &[vec![0], vec![1]], &transitions, 3, 0.75, 10);
         assert_eq!(result.links.len(), 1);
         assert_eq!(result.sequences.len(), 1);
         assert_eq!(result.sequences[0].len(), 18);
-        assert!(result.sequences[0].windows(10).any(|window| window == b"NNNNNNNNNN"));
+        assert!(result.sequences[0]
+            .windows(10)
+            .any(|window| window == b"NNNNNNNNNN"));
     }
 
     #[test]
@@ -311,237 +299,3 @@ mod tests {
         assert_eq!(result.sequences.len(), 3);
     }
 }
-''')
-
-lib = Path("src/lib.rs")
-text = lib.read_text()
-if "pub mod scaffold;\n" not in text:
-    text += "pub mod scaffold;\n"
-lib.write_text(text)
-
-main = Path("src/main.rs")
-text = main.read_text()
-text = text.replace(
-'''        #[arg(long, default_value_t = 200)]
-        min_contig_length: usize,
-''',
-'''        #[arg(long, default_value_t = 200)]
-        min_contig_length: usize,
-        #[arg(long, default_value_t = 100)]
-        scaffold_gap_bases: usize,
-''',
-1,
-)
-text = text.replace(
-'''            min_contig_length,
-            max_pairs,
-''',
-'''            min_contig_length,
-            scaffold_gap_bases,
-            max_pairs,
-''',
-1,
-)
-text = text.replace(
-'''                min_contig_length,
-                max_pairs,
-''',
-'''                min_contig_length,
-                scaffold_gap_bases,
-                max_pairs,
-''',
-1,
-)
-main.write_text(text)
-
-assembler = Path("src/assembler.rs")
-text = assembler.read_text()
-text = text.replace(
-'''use crate::kmer::{count_and_filter, KmerCountSummary, KmerFilterConfig};
-''',
-'''use crate::kmer::{count_and_filter, KmerCountSummary, KmerFilterConfig};
-use crate::scaffold::{build_scaffolds, ScaffoldLink};
-''',
-1,
-)
-text = text.replace(
-'''    pub min_contig_length: usize,
-    pub max_pairs: Option<usize>,
-''',
-'''    pub min_contig_length: usize,
-    pub scaffold_gap_bases: usize,
-    pub max_pairs: Option<usize>,
-''',
-1,
-)
-text = text.replace(
-'''    pub largest_primary: usize,
-    pub timings_seconds: FxHashMap<String, f64>,
-''',
-'''    pub largest_primary: usize,
-    pub scaffolds: usize,
-    pub scaffold_links: usize,
-    pub scaffold_bases: usize,
-    pub scaffold_n50: usize,
-    pub largest_scaffold: usize,
-    pub scaffold_gap_bases: usize,
-    pub timings_seconds: FxHashMap<String, f64>,
-''',
-1,
-)
-text = text.replace(
-'''    pub primary_sequences: Vec<Vec<u8>>,
-    pub bubble_alleles: Vec<BubbleAllele>,
-''',
-'''    pub primary_sequences: Vec<Vec<u8>>,
-    pub scaffold_sequences: Vec<Vec<u8>>,
-    pub scaffold_links: Vec<ScaffoldLink>,
-    pub bubble_alleles: Vec<BubbleAllele>,
-''',
-1,
-)
-marker = '''    primary_sequences
-        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-    timings.insert(
-        "branch_aware_emission".to_string(),
-        started.elapsed().as_secs_f64(),
-    );
-
-'''
-insert = marker + '''    let started = Instant::now();
-    let scaffold_result = build_scaffolds(
-        &unitig_graph,
-        &primary_paths,
-        &transitions,
-        config.min_pair_support,
-        config.primary_dominance,
-        config.scaffold_gap_bases,
-    );
-    let mut scaffold_sequences = scaffold_result.sequences;
-    scaffold_sequences
-        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-    let scaffold_links = scaffold_result.links;
-    timings.insert(
-        "paired_scaffolding".to_string(),
-        started.elapsed().as_secs_f64(),
-    );
-
-'''
-if marker not in text:
-    raise SystemExit("branch-aware emission marker not found")
-text = text.replace(marker, insert, 1)
-marker = '''    let primary_n50 = crate::graph::n50(&mut primary_lengths);
-'''
-insert = marker + '''    let mut scaffold_lengths: Vec<usize> = scaffold_sequences.iter().map(Vec::len).collect();
-    let scaffold_bases = scaffold_lengths.iter().sum();
-    let largest_scaffold = scaffold_lengths.iter().copied().max().unwrap_or(0);
-    let scaffold_n50 = crate::graph::n50(&mut scaffold_lengths);
-'''
-text = text.replace(marker, insert, 1)
-text = text.replace(
-'''        largest_primary,
-        timings_seconds: timings,
-''',
-'''        largest_primary,
-        scaffolds: scaffold_sequences.len(),
-        scaffold_links: scaffold_links.len(),
-        scaffold_bases,
-        scaffold_n50,
-        largest_scaffold,
-        scaffold_gap_bases: scaffold_links
-            .iter()
-            .map(|link| link.gap_bases)
-            .sum(),
-        timings_seconds: timings,
-''',
-1,
-)
-text = text.replace(
-'''        primary_sequences,
-        bubble_alleles,
-''',
-'''        primary_sequences,
-        scaffold_sequences,
-        scaffold_links,
-        bubble_alleles,
-''',
-1,
-)
-assembler.write_text(text)
-
-output = Path("src/output.rs")
-text = output.read_text()
-text = text.replace(
-'''use crate::assembler::{AssemblyProduct, BubbleAllele};
-''',
-'''use crate::assembler::{AssemblyProduct, BubbleAllele};
-use crate::scaffold::ScaffoldLink;
-''',
-1,
-)
-marker = '''    write_fasta(
-        &output_dir.join("unitigs.fasta"),
-'''
-insert = '''    write_fasta(
-        &output_dir.join("primary_scaffolds.fasta"),
-        product
-            .scaffold_sequences
-            .iter()
-            .enumerate()
-            .map(|(index, sequence)| {
-                (
-                    format!("scaffold_{:06} len={}", index + 1, sequence.len()),
-                    sequence.as_slice(),
-                )
-            }),
-    )?;
-    write_scaffold_links(
-        &output_dir.join("scaffold_links.tsv"),
-        &product.scaffold_links,
-    )?;
-
-''' + marker
-if marker not in text:
-    raise SystemExit("unitig output marker missing")
-text = text.replace(marker, insert, 1)
-marker = '''fn write_bubble_table(path: &Path, alleles: &[BubbleAllele]) -> Result<()> {
-'''
-insert = '''fn write_scaffold_links(path: &Path, links: &[ScaffoldLink]) -> Result<()> {
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    writeln!(
-        writer,
-        "source_component\\ttarget_component\\tpair_support\\tgap_bases"
-    )?;
-    for link in links {
-        writeln!(
-            writer,
-            "{}\\t{}\\t{}\\t{}",
-            link.source_component,
-            link.target_component,
-            link.pair_support,
-            link.gap_bases
-        )?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-''' + marker
-text = text.replace(marker, insert, 1)
-output.write_text(text)
-
-tests = Path("tests/integration.rs")
-text = tests.read_text()
-text = text.replace(
-'''        min_contig_length: 20,
-        max_pairs: None,
-''',
-'''        min_contig_length: 20,
-        scaffold_gap_bases: 100,
-        max_pairs: None,
-''',
-1,
-)
-tests.write_text(text)

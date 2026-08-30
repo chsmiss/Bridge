@@ -4,3 +4,4 @@ pub mod fastq;
 pub mod graph;
 pub mod kmer;
 pub mod output;
+pub mod scaffold;

@@ -4,6 +4,7 @@ use crate::graph::{
     build_raw_graph, compact_unitigs, summarize, GraphSummary, RawGraph, UnitigGraph,
 };
 use crate::kmer::{count_and_filter, KmerCountSummary, KmerFilterConfig};
+use crate::scaffold::{build_scaffolds, ScaffoldLink};
 use anyhow::{Context, Result};
 use rayon::ThreadPoolBuilder;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -27,6 +28,7 @@ pub struct AssembleConfig {
     pub min_primary_support: u32,
     pub primary_dominance: f32,
     pub min_contig_length: usize,
+    pub scaffold_gap_bases: usize,
     pub max_pairs: Option<usize>,
     pub threads: usize,
 }
@@ -97,6 +99,12 @@ pub struct AssemblyStats {
     pub primary_bases: usize,
     pub primary_n50: usize,
     pub largest_primary: usize,
+    pub scaffolds: usize,
+    pub scaffold_links: usize,
+    pub scaffold_bases: usize,
+    pub scaffold_n50: usize,
+    pub largest_scaffold: usize,
+    pub scaffold_gap_bases: usize,
     pub timings_seconds: FxHashMap<String, f64>,
 }
 
@@ -107,6 +115,8 @@ pub struct AssemblyProduct {
     pub transitions: FxHashMap<(u32, u32), TransitionEvidence>,
     pub primary_paths: Vec<Vec<u32>>,
     pub primary_sequences: Vec<Vec<u8>>,
+    pub scaffold_sequences: Vec<Vec<u8>>,
+    pub scaffold_links: Vec<ScaffoldLink>,
     pub bubble_alleles: Vec<BubbleAllele>,
     pub stats: AssemblyStats,
 }
@@ -218,10 +228,32 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         started.elapsed().as_secs_f64(),
     );
 
+    let started = Instant::now();
+    let scaffold_result = build_scaffolds(
+        &unitig_graph,
+        &primary_paths,
+        &transitions,
+        config.min_pair_support,
+        config.primary_dominance,
+        config.scaffold_gap_bases,
+    );
+    let mut scaffold_sequences = scaffold_result.sequences;
+    scaffold_sequences
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+    let scaffold_links = scaffold_result.links;
+    timings.insert(
+        "paired_scaffolding".to_string(),
+        started.elapsed().as_secs_f64(),
+    );
+
     let mut primary_lengths: Vec<usize> = primary_sequences.iter().map(Vec::len).collect();
     let primary_bases = primary_lengths.iter().sum();
     let largest_primary = primary_lengths.iter().copied().max().unwrap_or(0);
     let primary_n50 = crate::graph::n50(&mut primary_lengths);
+    let mut scaffold_lengths: Vec<usize> = scaffold_sequences.iter().map(Vec::len).collect();
+    let scaffold_bases = scaffold_lengths.iter().sum();
+    let largest_scaffold = scaffold_lengths.iter().copied().max().unwrap_or(0);
+    let scaffold_n50 = crate::graph::n50(&mut scaffold_lengths);
     let direct_transitions = transitions
         .values()
         .filter(|evidence| evidence.direct_reads > 0)
@@ -262,6 +294,12 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         primary_bases,
         primary_n50,
         largest_primary,
+        scaffolds: scaffold_sequences.len(),
+        scaffold_links: scaffold_links.len(),
+        scaffold_bases,
+        scaffold_n50,
+        largest_scaffold,
+        scaffold_gap_bases: scaffold_links.iter().map(|link| link.gap_bases).sum(),
         timings_seconds: timings,
     };
 
@@ -271,6 +309,8 @@ pub fn assemble(config: &AssembleConfig) -> Result<AssemblyProduct> {
         transitions,
         primary_paths,
         primary_sequences,
+        scaffold_sequences,
+        scaffold_links,
         bubble_alleles,
         stats,
     })

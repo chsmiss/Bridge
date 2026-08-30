@@ -46,6 +46,8 @@ enum Command {
         primary_dominance: f32,
         #[arg(long, default_value_t = 200)]
         min_contig_length: usize,
+        #[arg(long, default_value_t = 100)]
+        scaffold_gap_bases: usize,
         #[arg(long)]
         max_pairs: Option<usize>,
         #[arg(short = 't', long, default_value_t = 1)]
@@ -70,6 +72,7 @@ fn main() -> Result<()> {
             min_primary_support,
             primary_dominance,
             min_contig_length,
+            scaffold_gap_bases,
             max_pairs,
             threads,
         } => {
@@ -93,6 +96,7 @@ fn main() -> Result<()> {
                 min_primary_support,
                 primary_dominance,
                 min_contig_length,
+                scaffold_gap_bases,
                 max_pairs,
                 threads,
             };

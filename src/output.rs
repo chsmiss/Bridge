@@ -1,5 +1,6 @@
 use crate::assembler::{AssemblyProduct, BubbleAllele};
 use crate::dna::reverse_complement;
+use crate::scaffold::ScaffoldLink;
 use anyhow::{Context, Result};
 use rustc_hash::FxHashSet;
 use std::fs::File;
@@ -19,6 +20,24 @@ pub fn write_outputs(product: &AssemblyProduct, output_dir: &Path) -> Result<()>
                     sequence.as_slice(),
                 )
             }),
+    )?;
+
+    write_fasta(
+        &output_dir.join("primary_scaffolds.fasta"),
+        product
+            .scaffold_sequences
+            .iter()
+            .enumerate()
+            .map(|(index, sequence)| {
+                (
+                    format!("scaffold_{:06} len={}", index + 1, sequence.len()),
+                    sequence.as_slice(),
+                )
+            }),
+    )?;
+    write_scaffold_links(
+        &output_dir.join("scaffold_links.tsv"),
+        &product.scaffold_links,
     )?;
 
     write_fasta(
@@ -123,6 +142,25 @@ fn write_bubble_fasta(path: &Path, alleles: &[BubbleAllele], haplotigs: bool) ->
             writer.write_all(chunk)?;
             writer.write_all(b"\n")?;
         }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_scaffold_links(path: &Path, links: &[ScaffoldLink]) -> Result<()> {
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "source_component\ttarget_component\tpair_support\tgap_bases"
+    )?;
+    for link in links {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}",
+            link.source_component, link.target_component, link.pair_support, link.gap_bases
+        )?;
     }
     writer.flush()?;
     Ok(())
