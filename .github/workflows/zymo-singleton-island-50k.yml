@@ -1,0 +1,188 @@
+name: Zymo 50k singleton-island sweep
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - src/kmer.rs
+      - .github/workflows/zymo-singleton-island-50k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-singleton-island-50k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PAIRS: "50000"
+      SEED: "43"
+      WINDOWS: "5"
+      TOTAL_SPOTS: "23916276"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sra-toolkit curl unzip time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Reproduce random 50k sample and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zymo benchmark/assemblies benchmark/times
+          python3 - <<'PY'
+          import os, random
+          total = int(os.environ['TOTAL_SPOTS'])
+          pairs = int(os.environ['PAIRS'])
+          windows = int(os.environ['WINDOWS'])
+          rng = random.Random(int(os.environ['SEED']))
+          sizes = [pairs // windows] * windows
+          for index in range(pairs % windows):
+              sizes[index] += 1
+          chosen = []
+          for size in sizes:
+              for _ in range(100000):
+                  start = rng.randint(1, total - size + 1)
+                  end = start + size - 1
+                  if all(end < a or start > b for a, b in chosen):
+                      chosen.append((start, end))
+                      break
+              else:
+                  raise SystemExit('failed to choose windows')
+          chosen.sort()
+          with open('/tmp/zymo/ranges.tsv', 'w') as handle:
+              handle.write('window\tstart_spot\tend_spot\tpairs\n')
+              for index, (start, end) in enumerate(chosen, 1):
+                  handle.write(f'{index}\t{start}\t{end}\t{end-start+1}\n')
+          PY
+          : > /tmp/zymo/R1.fastq.gz
+          : > /tmp/zymo/R2.fastq.gz
+          tail -n +2 /tmp/zymo/ranges.tsv | while IFS=$'\t' read -r idx start end count; do
+            part="/tmp/zymo/part-${idx}"
+            mkdir -p "$part"
+            (
+              cd "$part"
+              fastq-dump ERR2935805 -N "$start" -X "$end" --split-files --skip-technical --gzip
+            )
+            cat "$part/ERR2935805_1.fastq.gz" >> /tmp/zymo/R1.fastq.gz
+            cat "$part/ERR2935805_2.fastq.gz" >> /tmp/zymo/R2.fastq.gz
+          done
+          test "$(gzip -cd /tmp/zymo/R1.fastq.gz | awk 'END {print NR/4}')" -eq "$PAIRS"
+          test "$(gzip -cd /tmp/zymo/R2.fastq.gz | awk 'END {print NR/4}')" -eq "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build BridgeAsm
+        run: cargo build --release
+
+      - name: Run singleton-island variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_variant() {
+            name="$1"
+            fraction="$2"
+            quality="$3"
+            min_count="$4"
+            mercy=24
+            if [ "$min_count" -eq 1 ]; then mercy=0; fi
+            out="benchmark/${name}"
+            mkdir -p "$out"
+            /usr/bin/time -v -o "benchmark/times/${name}.time.txt" \
+              env BRIDGEASM_MATE_TERMINAL_MERCY_KMERS=0 \
+                  BRIDGEASM_SINGLETON_ISLAND_MIN_FRACTION="$fraction" \
+                  BRIDGEASM_SINGLETON_ISLAND_MIN_QUALITY="$quality" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+                -o "$out" -k 21 \
+                --min-count "$min_count" --mercy-max-kmers "$mercy" \
+                --mercy-min-support 1 --mercy-min-quality 25 \
+                --min-read-support 2 --min-pair-support 2 \
+                --min-primary-support 5 --primary-dominance 0.75 \
+                --min-contig-length 200 --threads 2
+            cp "$out/primary_contigs.fasta" "benchmark/assemblies/${name}.fasta"
+          }
+          run_variant bridge_prod 0 30 2
+          run_variant bridge_island60 0.60 30 2
+          run_variant bridge_island75 0.75 30 2
+          run_variant bridge_island90 0.90 30 2
+          run_variant bridge_island75q35 0.75 35 2
+          run_variant bridge_min1 0 30 1
+
+      - name: MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_prod.fasta \
+            benchmark/assemblies/bridge_island60.fasta \
+            benchmark/assemblies/bridge_island75.fasta \
+            benchmark/assemblies/bridge_island90.fasta \
+            benchmark/assemblies/bridge_island75q35.fasta \
+            benchmark/assemblies/bridge_min1.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+
+      - name: Summarize
+        run: |
+          python3 - <<'PY'
+          import csv, json, re
+          from pathlib import Path
+          report = Path('benchmark/metaquast/combined_reference/report.tsv')
+          with report.open() as handle:
+              reader = csv.reader(handle, delimiter='\t')
+              header = next(reader)
+              names = header[1:]
+              rows = {row[0]: row[1:] for row in reader if row}
+          metrics = [
+              'Genome fraction (%)', 'N50', 'NA50', '# contigs', 'Total length',
+              'Largest contig', '# misassemblies', 'Duplication ratio', 'Total aligned length'
+          ]
+          def wall_seconds(text):
+              match = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text)
+              if not match:
+                  return 0.0
+              parts = match.group(1).split(':')
+              if len(parts) == 2:
+                  return float(parts[0]) * 60 + float(parts[1])
+              return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+          with Path('benchmark/summary.tsv').open('w') as out:
+              out.write('assembly\t' + '\t'.join(metrics) + '\tretained_kmers\trescued_kmers\tgraph_nodes\tbranching_unitigs\twall_seconds\tpeak_rss_mib\n')
+              for index, name in enumerate(names):
+                  profile = json.loads((Path('benchmark') / name / 'run_profile.json').read_text())
+                  text = (Path('benchmark/times') / f'{name}.time.txt').read_text()
+                  rss_match = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text)
+                  rss = int(rss_match.group(1)) if rss_match else 0
+                  values = [rows.get(metric, ['NA'] * len(names))[index] for metric in metrics]
+                  kmer = profile['kmer']
+                  graph = profile['graph']
+                  out.write(
+                      name + '\t' + '\t'.join(values) +
+                      f"\t{kmer['solid'] + kmer['rescued']}\t{kmer['rescued']}"
+                      f"\t{graph['canonical_nodes']}\t{graph['branching_unitigs']}"
+                      f"\t{wall_seconds(text):.3f}\t{rss/1024:.1f}\n"
+                  )
+          print(Path('benchmark/summary.tsv').read_text())
+          PY
+          cp /tmp/zymo/ranges.tsv benchmark/random_ranges.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-singleton-island-50k
+          path: benchmark
+          retention-days: 14
