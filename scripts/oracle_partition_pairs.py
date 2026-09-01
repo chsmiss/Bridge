@@ -2,11 +2,12 @@
 """Partition paired FASTQ reads into reference-genome bins using PAF evidence.
 
 This is a diagnostic/oracle utility, not a production binning algorithm. Reference
-identifiers are expected to be prefixed as ``BIN|original_contig``. A pair is
-assigned to one bin when both mates support the same unique bin, or when one mate
-is uniquely assigned and the other mate has no conflicting confident assignment.
-All ambiguous/conflicting/unmapped pairs are retained in a shared pool so an
-oracle-split benchmark does not silently throw away difficult reads.
+identifiers are expected to be prefixed as ``BIN|original_contig``. Mate 1 and
+mate 2 are aligned separately so evidence from reads sharing the same spot name
+cannot be mixed. A pair is assigned to one bin when both mates support the same
+unique bin, or when one mate is uniquely assigned and the other mate has no
+conflicting confident assignment. Ambiguous/conflicting/unmapped pairs are kept
+in a shared pool rather than discarded.
 """
 from __future__ import annotations
 
@@ -55,7 +56,12 @@ def fastq_records(path: Path) -> Iterator[tuple[str, str, str, str]]:
                 raise ValueError(f"truncated FASTQ: {path}")
             if not header.startswith("@") or not plus.startswith("+"):
                 raise ValueError(f"invalid FASTQ record in {path}")
-            yield header.rstrip("\n"), sequence.rstrip("\n"), plus.rstrip("\n"), quality.rstrip("\n")
+            yield (
+                header.rstrip("\n"),
+                sequence.rstrip("\n"),
+                plus.rstrip("\n"),
+                quality.rstrip("\n"),
+            )
 
 
 def paf_hits(path: Path, delimiter: str) -> dict[str, dict[str, Hit]]:
@@ -71,8 +77,7 @@ def paf_hits(path: Path, delimiter: str) -> dict[str, dict[str, Hit]]:
             qlen = max(1, int(fields[1]))
             qstart = int(fields[2])
             qend = int(fields[3])
-            tname = fields[5]
-            genome = tname.split(delimiter, 1)[0]
+            genome = fields[5].split(delimiter, 1)[0]
             matches = int(fields[9])
             mapq = int(fields[11])
             score = matches
@@ -107,7 +112,10 @@ def unique_assignment(
     ]
     if not candidates:
         return None, "weak"
-    candidates.sort(key=lambda item: (item[1].score, item[1].mapq, item[1].aligned_fraction), reverse=True)
+    candidates.sort(
+        key=lambda item: (item[1].score, item[1].mapq, item[1].aligned_fraction),
+        reverse=True,
+    )
     best_genome, best = candidates[0]
     if len(candidates) == 1:
         return best_genome, "unique"
@@ -129,7 +137,8 @@ def write_record(handle: TextIO, record: tuple[str, str, str, str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--paf", required=True, type=Path)
+    parser.add_argument("--paf1", required=True, type=Path)
+    parser.add_argument("--paf2", required=True, type=Path)
     parser.add_argument("--read1", required=True, type=Path)
     parser.add_argument("--read2", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -154,7 +163,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     bins_dir = args.output / "bins"
     bins_dir.mkdir(exist_ok=True)
-    hits = paf_hits(args.paf, args.target_delimiter)
+    left_hits = paf_hits(args.paf1, args.target_delimiter)
+    right_hits = paf_hits(args.paf2, args.target_delimiter)
 
     handles: dict[str, tuple[TextIO, TextIO]] = {}
     counts: Counter[str] = Counter()
@@ -162,10 +172,7 @@ def main() -> None:
 
     def get_handles(label: str) -> tuple[TextIO, TextIO]:
         if label not in handles:
-            if label == "shared":
-                directory = args.output / "shared"
-            else:
-                directory = bins_dir / safe_label(label)
+            directory = args.output / "shared" if label == "shared" else bins_dir / safe_label(label)
             directory.mkdir(parents=True, exist_ok=True)
             handles[label] = (
                 gzip.open(directory / "R1.fastq.gz", "wt"),
@@ -201,10 +208,16 @@ def main() -> None:
                 )
 
             left_bin, left_status = unique_assignment(
-                hits.get(left_name), args.min_mapq, args.min_aligned_fraction, args.score_margin
+                left_hits.get(left_name),
+                args.min_mapq,
+                args.min_aligned_fraction,
+                args.score_margin,
             )
             right_bin, right_status = unique_assignment(
-                hits.get(right_name), args.min_mapq, args.min_aligned_fraction, args.score_margin
+                right_hits.get(right_name),
+                args.min_mapq,
+                args.min_aligned_fraction,
+                args.score_margin,
             )
 
             output_bin = "shared"
