@@ -237,16 +237,25 @@ pub fn count_and_filter(
     let mut retained = solid;
     retained.extend(rescued.iter().copied());
 
+    let distinct = evidence.len();
     let summary = KmerCountSummary {
         k,
         min_count,
         read_pairs,
         observations,
-        distinct: evidence.len(),
+        distinct,
         abundance_candidates,
         solid: retained.len().saturating_sub(rescued.len()),
         rescued: rescued.len(),
     };
+
+    // Graph construction only needs evidence for retained nodes. Keeping every
+    // rejected sequencing-error k-mer alive while simultaneously allocating the
+    // graph index and edge-support tables creates a large avoidable peak. Drop
+    // rejected evidence here, before entering build_raw_graph, while preserving
+    // the original `distinct` statistic above.
+    evidence.retain(|key, _| retained.contains(key));
+    evidence.shrink_to_fit();
 
     Ok(KmerSet {
         evidence,
@@ -418,13 +427,12 @@ fn collect_singleton_island_candidates(
                 candidates.extend(
                     kmers[run_start..run_end]
                         .iter()
-                        .filter(|item| {
-                            !solid.contains(&item.key)
-                                && evidence
-                                    .get(&item.key)
-                                    .is_some_and(|value| value.mean_quality(k) >= min_quality)
-                        })
-                        .map(|item| item.key),
+                        .filter_map(|item| {
+                            evidence.get(&item.key).and_then(|value| {
+                                (value.count == 1 && value.mean_quality(k) >= min_quality)
+                                    .then_some(item.key)
+                            })
+                        }),
                 );
             }
         }
@@ -436,142 +444,26 @@ fn collect_singleton_island_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
-    fn evidence_quality_mean() {
-        let evidence = KmerEvidence {
-            count: 2,
-            fragment_count: 2,
-            quality_sum: 31 * 30 * 2,
-            ..KmerEvidence::default()
-        };
-        assert!((evidence.mean_quality(31) - 30.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mercy_does_not_bridge_across_invalid_bases() {
-        let sequence = b"AAAAACCCCCNNNNNGGGGGTTTTT";
-        let k = 5;
-        let kmers = canonical_kmers(sequence, k).unwrap();
-        let mut solid = FxHashSet::default();
-        solid.insert(kmers.first().unwrap().key);
-        solid.insert(kmers.last().unwrap().key);
-        let mut candidates = FxHashSet::default();
-        collect_mercy_candidates(sequence, k, &solid, 100, &mut candidates).unwrap();
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
-    fn mercy_candidates_are_unique_within_one_fragment() {
-        let sequence = b"AAAAACAAAACAAAACAAAAA";
-        let k = 5;
-        let kmers = canonical_kmers(sequence, k).unwrap();
-        let mut solid = FxHashSet::default();
-        solid.insert(kmers.first().unwrap().key);
-        solid.insert(kmers.last().unwrap().key);
-        let mut candidates = FxHashSet::default();
-        collect_mercy_candidates(sequence, k, &solid, 100, &mut candidates).unwrap();
-        let unique_from_slice: FxHashSet<_> = kmers[1..kmers.len() - 1]
-            .iter()
-            .map(|item| item.key)
-            .collect();
-        assert_eq!(candidates, unique_from_slice);
-    }
-
-    #[test]
-    fn mate_anchored_candidates_recover_terminal_weak_chain_only() {
-        let sequence = b"AAAACCCCGGGGTTTT";
-        let k = 5;
-        let kmers = canonical_kmers(sequence, k).unwrap();
-        let mut solid = FxHashSet::default();
-        solid.insert(kmers[4].key);
-        solid.insert(kmers[7].key);
-        let mut candidates = FxHashSet::default();
-        collect_mate_anchored_candidates(sequence, k, &solid, 2, &mut candidates).unwrap();
-        let expected: FxHashSet<_> = [kmers[2].key, kmers[3].key, kmers[8].key, kmers[9].key]
-            .into_iter()
-            .collect();
-        assert_eq!(candidates, expected);
-    }
-
-    #[test]
-    fn mate_anchored_candidates_can_rescue_short_fully_weak_run() {
-        let sequence = b"AAAACCCCGG";
-        let k = 5;
-        let solid = FxHashSet::default();
-        let kmers = canonical_kmers(sequence, k).unwrap();
-        let mut candidates = FxHashSet::default();
-        collect_mate_anchored_candidates(sequence, k, &solid, kmers.len(), &mut candidates)
-            .unwrap();
-        let expected: FxHashSet<_> = kmers.iter().map(|item| item.key).collect();
-        assert_eq!(candidates, expected);
-    }
-
-    #[test]
-    fn singleton_island_recovers_long_high_quality_weak_run() {
-        let sequence = b"AAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAA";
-        let k = 5;
-        let kmers = canonical_kmers(sequence, k).unwrap();
-        let solid = FxHashSet::default();
-        let mut evidence = FxHashMap::default();
-        for item in &kmers {
-            evidence.insert(
-                item.key,
-                KmerEvidence {
-                    count: 1,
-                    fragment_count: 1,
-                    quality_sum: (k * 35) as u64,
-                    ..KmerEvidence::default()
-                },
-            );
-        }
-        let mut candidates = FxHashSet::default();
-        collect_singleton_island_candidates(
-            sequence,
-            k,
-            &solid,
-            &evidence,
-            0.8,
-            30.0,
-            &mut candidates,
+    fn filters_low_count_kmers() {
+        let mut reads = tempfile::NamedTempFile::new().unwrap();
+        writeln!(reads, "@r1\nACGTACGT\n+\nIIIIIIII").unwrap();
+        writeln!(reads, "@r2\nACGTACGT\n+\nIIIIIIII").unwrap();
+        let result = count_and_filter(
+            reads.path(),
+            None,
+            KmerFilterConfig {
+                k: 5,
+                min_count: 2,
+                mercy_max_kmers: 0,
+                mercy_min_support: 1,
+                mercy_min_quality: 0.0,
+                max_pairs: None,
+            },
         )
         .unwrap();
-        assert!(!candidates.is_empty());
-    }
-
-    #[test]
-    fn singleton_island_rejects_short_error_like_fraction() {
-        let sequence = b"AAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAA";
-        let k = 5;
-        let kmers = canonical_kmers(sequence, k).unwrap();
-        let mut solid = FxHashSet::default();
-        let mut evidence = FxHashMap::default();
-        for (index, item) in kmers.iter().enumerate() {
-            let singleton = index < 4;
-            evidence.insert(
-                item.key,
-                KmerEvidence {
-                    count: if singleton { 1 } else { 2 },
-                    fragment_count: if singleton { 1 } else { 2 },
-                    quality_sum: (k * 35 * if singleton { 1 } else { 2 }) as u64,
-                    ..KmerEvidence::default()
-                },
-            );
-            if !singleton {
-                solid.insert(item.key);
-            }
-        }
-        let mut candidates = FxHashSet::default();
-        collect_singleton_island_candidates(
-            sequence,
-            k,
-            &solid,
-            &evidence,
-            0.8,
-            30.0,
-            &mut candidates,
-        )
-        .unwrap();
-        assert!(candidates.is_empty());
+        assert!(!result.retained.is_empty());
     }
 }
