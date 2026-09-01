@@ -4,8 +4,8 @@
 The pipeline deliberately separates responsibilities across k values:
 
 * k=21 keeps low-depth sequence using the validated singleton-island rescue.
-* k=31 and k=41 provide progressively more specific paths.
-* all three assemblies enable same-read triplet and major-path evidence.
+* k=31, k=41 and k=55 provide progressively more specific paths.
+* all four assemblies enable same-read triplet and major-path evidence.
 * exact reverse-complement-aware deduplication/containment filtering preserves
   complementary sequence without duplicating records.
 * reciprocal unique exact suffix/prefix overlaps carry compatible paths across
@@ -112,6 +112,7 @@ def main() -> None:
         ("k21_recall", 21, 24),
         ("k31_resolve", 31, 16),
         ("k41_resolve", 41, 12),
+        ("k55_resolve", 55, 8),
     ]
     contigs: list[Path] = []
     for name, k, mercy in stages:
