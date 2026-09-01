@@ -1,0 +1,138 @@
+name: Zymo 200k reconciliation tuning
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-reconcile-200k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-reconcile-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frozen 200k assembly artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zymo-optimized-200k-three-way
+          path: /tmp/previous
+          repository: chsmiss/Bridge
+          run-id: 33521053707
+          github-token: ${{ github.token }}
+
+      - name: Install evaluation tools and references
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs benchmark/assemblies
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+
+      - name: Build reconciliation candidates
+        run: |
+          set -euo pipefail
+          base=/tmp/previous/bridge_recovery
+          cp "$base/primary_contigs.fasta" benchmark/assemblies/bridge_current80m20.fasta
+
+          for spec in 31:5 31:10 35:5 40:5 40:10 45:10 60:10; do
+            overlap=${spec%:*}
+            margin=${spec#*:}
+            name="bridge_full_o${overlap}m${margin}"
+            python3 scripts/stitch_exact_overlaps.py \
+              "benchmark/assemblies/${name}.fasta" \
+              "$base/cross_k_noncontained.fasta" \
+              --min-overlap "$overlap" \
+              --overlap-margin "$margin" \
+              --seed-length 31 \
+              --max-seed-occurrences 64 \
+              --min-length 200 \
+              | tee "benchmark/${name}.log"
+          done
+
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/primary_union.fasta \
+            "$base/k21_recall/primary_contigs.fasta" \
+            "$base/k31_resolve/primary_contigs.fasta" \
+            "$base/k41_resolve/primary_contigs.fasta" \
+            "$base/k55_resolve/primary_contigs.fasta" \
+            --min-length 200
+          python3 scripts/filter_contained_fasta.py \
+            benchmark/primary_union.fasta \
+            benchmark/primary_noncontained.fasta \
+            --min-length 200 --seed-k 21 --window 12 --candidate-minimizers 16 \
+            --stats-json benchmark/primary_containment.json
+          for spec in 31:5 40:5; do
+            overlap=${spec%:*}
+            margin=${spec#*:}
+            name="bridge_primary_o${overlap}m${margin}"
+            python3 scripts/stitch_exact_overlaps.py \
+              "benchmark/assemblies/${name}.fasta" \
+              benchmark/primary_noncontained.fasta \
+              --min-overlap "$overlap" \
+              --overlap-margin "$margin" \
+              --seed-length 31 \
+              --max-seed-occurrences 64 \
+              --min-length 200 \
+              | tee "benchmark/${name}.log"
+          done
+
+          cp /tmp/previous/assemblies/megahit.fasta benchmark/assemblies/megahit.fasta
+          cp /tmp/previous/assemblies/metaspades.fasta benchmark/assemblies/metaspades.fasta
+          for fasta in benchmark/assemblies/*.fasta; do
+            name=$(basename "$fasta" .fasta)
+            python3 scripts/fasta_stats.py "$fasta" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run MetaQUAST on reconciliation candidates
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_current80m20.fasta \
+            benchmark/assemblies/bridge_full_o31m5.fasta \
+            benchmark/assemblies/bridge_full_o31m10.fasta \
+            benchmark/assemblies/bridge_full_o35m5.fasta \
+            benchmark/assemblies/bridge_full_o40m5.fasta \
+            benchmark/assemblies/bridge_full_o40m10.fasta \
+            benchmark/assemblies/bridge_full_o45m10.fasta \
+            benchmark/assemblies/bridge_full_o60m10.fasta \
+            benchmark/assemblies/bridge_primary_o31m5.fasta \
+            benchmark/assemblies/bridge_primary_o40m5.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+
+      - name: Save compact report
+        run: |
+          cp benchmark/metaquast/combined_reference/report.tsv benchmark/reconciliation_report.tsv
+          printf 'source_run\t33521053707\nsource_commit\t7edafedf6aa8cb052957e4e60c7953d3c55f3ecd\nread_pairs\t200000\n' \
+            > benchmark/reconciliation_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-reconcile-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.log
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/metaquast/combined_reference/report.tsv
+          retention-days: 14
