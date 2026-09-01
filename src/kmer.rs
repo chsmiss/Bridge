@@ -77,15 +77,23 @@ pub fn count_and_filter(
         mercy_min_quality
     };
 
-    // Experimental, reference-free recovery gate. This is intentionally an
-    // environment knob while the idea is benchmarked; zero preserves the
-    // production behavior exactly. A weak terminal chain is considered only
-    // when the opposite mate contains at least one solid k-mer. The ordinary
-    // mercy quality/support filters are still applied afterwards.
+    // Experimental, reference-free recovery gates. Zero disables each path and
+    // preserves production behavior. These are environment knobs while their
+    // value is being established empirically; successful ideas can later be
+    // promoted to explicit CLI/config fields.
     let mate_terminal_mercy_kmers = std::env::var("BRIDGEASM_MATE_TERMINAL_MERCY_KMERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let singleton_island_fraction = std::env::var("BRIDGEASM_SINGLETON_ISLAND_MIN_FRACTION")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| (0.0..=1.0).contains(value))
+        .unwrap_or(0.0);
+    let singleton_island_quality = std::env::var("BRIDGEASM_SINGLETON_ISLAND_MIN_QUALITY")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(30.0);
 
     let mut evidence: FxHashMap<KmerKey, KmerEvidence> = FxHashMap::default();
     let mut observations = 0_u64;
@@ -138,7 +146,7 @@ pub fn count_and_filter(
         .collect();
 
     let mut mercy_support: FxHashMap<KmerKey, u16> = FxHashMap::default();
-    if mercy_max_kmers > 0 || mate_terminal_mercy_kmers > 0 {
+    if mercy_max_kmers > 0 || mate_terminal_mercy_kmers > 0 || singleton_island_fraction > 0.0 {
         for_each_pair(read1, read2, max_pairs, |_index, left, right| {
             // Count support once per physical fragment, even if the same weak
             // k-mer occurs more than once or is present in both mates.
@@ -184,6 +192,29 @@ pub fn count_and_filter(
                             &mut fragment_candidates,
                         )?;
                     }
+                }
+            }
+
+            if singleton_island_fraction > 0.0 {
+                collect_singleton_island_candidates(
+                    &left.sequence,
+                    k,
+                    &solid,
+                    &evidence,
+                    singleton_island_fraction,
+                    singleton_island_quality,
+                    &mut fragment_candidates,
+                )?;
+                if let Some(right) = right.as_ref() {
+                    collect_singleton_island_candidates(
+                        &right.sequence,
+                        k,
+                        &solid,
+                        &evidence,
+                        singleton_island_fraction,
+                        singleton_island_quality,
+                        &mut fragment_candidates,
+                    )?;
                 }
             }
 
@@ -346,6 +377,62 @@ fn collect_mate_anchored_candidates(
     Ok(())
 }
 
+fn collect_singleton_island_candidates(
+    sequence: &[u8],
+    k: usize,
+    solid: &FxHashSet<KmerKey>,
+    evidence: &FxHashMap<KmerKey, KmerEvidence>,
+    min_singleton_fraction: f32,
+    min_quality: f32,
+    candidates: &mut FxHashSet<KmerKey>,
+) -> Result<()> {
+    let kmers = canonical_kmers(sequence, k)?;
+    if kmers.is_empty() {
+        return Ok(());
+    }
+
+    // One substitution typically creates a weak run of roughly k consecutive
+    // k-mers inside an otherwise well-supported read. A genuinely low-depth
+    // read can instead be weak across most of its full continuous span. Only
+    // evaluate runs longer than k+4 windows and require a high fraction of
+    // globally singleton, high-quality k-mers before rescuing that island.
+    let min_run_kmers = k.saturating_add(4);
+    let mut run_start = 0_usize;
+    while run_start < kmers.len() {
+        let mut run_end = run_start + 1;
+        while run_end < kmers.len() && kmers[run_end].position == kmers[run_end - 1].position + 1 {
+            run_end += 1;
+        }
+        let run_len = run_end - run_start;
+        if run_len >= min_run_kmers {
+            let singleton_count = kmers[run_start..run_end]
+                .iter()
+                .filter(|item| {
+                    evidence.get(&item.key).is_some_and(|value| {
+                        value.count == 1 && value.mean_quality(k) >= min_quality
+                    })
+                })
+                .count();
+            let singleton_fraction = singleton_count as f32 / run_len as f32;
+            if singleton_fraction >= min_singleton_fraction {
+                candidates.extend(
+                    kmers[run_start..run_end]
+                        .iter()
+                        .filter(|item| {
+                            !solid.contains(&item.key)
+                                && evidence.get(&item.key).is_some_and(|value| {
+                                    value.mean_quality(k) >= min_quality
+                                })
+                        })
+                        .map(|item| item.key),
+                );
+            }
+        }
+        run_start = run_end;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +505,73 @@ mod tests {
             .unwrap();
         let expected: FxHashSet<_> = kmers.iter().map(|item| item.key).collect();
         assert_eq!(candidates, expected);
+    }
+
+    #[test]
+    fn singleton_island_recovers_long_high_quality_weak_run() {
+        let sequence = b"AAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAA";
+        let k = 5;
+        let kmers = canonical_kmers(sequence, k).unwrap();
+        let solid = FxHashSet::default();
+        let mut evidence = FxHashMap::default();
+        for item in &kmers {
+            evidence.insert(
+                item.key,
+                KmerEvidence {
+                    count: 1,
+                    fragment_count: 1,
+                    quality_sum: (k * 35) as u64,
+                    ..KmerEvidence::default()
+                },
+            );
+        }
+        let mut candidates = FxHashSet::default();
+        collect_singleton_island_candidates(
+            sequence,
+            k,
+            &solid,
+            &evidence,
+            0.8,
+            30.0,
+            &mut candidates,
+        )
+        .unwrap();
+        assert!(!candidates.is_empty());
+    }
+
+    #[test]
+    fn singleton_island_rejects_short_error_like_fraction() {
+        let sequence = b"AAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAA";
+        let k = 5;
+        let kmers = canonical_kmers(sequence, k).unwrap();
+        let mut solid = FxHashSet::default();
+        let mut evidence = FxHashMap::default();
+        for (index, item) in kmers.iter().enumerate() {
+            let singleton = index < 4;
+            evidence.insert(
+                item.key,
+                KmerEvidence {
+                    count: if singleton { 1 } else { 2 },
+                    fragment_count: if singleton { 1 } else { 2 },
+                    quality_sum: (k * 35 * if singleton { 1 } else { 2 }) as u64,
+                    ..KmerEvidence::default()
+                },
+            );
+            if !singleton {
+                solid.insert(item.key);
+            }
+        }
+        let mut candidates = FxHashSet::default();
+        collect_singleton_island_candidates(
+            sequence,
+            k,
+            &solid,
+            &evidence,
+            0.8,
+            30.0,
+            &mut candidates,
+        )
+        .unwrap();
+        assert!(candidates.is_empty());
     }
 }
