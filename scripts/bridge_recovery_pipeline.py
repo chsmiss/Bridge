@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
 import subprocess
 import sys
@@ -107,6 +108,7 @@ def main() -> None:
     if args.stitch_min_overlap < 31:
         raise SystemExit("stitch minimum overlap must be >=31")
 
+    pipeline_started = time.monotonic()
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     scripts = Path(__file__).resolve().parent
@@ -212,6 +214,7 @@ def main() -> None:
         ]
     )
 
+    child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
         "pipeline": "bridge-recovery-v2",
         "read1": str(args.read1),
@@ -232,6 +235,8 @@ def main() -> None:
         "final_fasta": str(final_fasta),
         "timings_seconds": timings,
         "total_stage_seconds": sum(timings.values()),
+        "wall_seconds": time.monotonic() - pipeline_started,
+        "peak_child_rss_mib": child_usage.ru_maxrss / 1024.0,
     }
     (output / "pipeline_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
