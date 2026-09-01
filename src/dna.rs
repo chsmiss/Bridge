@@ -55,8 +55,19 @@ pub struct KmerKey {
 }
 
 impl Hash for KmerKey {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.words.hash(state);
+        // Most production short-read k-mers use only one or two of the five
+        // words. Hashing all five words wastes memory bandwidth on guaranteed
+        // trailing zeroes. Equal keys always have the same highest non-zero
+        // word, so omitting those zero suffixes preserves the Hash contract.
+        let mut used = WORDS;
+        while used > 1 && self.words[used - 1] == 0 {
+            used -= 1;
+        }
+        for word in &self.words[..used] {
+            state.write_u64(*word);
+        }
     }
 }
 
@@ -243,19 +254,23 @@ pub struct OrientedKmer {
     pub position: usize,
 }
 
-/// Iterate exact canonical k-mers in O(read_length) time. Invalid bases reset the roller.
-pub fn canonical_kmers(sequence: &[u8], k: usize) -> Result<Vec<OrientedKmer>> {
+/// Visit exact canonical k-mers in O(read_length) time without allocating a
+/// per-read output vector. Invalid bases reset the roller.
+pub fn for_each_canonical_kmer<F>(sequence: &[u8], k: usize, mut callback: F) -> Result<usize>
+where
+    F: FnMut(OrientedKmer),
+{
     if k == 0 || k > MAX_K {
         bail!("k must be in 1..={MAX_K}");
     }
     if sequence.len() < k {
-        return Ok(Vec::new());
+        return Ok(0);
     }
 
     let mut forward = KmerKey::ZERO;
     let mut reverse = KmerKey::ZERO;
     let mut valid = 0_usize;
-    let mut output = Vec::with_capacity(sequence.len() - k + 1);
+    let mut emitted = 0_usize;
 
     for (index, &base) in sequence.iter().enumerate() {
         let Some(bits) = base_bits(base) else {
@@ -277,21 +292,30 @@ pub fn canonical_kmers(sequence: &[u8], k: usize) -> Result<Vec<OrientedKmer>> {
         if valid >= k {
             let position = index + 1 - k;
             if reverse < forward {
-                output.push(OrientedKmer {
+                callback(OrientedKmer {
                     key: reverse,
                     reverse: true,
                     position,
                 });
             } else {
-                output.push(OrientedKmer {
+                callback(OrientedKmer {
                     key: forward,
                     reverse: false,
                     position,
                 });
             }
+            emitted += 1;
         }
     }
 
+    Ok(emitted)
+}
+
+/// Collect exact canonical k-mers. Kept for algorithms that need random access
+/// to neighboring k-mers; hot counting paths should prefer for_each_canonical_kmer.
+pub fn canonical_kmers(sequence: &[u8], k: usize) -> Result<Vec<OrientedKmer>> {
+    let mut output = Vec::with_capacity(sequence.len().saturating_sub(k).saturating_add(1));
+    for_each_canonical_kmer(sequence, k, |item| output.push(item))?;
     Ok(output)
 }
 
@@ -330,6 +354,18 @@ mod tests {
                 assert_eq!(item.key, direct.0);
                 assert_eq!(item.reverse, direct.1);
             }
+        }
+    }
+
+    #[test]
+    fn visitor_matches_collector() {
+        let sequence = b"ACGTACGTNNACGTACGTACGT";
+        for k in [3, 5, 7] {
+            let collected = canonical_kmers(sequence, k).unwrap();
+            let mut visited = Vec::new();
+            let emitted = for_each_canonical_kmer(sequence, k, |item| visited.push(item)).unwrap();
+            assert_eq!(emitted, collected.len());
+            assert_eq!(visited, collected);
         }
     }
 }
