@@ -389,7 +389,7 @@ fn collect_mate_anchored_candidates(
 fn collect_singleton_island_candidates(
     sequence: &[u8],
     k: usize,
-    solid: &FxHashSet<KmerKey>,
+    _solid: &FxHashSet<KmerKey>,
     evidence: &FxHashMap<KmerKey, KmerEvidence>,
     min_singleton_fraction: f32,
     min_quality: f32,
@@ -424,16 +424,12 @@ fn collect_singleton_island_candidates(
                 .count();
             let singleton_fraction = singleton_count as f32 / run_len as f32;
             if singleton_fraction >= min_singleton_fraction {
-                candidates.extend(
-                    kmers[run_start..run_end]
-                        .iter()
-                        .filter_map(|item| {
-                            evidence.get(&item.key).and_then(|value| {
-                                (value.count == 1 && value.mean_quality(k) >= min_quality)
-                                    .then_some(item.key)
-                            })
-                        }),
-                );
+                candidates.extend(kmers[run_start..run_end].iter().filter_map(|item| {
+                    evidence.get(&item.key).and_then(|value| {
+                        (value.count == 1 && value.mean_quality(k) >= min_quality)
+                            .then_some(item.key)
+                    })
+                }));
             }
         }
         run_start = run_end;
