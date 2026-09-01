@@ -75,11 +75,11 @@ jobs:
               --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
               --output benchmark/bridge_recovery \
               --threads "$THREADS" \
-              --singleton-fraction 0.60 \
-              --singleton-quality 30 \
+              --singleton-fraction 0.50 \
+              --singleton-quality 35 \
               --mate-terminal-mercy 96 \
-              --stitch-min-overlap 80 \
-              --stitch-overlap-margin 20
+              --stitch-min-overlap 31 \
+              --stitch-overlap-margin 10
           cp benchmark/bridge_recovery/primary_contigs.fasta \
             benchmark/assemblies/bridge_recovery.fasta
           python3 scripts/fasta_stats.py benchmark/bridge_recovery/primary_contigs.fasta \
@@ -167,5 +167,16 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: zymo-optimized-200k-three-way
-          path: benchmark
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/bridge_recovery/pipeline_manifest.json
+            benchmark/bridge_recovery/containment_stats.json
+            benchmark/bridge_recovery/k21_recall/run_profile.json
+            benchmark/bridge_recovery/k31_resolve/run_profile.json
+            benchmark/bridge_recovery/k41_resolve/run_profile.json
+            benchmark/bridge_recovery/k55_resolve/run_profile.json
+            benchmark/metaquast/combined_reference/report.tsv
           retention-days: 14
