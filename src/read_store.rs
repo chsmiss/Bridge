@@ -16,11 +16,7 @@ pub struct PackedReadStore {
 }
 
 impl PackedReadStore {
-    pub fn load(
-        read1: &Path,
-        read2: Option<&Path>,
-        max_pairs: Option<usize>,
-    ) -> Result<Self> {
+    pub fn load(read1: &Path, read2: Option<&Path>, max_pairs: Option<usize>) -> Result<Self> {
         let mut store = Self {
             paired: read2.is_some(),
             ..Self::default()
