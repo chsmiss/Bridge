@@ -320,9 +320,7 @@ fn collect_mate_anchored_candidates(
     let mut run_start = 0_usize;
     while run_start < kmers.len() {
         let mut run_end = run_start + 1;
-        while run_end < kmers.len()
-            && kmers[run_end].position == kmers[run_end - 1].position + 1
-        {
+        while run_end < kmers.len() && kmers[run_end].position == kmers[run_end - 1].position + 1 {
             run_end += 1;
         }
 
@@ -416,7 +414,8 @@ mod tests {
         let solid = FxHashSet::default();
         let kmers = canonical_kmers(sequence, k).unwrap();
         let mut candidates = FxHashSet::default();
-        collect_mate_anchored_candidates(sequence, k, &solid, kmers.len(), &mut candidates).unwrap();
+        collect_mate_anchored_candidates(sequence, k, &solid, kmers.len(), &mut candidates)
+            .unwrap();
         let expected: FxHashSet<_> = kmers.iter().map(|item| item.key).collect();
         assert_eq!(candidates, expected);
     }
