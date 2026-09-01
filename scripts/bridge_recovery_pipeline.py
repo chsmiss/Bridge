@@ -3,9 +3,10 @@
 
 The pipeline deliberately separates responsibilities across k values:
 
-* k=21 keeps low-depth sequence using the validated singleton-island rescue.
+* k=21 keeps low-depth sequence with singleton-island plus mate-terminal rescue.
 * k=31, k=41 and k=55 provide progressively more specific paths.
 * all four assemblies enable same-read triplet and major-path evidence.
+* physically-flanked, read-supported haplotigs are preserved as strain paths.
 * exact reverse-complement-aware deduplication/containment filtering preserves
   complementary sequence without duplicating records.
 * reciprocal unique exact suffix/prefix overlaps carry compatible paths across
@@ -92,6 +93,7 @@ def main() -> None:
     parser.add_argument("--min-contig-length", type=int, default=200)
     parser.add_argument("--singleton-fraction", type=float, default=0.60)
     parser.add_argument("--singleton-quality", type=float, default=30.0)
+    parser.add_argument("--mate-terminal-mercy", type=int, default=96)
     parser.add_argument("--stitch-min-overlap", type=int, default=80)
     parser.add_argument("--stitch-overlap-margin", type=int, default=20)
     args = parser.parse_args()
@@ -100,6 +102,8 @@ def main() -> None:
         raise SystemExit("threads must be positive")
     if not 0.0 <= args.singleton_fraction <= 1.0:
         raise SystemExit("singleton fraction must be in [0,1]")
+    if args.mate_terminal_mercy < 0:
+        raise SystemExit("mate terminal mercy must be non-negative")
     if args.stitch_min_overlap < 31:
         raise SystemExit("stitch minimum overlap must be >=31")
 
@@ -114,7 +118,7 @@ def main() -> None:
         ("k41_resolve", 41, 12),
         ("k55_resolve", 55, 8),
     ]
-    contigs: list[Path] = []
+    candidates: list[Path] = []
     for name, k, mercy in stages:
         stage_dir = output / name
         if stage_dir.exists():
@@ -127,9 +131,13 @@ def main() -> None:
             env["BRIDGEASM_SINGLETON_ISLAND_MIN_QUALITY"] = str(
                 args.singleton_quality
             )
+            env["BRIDGEASM_MATE_TERMINAL_MERCY_KMERS"] = str(
+                args.mate_terminal_mercy
+            )
         else:
             env.pop("BRIDGEASM_SINGLETON_ISLAND_MIN_FRACTION", None)
             env.pop("BRIDGEASM_SINGLETON_ISLAND_MIN_QUALITY", None)
+            env.pop("BRIDGEASM_MATE_TERMINAL_MERCY_KMERS", None)
         timings[name] = run(
             bridge_command(
                 args.bridgeasm,
@@ -143,7 +151,12 @@ def main() -> None:
             ),
             env=env,
         )
-        contigs.append(stage_dir / "primary_contigs.fasta")
+        candidates.append(stage_dir / "primary_contigs.fasta")
+        # Haplotigs are emitted only for bubbles that have unique flanks and
+        # sufficient direct read support on both sides. Keeping them here is a
+        # conservative way to preserve strain-specific paths that the single
+        # primary path necessarily omits.
+        candidates.append(stage_dir / "haplotigs.fasta")
 
     merged = output / "cross_k_exact_union.fasta"
     timings["exact_union"] = run(
@@ -151,7 +164,7 @@ def main() -> None:
             sys.executable,
             str(scripts / "merge_fasta_unique.py"),
             str(merged),
-            *map(str, contigs),
+            *map(str, candidates),
             "--min-length",
             str(args.min_contig_length),
         ]
@@ -200,7 +213,7 @@ def main() -> None:
     )
 
     manifest = {
-        "pipeline": "bridge-recovery-v1",
+        "pipeline": "bridge-recovery-v2",
         "read1": str(args.read1),
         "read2": str(args.read2) if args.read2 else None,
         "stages": [
@@ -209,6 +222,8 @@ def main() -> None:
         ],
         "singleton_fraction_k21": args.singleton_fraction,
         "singleton_quality_k21": args.singleton_quality,
+        "mate_terminal_mercy_k21": args.mate_terminal_mercy,
+        "preserve_physically_flanked_haplotigs": True,
         "threaded_path_cover": True,
         "major_path_cover": True,
         "path_cover_secondary_dominance": 0.25,
