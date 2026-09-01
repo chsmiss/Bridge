@@ -1,0 +1,246 @@
+name: Zymo Log random 50k benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Total ERR2935805 paired-end spots to sample
+        required: false
+        default: "50000"
+      seed:
+        description: Random seed for reproducible window sampling
+        required: false
+        default: "43"
+      windows:
+        description: Number of non-overlapping random windows
+        required: false
+        default: "5"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-random-50k-benchmark.yml
+
+concurrency:
+  group: zymo-random-50k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: ${{ inputs.pairs || '50000' }}
+      SEED: ${{ inputs.seed || '43' }}
+      WINDOWS: ${{ inputs.windows || '5' }}
+      # ENA metadata reports 47,832,553 reads for ERR2935805; paired spots are ~23.9M.
+      # Keep one spot of margin for the odd read count.
+      TOTAL_SPOTS: "23916276"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install assemblers, SRA toolkit, and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit spades sra-toolkit curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+          {
+            echo "fastq-dump: $(fastq-dump --version 2>&1 | tail -n 1)"
+            echo "megahit: $(megahit --version 2>&1 | head -n 1)"
+            echo "metaspades: $(metaspades.py --version 2>&1 | head -n 1)"
+            echo "metaquast: $(python3 /tmp/quast-5.3.0/metaquast.py --version 2>&1 | head -n 1)"
+            echo "rustc: $(rustc --version)"
+          } | tee /tmp/tool_versions.txt
+
+      - name: Sample reproducible random read windows and download references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zymo-random benchmark/assemblies
+          python3 - <<'PY'
+          import os, random
+
+          total = int(os.environ['TOTAL_SPOTS'])
+          pairs = int(os.environ['PAIRS'])
+          seed = int(os.environ['SEED'])
+          windows = int(os.environ['WINDOWS'])
+          if pairs < 1 or windows < 1 or pairs < windows:
+              raise SystemExit('invalid PAIRS/WINDOWS')
+
+          sizes = [pairs // windows] * windows
+          for i in range(pairs % windows):
+              sizes[i] += 1
+
+          rng = random.Random(seed)
+          chosen = []
+          for size in sizes:
+              for _ in range(100000):
+                  start = rng.randint(1, total - size + 1)
+                  end = start + size - 1
+                  if all(end < a or start > b for a, b in chosen):
+                      chosen.append((start, end))
+                      break
+              else:
+                  raise SystemExit('could not choose non-overlapping windows')
+
+          chosen.sort()
+          with open('/tmp/zymo-random/ranges.tsv', 'w') as f:
+              f.write('window\tstart_spot\tend_spot\tpairs\n')
+              for i, (start, end) in enumerate(chosen, 1):
+                  f.write(f'{i}\t{start}\t{end}\t{end-start+1}\n')
+          PY
+          cat /tmp/zymo-random/ranges.tsv
+
+          : > /tmp/zymo-random/ERR2935805_1.fastq.gz
+          : > /tmp/zymo-random/ERR2935805_2.fastq.gz
+          tail -n +2 /tmp/zymo-random/ranges.tsv | while IFS=$'\t' read -r idx start end count; do
+            part="/tmp/zymo-random/part-${idx}"
+            mkdir -p "$part"
+            (
+              cd "$part"
+              fastq-dump ERR2935805 \
+                -N "$start" -X "$end" \
+                --split-files --skip-technical --gzip
+            )
+            test -s "$part/ERR2935805_1.fastq.gz"
+            test -s "$part/ERR2935805_2.fastq.gz"
+            cat "$part/ERR2935805_1.fastq.gz" >> /tmp/zymo-random/ERR2935805_1.fastq.gz
+            cat "$part/ERR2935805_2.fastq.gz" >> /tmp/zymo-random/ERR2935805_2.fastq.gz
+          done
+
+          r1=$(gzip -cd /tmp/zymo-random/ERR2935805_1.fastq.gz | awk 'END {print NR/4}')
+          r2=$(gzip -cd /tmp/zymo-random/ERR2935805_2.fastq.gz | awk 'END {print NR/4}')
+          echo "sampled_r1=$r1 sampled_r2=$r2 expected_pairs=$PAIRS"
+          test "$r1" -eq "$PAIRS"
+          test "$r2" -eq "$PAIRS"
+
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build BridgeAsm
+        run: cargo build --release
+
+      - name: Run BridgeAsm k21 mercy baseline
+        run: |
+          mkdir -p benchmark/bridgeasm
+          /usr/bin/time -v -o benchmark/bridgeasm.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo-random/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-random/ERR2935805_2.fastq.gz \
+              -o benchmark/bridgeasm -k 21 \
+              --min-count 2 --mercy-max-kmers 24 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 2 --min-pair-support 2 \
+              --min-primary-support 5 --primary-dominance 0.75 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridgeasm/primary_contigs.fasta benchmark/assemblies/bridgeasm.fasta
+          python3 scripts/fasta_stats.py benchmark/bridgeasm/primary_contigs.fasta \
+            --json benchmark/bridgeasm.stats.json | tee benchmark/bridgeasm.stats.tsv
+
+      - name: Run MEGAHIT
+        run: |
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit -1 /tmp/zymo-random/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-random/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json | tee benchmark/megahit.stats.tsv
+
+      - name: Run metaSPAdes
+        run: |
+          /usr/bin/time -v -o benchmark/metaspades.time.txt \
+            metaspades.py -1 /tmp/zymo-random/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-random/ERR2935805_2.fastq.gz \
+              -o benchmark/metaspades -t 2 -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
+          python3 scripts/fasta_stats.py benchmark/metaspades/contigs.fasta \
+            --json benchmark/metaspades.stats.json | tee benchmark/metaspades.stats.tsv
+
+      - name: Run MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridgeasm.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+
+      - name: Summarize GF, assembly quality, time, and peak memory
+        run: |
+          python3 - <<'PY'
+          import csv, re
+          from pathlib import Path
+
+          report = Path('benchmark/metaquast/combined_reference/report.tsv')
+          rows = {}
+          with report.open() as f:
+              reader = csv.reader(f, delimiter='\t')
+              header = next(reader)
+              assemblies = header[1:]
+              for row in reader:
+                  if row:
+                      rows[row[0]] = row[1:]
+
+          wanted = [
+              'Genome fraction (%)', 'N50', 'NA50', '# contigs', 'Total length',
+              'Largest contig', '# misassemblies', 'Duplication ratio',
+              'Total aligned length'
+          ]
+
+          def time_stats(path):
+              text = Path(path).read_text()
+              wall = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text)
+              rss = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text)
+              return wall.group(1) if wall else 'NA', int(rss.group(1)) if rss else None
+
+          time_files = {
+              'bridgeasm': 'benchmark/bridgeasm.time.txt',
+              'megahit': 'benchmark/megahit.time.txt',
+              'metaspades': 'benchmark/metaspades.time.txt',
+          }
+
+          out = Path('benchmark/random50k_summary.tsv')
+          with out.open('w') as f:
+              f.write('assembly\t' + '\t'.join(wanted) + '\twall_time\tpeak_rss_kb\tpeak_rss_mib\n')
+              for i, name in enumerate(assemblies):
+                  wall, rss = time_stats(time_files[name])
+                  vals = [rows.get(key, ['NA'] * len(assemblies))[i] for key in wanted]
+                  mib = f'{rss/1024:.1f}' if rss is not None else 'NA'
+                  f.write(name + '\t' + '\t'.join(vals) + f'\t{wall}\t{rss or "NA"}\t{mib}\n')
+          print(out.read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-random/ranges.tsv benchmark/random_ranges.tsv
+          cp /tmp/tool_versions.txt benchmark/tool_versions.txt
+          {
+            printf 'commit\t%s\n' "$GITHUB_SHA"
+            printf 'run\tERR2935805\n'
+            printf 'sampling\tseeded_nonoverlapping_random_windows\n'
+            printf 'seed\t%s\n' "$SEED"
+            printf 'read_pairs\t%s\n' "$PAIRS"
+            printf 'windows\t%s\n' "$WINDOWS"
+            printf 'total_spots_assumed\t%s\n' "$TOTAL_SPOTS"
+            printf 'threads\t2\n'
+            printf 'reference\tZymoBIOMICS.STD.refseq.v2\n'
+            printf 'metaquast_min_contig\t200\n'
+          } > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-random-50k-benchmark
+          path: benchmark
+          retention-days: 14
