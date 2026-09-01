@@ -1,0 +1,143 @@
+name: Zymo 50k k-mer engineering
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - src/bin/kmer_engineering_bench.rs
+      - src/dna.rs
+      - src/fastq.rs
+      - .github/workflows/zymo-kmer-engineering-50k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-kmer-engineering-50k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PAIRS: "50000"
+      SEED: "43"
+      WINDOWS: "5"
+      TOTAL_SPOTS: "23916276"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SRA tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sra-toolkit time
+
+      - name: Reproduce random 50k sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zymo benchmark/kmer_engineering
+          python3 - <<'PY'
+          import os, random
+          total = int(os.environ['TOTAL_SPOTS'])
+          pairs = int(os.environ['PAIRS'])
+          windows = int(os.environ['WINDOWS'])
+          rng = random.Random(int(os.environ['SEED']))
+          sizes = [pairs // windows] * windows
+          for index in range(pairs % windows):
+              sizes[index] += 1
+          chosen = []
+          for size in sizes:
+              for _ in range(100000):
+                  start = rng.randint(1, total - size + 1)
+                  end = start + size - 1
+                  if all(end < a or start > b for a, b in chosen):
+                      chosen.append((start, end))
+                      break
+              else:
+                  raise SystemExit('failed to choose windows')
+          chosen.sort()
+          with open('/tmp/zymo/ranges.tsv', 'w') as handle:
+              handle.write('window\tstart_spot\tend_spot\tpairs\n')
+              for index, (start, end) in enumerate(chosen, 1):
+                  handle.write(f'{index}\t{start}\t{end}\t{end-start+1}\n')
+          PY
+          : > /tmp/zymo/R1.fastq.gz
+          : > /tmp/zymo/R2.fastq.gz
+          tail -n +2 /tmp/zymo/ranges.tsv | while IFS=$'\t' read -r idx start end count; do
+            part="/tmp/zymo/part-${idx}"
+            mkdir -p "$part"
+            (
+              cd "$part"
+              fastq-dump ERR2935805 -N "$start" -X "$end" --split-files --skip-technical --gzip
+            )
+            cat "$part/ERR2935805_1.fastq.gz" >> /tmp/zymo/R1.fastq.gz
+            cat "$part/ERR2935805_2.fastq.gz" >> /tmp/zymo/R2.fastq.gz
+          done
+          cp /tmp/zymo/ranges.tsv benchmark/kmer_engineering/random_ranges.tsv
+
+      - name: Build benchmark binary
+        run: cargo build --release --bin kmer_engineering_bench
+
+      - name: Repeated scans with wide KmerKey
+        run: |
+          /usr/bin/time -v -o benchmark/kmer_engineering/repeated_wide.time.txt \
+            target/release/kmer_engineering_bench \
+              -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              --k 21,25,31 --mode repeated-wide \
+              > benchmark/kmer_engineering/repeated_wide.json
+
+      - name: Single scan with compact keys
+        run: |
+          /usr/bin/time -v -o benchmark/kmer_engineering/single_pass_compact.time.txt \
+            target/release/kmer_engineering_bench \
+              -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              --k 21,25,31 --mode single-pass-compact \
+              > benchmark/kmer_engineering/single_pass_compact.json
+
+      - name: Validate and summarize
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          base = json.loads(Path('benchmark/kmer_engineering/repeated_wide.json').read_text())
+          compact = json.loads(Path('benchmark/kmer_engineering/single_pass_compact.json').read_text())
+          assert base['read_pairs'] == compact['read_pairs'] == 50000
+          b = {row['k']: row for row in base['k']}
+          c = {row['k']: row for row in compact['k']}
+          for k in sorted(b):
+              assert b[k]['observations'] == c[k]['observations'], (k, b[k], c[k])
+              assert b[k]['distinct'] == c[k]['distinct'], (k, b[k], c[k])
+
+          def resources(path):
+              text = Path(path).read_text()
+              wall = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text).group(1)
+              parts = [float(x) for x in wall.split(':')]
+              seconds = parts[-1] + (parts[-2] * 60 if len(parts) >= 2 else 0) + (parts[-3] * 3600 if len(parts) >= 3 else 0)
+              rss = int(re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text).group(1)) / 1024
+              return seconds, rss
+
+          bw, br = resources('benchmark/kmer_engineering/repeated_wide.time.txt')
+          cw, cr = resources('benchmark/kmer_engineering/single_pass_compact.time.txt')
+          lines = [
+              'mode\twall_seconds\tpeak_rss_mib\tread_pairs\tks',
+              f"repeated_wide\t{bw:.3f}\t{br:.1f}\t{base['read_pairs']}\t21,25,31",
+              f"single_pass_compact\t{cw:.3f}\t{cr:.1f}\t{compact['read_pairs']}\t21,25,31",
+          ]
+          Path('benchmark/kmer_engineering/summary.tsv').write_text('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          print('speedup', bw / cw if cw else None)
+          print('rss_ratio', cr / br if br else None)
+          print('key sizes', {k: (b[k]['key_bytes'], c[k]['key_bytes']) for k in sorted(b)})
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-kmer-engineering-50k
+          path: benchmark/kmer_engineering
+          retention-days: 14
