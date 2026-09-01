@@ -92,11 +92,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--min-contig-length", type=int, default=200)
-    parser.add_argument("--singleton-fraction", type=float, default=0.60)
-    parser.add_argument("--singleton-quality", type=float, default=30.0)
+    parser.add_argument("--singleton-fraction", type=float, default=0.50)
+    parser.add_argument("--singleton-quality", type=float, default=35.0)
     parser.add_argument("--mate-terminal-mercy", type=int, default=96)
-    parser.add_argument("--stitch-min-overlap", type=int, default=80)
-    parser.add_argument("--stitch-overlap-margin", type=int, default=20)
+    parser.add_argument("--stitch-min-overlap", type=int, default=31)
+    parser.add_argument("--stitch-overlap-margin", type=int, default=10)
     args = parser.parse_args()
 
     if args.threads <= 0:
@@ -216,7 +216,7 @@ def main() -> None:
 
     child_usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
-        "pipeline": "bridge-recovery-v2",
+        "pipeline": "bridge-recovery-v3",
         "read1": str(args.read1),
         "read2": str(args.read2) if args.read2 else None,
         "stages": [
