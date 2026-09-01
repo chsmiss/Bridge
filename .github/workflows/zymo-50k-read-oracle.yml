@@ -1,0 +1,60 @@
+name: Zymo Log 50k read-level GF oracle
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-50k-read-oracle.yml
+      - scripts/read_coverage_oracle.py
+      - scripts/download_ena_subset.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mapper
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minimap2 curl unzip
+      - name: Download the deterministic first 50k pairs and references
+        run: |
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs 50000
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs benchmark
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+      - name: Map every mate independently to the combined Zymo references
+        run: |
+          minimap2 -x sr --secondary=yes -N 50 -t 2 \
+            /tmp/zymo-references.fasta \
+            /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            > benchmark/reads_to_reference.paf
+      - name: Compute read-level oracle ceilings
+        run: |
+          python3 scripts/read_coverage_oracle.py \
+            --reference /tmp/zymo-references.fasta \
+            --paf benchmark/reads_to_reference.paf \
+            --json benchmark/read_oracle.json \
+            --tsv benchmark/read_oracle.tsv \
+            --min-island 200
+          cat benchmark/read_oracle.tsv
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t50000\n' "$GITHUB_SHA" > benchmark/provenance.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-50k-read-oracle
+          path: benchmark
+          retention-days: 14
