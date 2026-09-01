@@ -57,6 +57,14 @@ jobs:
               -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
               --k "$KS" --mode one-pass \
               > benchmark/one-pass.json
+      - name: Packed ReadStore, sequential k scans
+        run: |
+          /usr/bin/time -v -o benchmark/packed.time.txt \
+            target/release/multik_extract_bench \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --k "$KS" --mode packed \
+              > benchmark/packed.json
       - name: Verify identical k-mer statistics and summarize
         run: |
           python3 - <<'PY'
@@ -64,8 +72,9 @@ jobs:
           root = pathlib.Path('benchmark')
           repeated = json.loads((root/'repeated.json').read_text())
           one = json.loads((root/'one-pass.json').read_text())
-          assert repeated['read_pairs'] == one['read_pairs']
-          assert repeated['k'] == one['k'], (repeated['k'], one['k'])
+          packed = json.loads((root/'packed.json').read_text())
+          assert repeated['read_pairs'] == one['read_pairs'] == packed['read_pairs']
+          assert repeated['k'] == one['k'] == packed['k'], (repeated['k'], one['k'], packed['k'])
           def parse_time(path):
               text = path.read_text()
               rss = int(re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text).group(1))
@@ -73,17 +82,23 @@ jobs:
               return rss, wall
           rep_rss, rep_wall = parse_time(root/'repeated.time.txt')
           one_rss, one_wall = parse_time(root/'one-pass.time.txt')
-          speedup = repeated['seconds'] / one['seconds']
+          packed_rss, packed_wall = parse_time(root/'packed.time.txt')
           summary = {
               'pairs': repeated['read_pairs'],
               'k': [x['k'] for x in repeated['k']],
               'repeated_seconds_internal': repeated['seconds'],
               'one_pass_seconds_internal': one['seconds'],
-              'speedup': speedup,
+              'packed_seconds_internal': packed['seconds'],
+              'packed_load_seconds': packed['load_seconds'],
+              'packed_store_bytes': packed['packed_bytes'],
+              'one_pass_speedup_vs_repeated': repeated['seconds'] / one['seconds'],
+              'packed_speedup_vs_repeated': repeated['seconds'] / packed['seconds'],
               'repeated_max_rss_kb': rep_rss,
               'one_pass_max_rss_kb': one_rss,
+              'packed_max_rss_kb': packed_rss,
               'repeated_wall': rep_wall,
               'one_pass_wall': one_wall,
+              'packed_wall': packed_wall,
           }
           (root/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
           print(json.dumps(summary, indent=2))
