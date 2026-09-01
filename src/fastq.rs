@@ -11,6 +11,31 @@ pub struct FastqRecord {
     pub quality: Vec<u8>,
 }
 
+pub trait PairSource {
+    fn for_each_pair_dyn(
+        &self,
+        max_pairs: Option<usize>,
+        callback: &mut dyn FnMut(usize, FastqRecord, Option<FastqRecord>) -> Result<()>,
+    ) -> Result<usize>;
+}
+
+pub struct FastqPairSource<'a> {
+    pub read1: &'a Path,
+    pub read2: Option<&'a Path>,
+}
+
+impl PairSource for FastqPairSource<'_> {
+    fn for_each_pair_dyn(
+        &self,
+        max_pairs: Option<usize>,
+        callback: &mut dyn FnMut(usize, FastqRecord, Option<FastqRecord>) -> Result<()>,
+    ) -> Result<usize> {
+        for_each_pair(self.read1, self.read2, max_pairs, |index, left, right| {
+            callback(index, left, right)
+        })
+    }
+}
+
 pub struct FastqReader {
     reader: Box<dyn BufRead + Send>,
     line_number: usize,
