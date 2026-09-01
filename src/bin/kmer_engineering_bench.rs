@@ -194,8 +194,7 @@ impl CompactCounter {
                 counts,
             } => {
                 *forward = ((*forward << 2) | u64::from(bits)) & *mask;
-                *reverse =
-                    (*reverse >> 2) | (u64::from(complement_bits(bits)) << (2 * (*k - 1)));
+                *reverse = (*reverse >> 2) | (u64::from(complement_bits(bits)) << (2 * (*k - 1)));
                 *valid = valid.saturating_add(1).min(*k);
                 if *valid >= *k {
                     let key = (*forward).min(*reverse);
@@ -214,8 +213,7 @@ impl CompactCounter {
                 counts,
             } => {
                 *forward = ((*forward << 2) | u128::from(bits)) & *mask;
-                *reverse =
-                    (*reverse >> 2) | (u128::from(complement_bits(bits)) << (2 * (*k - 1)));
+                *reverse = (*reverse >> 2) | (u128::from(complement_bits(bits)) << (2 * (*k - 1)));
                 *valid = valid.saturating_add(1).min(*k);
                 if *valid >= *k {
                     let key = (*forward).min(*reverse);
