@@ -77,6 +77,16 @@ pub fn count_and_filter(
         mercy_min_quality
     };
 
+    // Experimental, reference-free recovery gate. This is intentionally an
+    // environment knob while the idea is benchmarked; zero preserves the
+    // production behavior exactly. A weak terminal chain is considered only
+    // when the opposite mate contains at least one solid k-mer. The ordinary
+    // mercy quality/support filters are still applied afterwards.
+    let mate_terminal_mercy_kmers = std::env::var("BRIDGEASM_MATE_TERMINAL_MERCY_KMERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
     let mut evidence: FxHashMap<KmerKey, KmerEvidence> = FxHashMap::default();
     let mut observations = 0_u64;
 
@@ -128,27 +138,55 @@ pub fn count_and_filter(
         .collect();
 
     let mut mercy_support: FxHashMap<KmerKey, u16> = FxHashMap::default();
-    if mercy_max_kmers > 0 {
+    if mercy_max_kmers > 0 || mate_terminal_mercy_kmers > 0 {
         for_each_pair(read1, read2, max_pairs, |_index, left, right| {
             // Count support once per physical fragment, even if the same weak
             // k-mer occurs more than once or is present in both mates.
             let mut fragment_candidates: FxHashSet<KmerKey> = FxHashSet::default();
-            collect_mercy_candidates(
-                &left.sequence,
-                k,
-                &solid,
-                mercy_max_kmers,
-                &mut fragment_candidates,
-            )?;
-            if let Some(right) = right {
+            if mercy_max_kmers > 0 {
                 collect_mercy_candidates(
-                    &right.sequence,
+                    &left.sequence,
                     k,
                     &solid,
                     mercy_max_kmers,
                     &mut fragment_candidates,
                 )?;
+                if let Some(right) = right.as_ref() {
+                    collect_mercy_candidates(
+                        &right.sequence,
+                        k,
+                        &solid,
+                        mercy_max_kmers,
+                        &mut fragment_candidates,
+                    )?;
+                }
             }
+
+            if mate_terminal_mercy_kmers > 0 {
+                if let Some(right) = right.as_ref() {
+                    let left_has_solid = record_has_solid(&left.sequence, k, &solid)?;
+                    let right_has_solid = record_has_solid(&right.sequence, k, &solid)?;
+                    if right_has_solid {
+                        collect_mate_anchored_candidates(
+                            &left.sequence,
+                            k,
+                            &solid,
+                            mate_terminal_mercy_kmers,
+                            &mut fragment_candidates,
+                        )?;
+                    }
+                    if left_has_solid {
+                        collect_mate_anchored_candidates(
+                            &right.sequence,
+                            k,
+                            &solid,
+                            mate_terminal_mercy_kmers,
+                            &mut fragment_candidates,
+                        )?;
+                    }
+                }
+            }
+
             for key in fragment_candidates {
                 let entry = mercy_support.entry(key).or_insert(0);
                 *entry = entry.saturating_add(1);
@@ -253,6 +291,63 @@ fn collect_mercy_candidates(
     Ok(())
 }
 
+fn record_has_solid(sequence: &[u8], k: usize, solid: &FxHashSet<KmerKey>) -> Result<bool> {
+    Ok(canonical_kmers(sequence, k)?
+        .iter()
+        .any(|item| solid.contains(&item.key)))
+}
+
+fn collect_mate_anchored_candidates(
+    sequence: &[u8],
+    k: usize,
+    solid: &FxHashSet<KmerKey>,
+    max_weak_kmers: usize,
+    candidates: &mut FxHashSet<KmerKey>,
+) -> Result<()> {
+    if max_weak_kmers == 0 {
+        return Ok(());
+    }
+    let kmers = canonical_kmers(sequence, k)?;
+    if kmers.is_empty() {
+        return Ok(());
+    }
+
+    // Treat stretches separated by N/invalid bases independently. Within one
+    // continuous run, rescue only terminal weak chains adjacent to the first
+    // or last solid k-mer. If a whole run has no local solid anchor, it may be
+    // rescued only when the entire run fits the configured bound; the caller
+    // has already required a solid anchor in the opposite mate.
+    let mut run_start = 0_usize;
+    while run_start < kmers.len() {
+        let mut run_end = run_start + 1;
+        while run_end < kmers.len()
+            && kmers[run_end].position == kmers[run_end - 1].position + 1
+        {
+            run_end += 1;
+        }
+
+        let first_solid = (run_start..run_end).find(|&index| solid.contains(&kmers[index].key));
+        let last_solid = (run_start..run_end)
+            .rev()
+            .find(|&index| solid.contains(&kmers[index].key));
+
+        match (first_solid, last_solid) {
+            (Some(first), Some(last)) => {
+                let left_start = first.saturating_sub(max_weak_kmers).max(run_start);
+                candidates.extend(kmers[left_start..first].iter().map(|item| item.key));
+                let right_end = (last + 1 + max_weak_kmers).min(run_end);
+                candidates.extend(kmers[last + 1..right_end].iter().map(|item| item.key));
+            }
+            (None, None) if run_end - run_start <= max_weak_kmers => {
+                candidates.extend(kmers[run_start..run_end].iter().map(|item| item.key));
+            }
+            _ => {}
+        }
+        run_start = run_end;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +391,33 @@ mod tests {
             .map(|item| item.key)
             .collect();
         assert_eq!(candidates, unique_from_slice);
+    }
+
+    #[test]
+    fn mate_anchored_candidates_recover_terminal_weak_chain_only() {
+        let sequence = b"AAAACCCCGGGGTTTT";
+        let k = 5;
+        let kmers = canonical_kmers(sequence, k).unwrap();
+        let mut solid = FxHashSet::default();
+        solid.insert(kmers[4].key);
+        solid.insert(kmers[7].key);
+        let mut candidates = FxHashSet::default();
+        collect_mate_anchored_candidates(sequence, k, &solid, 2, &mut candidates).unwrap();
+        let expected: FxHashSet<_> = [kmers[2].key, kmers[3].key, kmers[8].key, kmers[9].key]
+            .into_iter()
+            .collect();
+        assert_eq!(candidates, expected);
+    }
+
+    #[test]
+    fn mate_anchored_candidates_can_rescue_short_fully_weak_run() {
+        let sequence = b"AAAACCCCGG";
+        let k = 5;
+        let solid = FxHashSet::default();
+        let kmers = canonical_kmers(sequence, k).unwrap();
+        let mut candidates = FxHashSet::default();
+        collect_mate_anchored_candidates(sequence, k, &solid, kmers.len(), &mut candidates).unwrap();
+        let expected: FxHashSet<_> = kmers.iter().map(|item| item.key).collect();
+        assert_eq!(candidates, expected);
     }
 }
