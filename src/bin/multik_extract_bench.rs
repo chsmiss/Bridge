@@ -71,8 +71,7 @@ impl Roller {
         };
         let complement = 3_u8 - bits;
         self.forward = ((self.forward << 2) | u128::from(bits)) & self.mask;
-        self.reverse = (self.reverse >> 2)
-            | (u128::from(complement) << (2 * (self.k - 1)));
+        self.reverse = (self.reverse >> 2) | (u128::from(complement) << (2 * (self.k - 1)));
         self.valid = self.valid.saturating_add(1).min(self.k);
         (self.valid >= self.k).then_some(self.forward.min(self.reverse))
     }
