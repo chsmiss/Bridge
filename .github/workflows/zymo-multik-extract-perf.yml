@@ -1,0 +1,96 @@
+name: Zymo multi-k extraction perf
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "200000"
+  pull_request:
+    paths:
+      - src/bin/multik_extract_bench.rs
+      - .github/workflows/zymo-multik-extract-perf.yml
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/bin/multik_extract_bench.rs
+      - .github/workflows/zymo-multik-extract-perf.yml
+
+concurrency:
+  group: zymo-multik-extract-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PAIRS: ${{ inputs.pairs || '200000' }}
+      KS: 21,31,41,55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reproduce Zymo subset
+        run: |
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+      - name: Build benchmark binary
+        run: cargo build --release --bin multik_extract_bench
+      - name: Repeated FASTQ passes
+        run: |
+          mkdir -p benchmark
+          /usr/bin/time -v -o benchmark/repeated.time.txt \
+            target/release/multik_extract_bench \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --k "$KS" --mode repeated \
+              > benchmark/repeated.json
+      - name: One FASTQ pass, simultaneous rolling k
+        run: |
+          /usr/bin/time -v -o benchmark/one-pass.time.txt \
+            target/release/multik_extract_bench \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --k "$KS" --mode one-pass \
+              > benchmark/one-pass.json
+      - name: Verify identical k-mer statistics and summarize
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          root = pathlib.Path('benchmark')
+          repeated = json.loads((root/'repeated.json').read_text())
+          one = json.loads((root/'one-pass.json').read_text())
+          assert repeated['read_pairs'] == one['read_pairs']
+          assert repeated['k'] == one['k'], (repeated['k'], one['k'])
+          def parse_time(path):
+              text = path.read_text()
+              rss = int(re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text).group(1))
+              wall = re.search(r'Elapsed \(wall clock\) time.*?:\s*([^\n]+)', text).group(1).strip()
+              return rss, wall
+          rep_rss, rep_wall = parse_time(root/'repeated.time.txt')
+          one_rss, one_wall = parse_time(root/'one-pass.time.txt')
+          speedup = repeated['seconds'] / one['seconds']
+          summary = {
+              'pairs': repeated['read_pairs'],
+              'k': [x['k'] for x in repeated['k']],
+              'repeated_seconds_internal': repeated['seconds'],
+              'one_pass_seconds_internal': one['seconds'],
+              'speedup': speedup,
+              'repeated_max_rss_kb': rep_rss,
+              'one_pass_max_rss_kb': one_rss,
+              'repeated_wall': rep_wall,
+              'one_pass_wall': one_wall,
+          }
+          (root/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
+          print(json.dumps(summary, indent=2))
+          PY
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-multik-extract-perf
+          path: benchmark
+          retention-days: 14
