@@ -420,9 +420,9 @@ fn collect_singleton_island_candidates(
                         .iter()
                         .filter(|item| {
                             !solid.contains(&item.key)
-                                && evidence.get(&item.key).is_some_and(|value| {
-                                    value.mean_quality(k) >= min_quality
-                                })
+                                && evidence
+                                    .get(&item.key)
+                                    .is_some_and(|value| value.mean_quality(k) >= min_quality)
                         })
                         .map(|item| item.key),
                 );
