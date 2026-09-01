@@ -1,5 +1,5 @@
 use crate::dna::{base_bits, bits_base};
-use crate::fastq::{for_each_pair, FastqRecord};
+use crate::fastq::{for_each_pair, FastqRecord, PairSource};
 use anyhow::Result;
 use std::path::Path;
 
@@ -88,23 +88,6 @@ impl PackedReadStore {
         }
     }
 
-    pub fn for_each_pair<F>(&self, max_pairs: Option<usize>, mut callback: F) -> Result<usize>
-    where
-        F: FnMut(usize, FastqRecord, Option<FastqRecord>) -> Result<()>,
-    {
-        let limit = max_pairs.unwrap_or(self.pair_count).min(self.pair_count);
-        for pair_index in 0..limit {
-            if self.paired {
-                let left = self.decode_record(pair_index * 2);
-                let right = self.decode_record(pair_index * 2 + 1);
-                callback(pair_index, left, Some(right))?;
-            } else {
-                callback(pair_index, self.decode_record(pair_index), None)?;
-            }
-        }
-        Ok(limit)
-    }
-
     pub fn pair_count(&self) -> usize {
         self.pair_count
     }
@@ -126,6 +109,26 @@ impl PackedReadStore {
     }
 }
 
+impl PairSource for PackedReadStore {
+    fn for_each_pair_dyn(
+        &self,
+        max_pairs: Option<usize>,
+        callback: &mut dyn FnMut(usize, FastqRecord, Option<FastqRecord>) -> Result<()>,
+    ) -> Result<usize> {
+        let limit = max_pairs.unwrap_or(self.pair_count).min(self.pair_count);
+        for pair_index in 0..limit {
+            if self.paired {
+                let left = self.decode_record(pair_index * 2);
+                let right = self.decode_record(pair_index * 2 + 1);
+                callback(pair_index, left, Some(right))?;
+            } else {
+                callback(pair_index, self.decode_record(pair_index), None)?;
+            }
+        }
+        Ok(limit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,14 +144,13 @@ mod tests {
         assert_eq!(store.pair_count(), 1);
         assert_eq!(store.record_count(), 2);
         let mut seen = Vec::new();
-        store
-            .for_each_pair(None, |_index, left, right| {
-                seen.push((left.sequence, left.quality));
-                let right = right.unwrap();
-                seen.push((right.sequence, right.quality));
-                Ok(())
-            })
-            .unwrap();
+        let mut callback = |_index, left: FastqRecord, right: Option<FastqRecord>| {
+            seen.push((left.sequence, left.quality));
+            let right = right.unwrap();
+            seen.push((right.sequence, right.quality));
+            Ok(())
+        };
+        store.for_each_pair_dyn(None, &mut callback).unwrap();
         assert_eq!(seen[0], (b"ACNT".to_vec(), b"IJKL".to_vec()));
         assert_eq!(seen[1], (b"TGCA".to_vec(), b"MNOP".to_vec()));
     }
