@@ -3,9 +3,10 @@
 
 Recovery contigs that mostly duplicate the graph backbone are not discarded as
 whole records. Instead, only novel k-mer intervals are retained, together with
-short exact-sequence anchors from the represented flanks. This preserves novel
-extensions/bridges for downstream exact-overlap stitching while avoiding the
-large duplication penalty of emitting the complete overlapping recovery contig.
+the minimum represented flank needed for exact-overlap stitching. Terminal
+novel sequence carries an anchor only on its represented side; internal novel
+sequence carries one anchor on each represented side. This keeps the contiguity
+benefit of recovery segments without re-emitting unnecessary backbone sequence.
 """
 from __future__ import annotations
 
@@ -103,24 +104,40 @@ def expand_interval(
     start: int,
     end: int,
     seq_len: int,
-    anchor_bases: int,
+    left_anchor: int,
+    right_anchor: int,
     min_length: int,
 ) -> tuple[int, int]:
-    start = max(0, start - anchor_bases)
-    end = min(seq_len, end + anchor_bases)
+    """Expand only into represented flanks that are actually available.
+
+    A terminal novel run has represented sequence on only one side, so adding
+    an anchor on the terminal side can only duplicate sequence and cannot help
+    an exact-overlap graft. Internal runs retain anchors on both sides.
+    """
+    start = max(0, start - left_anchor)
+    end = min(seq_len, end + right_anchor)
     missing = min_length - (end - start)
-    if missing > 0:
-        left_room = start
-        right_room = seq_len - end
-        take_left = min(left_room, (missing + 1) // 2)
-        start -= take_left
-        missing -= take_left
-        take_right = min(right_room, missing)
-        end += take_right
-        missing -= take_right
-        if missing > 0:
-            take_left = min(start, missing)
-            start -= take_left
+    if missing <= 0:
+        return start, end
+
+    # If a very short novel segment still needs padding to survive the short
+    # prefilter, consume represented flank only on sides that already have an
+    # anchor. This avoids inventing a terminal duplicate merely to reach a size
+    # threshold.
+    while missing > 0 and (left_anchor > 0 or right_anchor > 0):
+        changed = False
+        if left_anchor > 0 and start > 0:
+            take = min(start, max(1, (missing + 1) // 2))
+            start -= take
+            missing -= take
+            changed = True
+        if missing > 0 and right_anchor > 0 and end < seq_len:
+            take = min(seq_len - end, missing)
+            end += take
+            missing -= take
+            changed = True
+        if not changed:
+            break
     return start, end
 
 
@@ -148,17 +165,21 @@ def main() -> None:
     ap.add_argument("-k", type=int, default=31)
     ap.add_argument("--replace-fraction", type=float, default=0.85)
     ap.add_argument("--min-informative-kmers", type=int, default=20)
-    ap.add_argument("--segment-anchor-bases", type=int, default=96)
+    ap.add_argument("--segment-anchor-bases", type=int, default=31)
     ap.add_argument("--min-novel-kmers", type=int, default=4)
     ap.add_argument("--merge-represented-gap-kmers", type=int, default=8)
     ap.add_argument("--max-novel-hole-kmers", type=int, default=2)
-    ap.add_argument("--min-segment-length", type=int, default=200)
+    ap.add_argument("--min-segment-length", type=int, default=31)
     args = ap.parse_args()
 
     if not 0.0 <= args.replace_fraction <= 1.0:
         raise SystemExit("replace-fraction must be in [0,1]")
     if args.k < 3:
         raise SystemExit("k must be >=3")
+    if args.segment_anchor_bases < args.k:
+        raise SystemExit("segment-anchor-bases must be >= k for exact-overlap grafting")
+    if args.min_segment_length < args.k:
+        raise SystemExit("min-segment-length must be >= k")
 
     backbone = list(fasta(args.backbone))
     recovery = list(fasta(args.recovery))
@@ -181,6 +202,9 @@ def main() -> None:
         "recovery_fully_replaced_records": 0,
         "recovery_fully_replaced_bases": 0,
         "recovery_novel_kmers_retained": 0,
+        "recovery_anchor_bases_retained": 0,
+        "terminal_segment_records": 0,
+        "internal_segment_records": 0,
         "replace_fraction": args.replace_fraction,
         "k": args.k,
         "segment_anchor_bases": args.segment_anchor_bases,
@@ -212,13 +236,16 @@ def main() -> None:
                     len(seq),
                     len(seq),
                     0,
+                    0,
+                    "full",
                 )
             )
             continue
 
         fill_short_novel_holes(state, args.max_novel_hole_kmers)
         candidate_runs = novel_runs(state, args.merge_represented_gap_kmers)
-        intervals: list[tuple[int, int]] = []
+        intervals: list[tuple[int, int, int, str]] = []
+        state_len = len(state)
         for start_k, end_k in candidate_runs:
             novel_count = sum(
                 1 for value in state[start_k:end_k] if value is not True
@@ -227,17 +254,29 @@ def main() -> None:
                 continue
             base_start = start_k
             base_end = min(len(seq), end_k + args.k - 1)
-            intervals.append(
-                expand_interval(
-                    base_start,
-                    base_end,
-                    len(seq),
-                    args.segment_anchor_bases,
-                    args.min_segment_length,
-                )
+            left_represented = start_k > 0 and state[start_k - 1] is True
+            right_represented = end_k < state_len and state[end_k] is True
+            left_anchor = args.segment_anchor_bases if left_represented else 0
+            right_anchor = args.segment_anchor_bases if right_represented else 0
+            expanded_start, expanded_end = expand_interval(
+                base_start,
+                base_end,
+                len(seq),
+                left_anchor,
+                right_anchor,
+                args.min_segment_length,
             )
+            boundary = (
+                "internal"
+                if left_represented and right_represented
+                else "terminal"
+                if left_represented or right_represented
+                else "unanchored"
+            )
+            intervals.append((expanded_start, expanded_end, novel_count, boundary))
 
-        merged_coords = merge_intervals(intervals)
+        # Preserve boundary metadata while merging overlapping extraction windows.
+        merged_coords = merge_intervals([(start, end) for start, end, _, _ in intervals])
         if not merged_coords:
             stats["recovery_fully_replaced_records"] += 1
             stats["recovery_fully_replaced_bases"] += len(seq)
@@ -253,6 +292,8 @@ def main() -> None:
                     0,
                     0,
                     0,
+                    0,
+                    "none",
                 )
             )
             continue
@@ -265,7 +306,14 @@ def main() -> None:
             novel_count = sum(
                 1 for value in state[left_k:right_k] if value is not True
             )
+            represented_count = sum(
+                1 for value in state[left_k:right_k] if value is True
+            )
+            # Classify the merged segment by whether it touches either recovery end.
+            boundary = "terminal" if start == 0 or end == len(seq) else "internal"
+            stats[f"{boundary}_segment_records"] += 1
             stats["recovery_novel_kmers_retained"] += novel_count
+            stats["recovery_anchor_bases_retained"] += represented_count
             stats["recovery_segment_records"] += 1
             stats["recovery_segment_bases"] += len(segment)
             emitted.append((f"recovery_segment_{seg_idx}", name, segment))
@@ -281,6 +329,8 @@ def main() -> None:
                     end,
                     len(segment),
                     novel_count,
+                    represented_count,
+                    boundary,
                 )
             )
 
@@ -302,7 +352,7 @@ def main() -> None:
         out.write(
             "contig\tlength\tinformative_kmers\trepresented_kmers\t"
             "represented_fraction\taction\tsegment_start\tsegment_end\t"
-            "segment_length\tnovel_kmers\n"
+            "segment_length\tnovel_kmers\trepresented_segment_kmers\tboundary\n"
         )
         for row in rows:
             out.write(
