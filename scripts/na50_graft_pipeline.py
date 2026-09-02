@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """NA50 graph pipeline with short-segment graft-before-filter emission.
 
-This keeps the proven graph path stages unchanged. Recovery segments may be as
-short as 64 bp and are allowed to exact-stitch into the graph backbone before
-the final 200 bp contig cutoff, avoiding represented-sequence padding solely to
-survive early filtering.
+This keeps the proven graph path stages unchanged. Recovery segments are allowed
+to shrink to the exact-overlap k and are stitched into the graph backbone before
+the final 200 bp contig cutoff. Keeping represented anchors at the overlap k
+minimizes duplication while preserving the sequence needed to graft novel tails
+and internal bridges.
 """
 from __future__ import annotations
 
@@ -47,11 +48,11 @@ def emit(
         "-k", 31,
         "--replace-fraction", 0.85,
         "--min-informative-kmers", 20,
-        "--segment-anchor-bases", 64,
+        "--segment-anchor-bases", 31,
         "--min-novel-kmers", 4,
         "--merge-represented-gap-kmers", 8,
         "--max-novel-hole-kmers", 2,
-        "--min-segment-length", 64,
+        "--min-segment-length", 31,
     ])
     graft = stage / "graft"
     timings[f"graft_{name}"] = run([
@@ -59,7 +60,7 @@ def emit(
         scripts / "postprocess_segment_grafts.py",
         replacement,
         "--output-dir", graft,
-        "--short-min-length", 64,
+        "--short-min-length", 31,
         "--final-min-length", 200,
         "--min-overlap", 31,
         "--overlap-margin", 10,
@@ -126,7 +127,9 @@ def main() -> None:
 
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
-        "pipeline": "bridge-na50-segment-graft-v1",
+        "pipeline": "bridge-na50-segment-graft-v2-minimal-anchor",
+        "segment_anchor_bases": 31,
+        "short_min_length": 31,
         "wall_seconds": time.monotonic() - started,
         "peak_child_rss_mib": usage.ru_maxrss / 1024.0,
         "timings_seconds": timings,
