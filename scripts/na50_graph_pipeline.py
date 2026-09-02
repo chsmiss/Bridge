@@ -8,10 +8,10 @@ k31 path extraction with four cumulative graph-only refinements:
   3 high-k evidence only at ambiguous target-graph junctions
   4 context-aware second-pass read threading and graph re-resolution
 
-For final emission the new graph backbone replaces old recovery contigs whose
-canonical k-mers are already mostly represented by that backbone. Only novel
-recovery sequence is retained, avoiding the duplication inflation caused by a
-plain union of overlapping old and new backbone fragments.
+For final emission the graph backbone replaces only represented segments of old
+recovery contigs. Novel tails/islands are retained with short exact anchors so
+that downstream exact-overlap stitching can reconnect useful extensions without
+re-emitting whole overlapping recovery contigs.
 """
 from __future__ import annotations
 
@@ -128,9 +128,15 @@ def main() -> None:
             "--recovery", current,
             "-o", replacement,
             "--report", stage_dir / "backbone_replacement.tsv",
+            "--stats-json", stage_dir / "backbone_replacement.json",
             "-k", 31,
             "--replace-fraction", 0.85,
             "--min-informative-kmers", 20,
+            "--segment-anchor-bases", 96,
+            "--min-novel-kmers", 4,
+            "--merge-represented-gap-kmers", 8,
+            "--max-novel-hole-kmers", 2,
+            "--min-segment-length", 200,
         ])
         final = postprocess(scripts, [replacement], stage_dir)
         timings[f"postprocess_{name}"] = time.monotonic() - t0
@@ -140,7 +146,7 @@ def main() -> None:
 
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
-        "pipeline": "bridge-na50-graph-v2",
+        "pipeline": "bridge-na50-graph-v3-segment-replacement",
         "wall_seconds": time.monotonic() - started,
         "peak_child_rss_mib": usage.ru_maxrss / 1024.0,
         "timings_seconds": timings,
