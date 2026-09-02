@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Cumulative six-step BridgeAsm evidence recovery experiment.
+"""Six-step BridgeAsm evidence recovery experiment with promotion gating.
 
 step0 baseline                 existing recovery-v3
 step1 iterative                low-k trusted paths -> virtual pairs -> next k graph
-step2 residual                 residual-capacity branch patches without backbone copies
-step3 pairs                    empirical insert-size paired-end link graph
+step2 residual candidate       conservative residual-capacity branch patches
+step3 pairs                    insert-size paired-end links from last safe base (step1)
 step4 second_pass              remap all reads to preliminary paths and resolve again
 step5 gapfill                  local read-supported DBG fill of positive N gaps
 step6 strain_projection        flanked bulges -> virtual evidence -> conservative k31
+
+Step2 remains an explicit measured candidate, but after the previous experiment
+showed a large misassembly increase it is not automatically promoted into
+steps3-6. This keeps later mechanisms independently interpretable.
 """
 from __future__ import annotations
 import argparse, json, os, resource, shutil, subprocess, sys, time
@@ -54,11 +58,13 @@ def main():
     s1dir=out/'step1_iterative'; s1=postprocess(scripts,candidates,s1dir); shutil.copy2(s1,out/'step1_iterative.fasta')
 
     residual=out/'step2_residual_paths.fasta'; residual_meta=out/'step2_residual_paths.tsv'
-    times['step2_residual_extract']=run([sys.executable,scripts/'residual_path_cover.py',iterative/'k31_resolve'/'assembly.gfa',iterative/'k41_resolve'/'assembly.gfa',iterative/'k55_resolve'/'assembly.gfa','--backbone',s1,'-o',residual,'--metadata',residual_meta,'--secondary-dominance',0.20,'--extension-dominance',0.75,'--min-support',3,'--max-copy',3,'--novel-k',31,'--flank',120,'--max-novel-gap',96,'--min-novel-kmers',4,'--min-novel-fraction',0.05,'--max-patch-length',1500,'--max-patches',1500,'--max-total-fraction',0.15])
+    times['step2_residual_extract']=run([sys.executable,scripts/'residual_path_cover.py',iterative/'k31_resolve'/'assembly.gfa',iterative/'k41_resolve'/'assembly.gfa',iterative/'k55_resolve'/'assembly.gfa','--backbone',s1,'-o',residual,'--metadata',residual_meta,'--secondary-dominance',0.35,'--extension-dominance',0.85,'--min-support',6,'--max-copy',2,'--novel-k',31,'--flank',120,'--max-novel-gap',96,'--min-novel-kmers',4,'--min-novel-fraction',0.10,'--max-patch-length',1200,'--max-patches',300,'--max-total-fraction',0.05])
     s2=postprocess(scripts,[s1,residual],out/'step2_residual'); shutil.copy2(s2,out/'step2_residual.fasta')
 
+    # Step2 is measured but not promoted after its prior safety failure. Steps3-6
+    # continue from the last safe cumulative state, step1.
     s3=out/'step3_pairs.fasta'
-    times['step3_pair_graph']=run([sys.executable,scripts/'pair_gap_refine.py',s2,'-1',a.read1,'-2',a.read2,'-o',s3,'--links',out/'step3_pair_links.tsv','--threads',a.threads,'--min-mapq',20,'--min-support',3,'--dominance',0.75,'--end-window',500,'--min-overlap',31,'--max-gap',1000])
+    times['step3_pair_graph']=run([sys.executable,scripts/'pair_gap_refine.py',s1,'-1',a.read1,'-2',a.read2,'-o',s3,'--links',out/'step3_pair_links.tsv','--threads',a.threads,'--min-mapq',20,'--min-support',3,'--dominance',0.75,'--end-window',500,'--min-overlap',31,'--max-gap',1000])
 
     s4=out/'step4_second_pass.fasta'
     times['step4_second_pass']=run([sys.executable,scripts/'pair_gap_refine.py',s3,'-1',a.read1,'-2',a.read2,'-o',s4,'--links',out/'step4_pair_links.tsv','--threads',a.threads,'--min-mapq',25,'--min-support',2,'--dominance',0.85,'--end-window',650,'--min-overlap',31,'--max-gap',1000])
@@ -68,11 +74,11 @@ def main():
 
     projected=out/'step6_projected_strain_paths.fasta'; projection_map=out/'step6_projection_map.tsv'; haplotigs=[iterative/name/'haplotigs.fasta' for name,_,_ in stages]
     times['step6_project']=run([sys.executable,scripts/'strain_projection.py',s5,*haplotigs,'-o',projected,'--map',projection_map,'--k',31,'--projection-k',21,'--flank-length',90,'--projection-stride',2,'--min-flank-hits',2,'--min-novel-kmers',3,'--min-novel-fraction',0.01])
-    pvr1=out/'step6.virtual_R1.fastq.gz'; pvr2=out/'step6.virtual_R2.fastq.gz'; times['step6_virtualize']=run([sys.executable,scripts/'make_virtual_pairs.py',projected,'--read1',pvr1,'--read2',pvr2,'--read-length',101,'--insert-size',250,'--stride',120,'--min-length',300])
+    pvr1=out/'step6.virtual_R1.fastq.gz'; pvr2=out/'step6.virtual_R2.fastq.gz'; times['step6_virtualize']=run([sys.executable,scripts/'make_virtual_pairs.py',projected,'--read1',pvr1,'--read2',pvr2,'--read-length',101,'--insert-size',250,'--stride',120,'--min-length',250])
     par1=out/'step6.aug_R1.fastq.gz'; par2=out/'step6.aug_R2.fastq.gz'; concat_gzip(a.read1,pvr1,par1); concat_gzip(a.read2,pvr2,par2); projasm=out/'step6_projection_k31'; times['step6_projection_k31']=run(bridge_cmd(a.bridgeasm,par1,par2,projasm,31,16,a.threads))
     novel_proj=out/'step6_projection_novel.fasta'; times['step6_select_novel']=run([sys.executable,scripts/'strain_projection.py',s5,projasm/'primary_contigs.fasta',projasm/'haplotigs.fasta','-o',novel_proj,'--map',out/'step6_projection_assembly_map.tsv','--k',31,'--projection-k',21,'--flank-length',90,'--projection-stride',2,'--min-flank-hits',2,'--min-novel-kmers',3,'--min-novel-fraction',0.005])
     s6=postprocess(scripts,[s5,novel_proj],out/'step6_strain_projection'); shutil.copy2(s6,out/'step6_strain_projection.fasta')
 
-    usage=resource.getrusage(resource.RUSAGE_CHILDREN); manifest={'pipeline':'bridge-evidence-six-step-v2','wall_seconds':time.monotonic()-started,'peak_child_rss_mib':usage.ru_maxrss/1024.0,'timings_seconds':times,'outputs':{'step0_baseline':str(step0/'primary_contigs.fasta'),'step1_iterative':str(out/'step1_iterative.fasta'),'step2_residual':str(out/'step2_residual.fasta'),'step3_pairs':str(s3),'step4_second_pass':str(s4),'step5_gapfill':str(s5),'step6_strain_projection':str(out/'step6_strain_projection.fasta')}}
+    usage=resource.getrusage(resource.RUSAGE_CHILDREN); manifest={'pipeline':'bridge-evidence-six-step-v3','wall_seconds':time.monotonic()-started,'peak_child_rss_mib':usage.ru_maxrss/1024.0,'timings_seconds':times,'promotion_policy':{'step1_iterative':'promoted_safe_base','step2_residual':'evaluated_side_candidate_not_promoted','step3_base':'step1_iterative'},'outputs':{'step0_baseline':str(step0/'primary_contigs.fasta'),'step1_iterative':str(out/'step1_iterative.fasta'),'step2_residual':str(out/'step2_residual.fasta'),'step3_pairs':str(s3),'step4_second_pass':str(s4),'step5_gapfill':str(s5),'step6_strain_projection':str(out/'step6_strain_projection.fasta')}}
     (out/'pipeline_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n'); print(json.dumps(manifest,indent=2,sort_keys=True))
 if __name__=='__main__':main()
