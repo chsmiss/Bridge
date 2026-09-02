@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """NA50-focused cumulative graph optimization pipeline.
 
-Starts from the current evidence-six-step assembly, then replaces the dominant
-k31 path extraction with four cumulative graph-only refinements:
+Starts from the current evidence-six-step assembly, then applies cumulative
+reference-free graph refinements:
   1 full-read path phasing
   2 low-k graph path projection
-  3 high-k evidence only at ambiguous target-graph junctions
-  4 context-aware second-pass read threading and graph re-resolution
+  3 high-k evidence at ambiguous target-graph junctions
+  4 context-aware second-pass read threading
+  5 bounded lookahead repeat traversal
+  6 conservative simplification of short reconvergent bubbles
 
-For final emission the graph backbone replaces only represented segments of old
-recovery contigs. Novel tails/islands are retained with short exact anchors so
-that downstream exact-overlap stitching can reconnect useful extensions without
-re-emitting whole overlapping recovery contigs.
+Final emission uses segment-level backbone replacement: represented recovery
+sequence is removed while novel tails/islands are retained with exact anchors.
 """
 from __future__ import annotations
 
@@ -90,17 +90,21 @@ def main() -> None:
         "--threads", args.threads,
     ])
     current = base / "step6_strain_projection.fasta"
+    target_gfa = base / "iterative" / "k31_resolve" / "assembly.gfa"
+    projection_primary = base / "iterative" / "k21_recall" / "primary_contigs.fasta"
+    projection_haplotigs = base / "iterative" / "k21_recall" / "haplotigs.fasta"
+    highk_gfa = base / "iterative" / "k55_resolve" / "assembly.gfa"
 
     graph_opt = out / "graph_optimizer"
     timings["graph_optimizer"] = run([
         sys.executable,
         scripts / "graph_path_phaser.py",
-        "--gfa", base / "iterative" / "k31_resolve" / "assembly.gfa",
+        "--gfa", target_gfa,
         "-1", args.read1,
         "-2", args.read2,
-        "--projection", base / "iterative" / "k21_recall" / "primary_contigs.fasta",
-        "--projection", base / "iterative" / "k21_recall" / "haplotigs.fasta",
-        "--highk-gfa", base / "iterative" / "k55_resolve" / "assembly.gfa",
+        "--projection", projection_primary,
+        "--projection", projection_haplotigs,
+        "--highk-gfa", highk_gfa,
         "-o", graph_opt,
         "--anchor-k", 31,
         "--max-context", 6,
@@ -109,11 +113,37 @@ def main() -> None:
         "--min-length", 200,
     ])
 
+    repeat_opt = out / "repeat_optimizer"
+    timings["repeat_optimizer"] = run([
+        sys.executable,
+        scripts / "graph_repeat_resolver.py",
+        "--gfa", target_gfa,
+        "-1", args.read1,
+        "-2", args.read2,
+        "--projection", projection_primary,
+        "--projection", projection_haplotigs,
+        "--highk-gfa", highk_gfa,
+        "--preliminary-paths", graph_opt / "stage4_second_pass.paths.tsv",
+        "-o", repeat_opt,
+        "--anchor-k", 31,
+        "--max-context", 6,
+        "--dominance", 0.72,
+        "--min-direct", 4,
+        "--min-length", 200,
+        "--lookahead-edges", 5,
+        "--lookahead-margin", 1.30,
+        "--bubble-edges", 4,
+        "--bubble-bp", 800,
+        "--bubble-margin", 3.0,
+    ])
+
     stage_files = {
         "stage1_full_read": graph_opt / "stage1_full_read.fasta",
         "stage2_iterative_projection": graph_opt / "stage2_iterative_projection.fasta",
         "stage3_local_highk": graph_opt / "stage3_local_highk.fasta",
         "stage4_second_pass": graph_opt / "stage4_second_pass.fasta",
+        "stage5_repeat_traversal": repeat_opt / "stage5_repeat_traversal.fasta",
+        "stage6_graph_simplified": repeat_opt / "stage6_graph_simplified.fasta",
     }
     outputs: dict[str, str] = {"current": str(current)}
     for name, candidate in stage_files.items():
@@ -146,7 +176,7 @@ def main() -> None:
 
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
-        "pipeline": "bridge-na50-graph-v3-segment-anchor64",
+        "pipeline": "bridge-na50-graph-v4-segment-repeat",
         "wall_seconds": time.monotonic() - started,
         "peak_child_rss_mib": usage.ru_maxrss / 1024.0,
         "timings_seconds": timings,
