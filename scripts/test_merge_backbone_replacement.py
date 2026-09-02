@@ -35,15 +35,18 @@ def main() -> None:
         out = Path(tmp)
         backbone = random_seq(1, 1200)
         novel_tail = random_seq(2, 120)
+        novel_head = random_seq(5, 90)
         novel_mid = random_seq(3, 45)
         mostly_novel = random_seq(4, 350)
         recovery_tail = backbone[:1000] + novel_tail
+        recovery_head = novel_head + backbone[200:1100]
         recovery_exact = backbone[150:950]
         recovery_mid = backbone[100:600] + novel_mid + backbone[645:1050]
 
         (out / "backbone.fasta").write_text(f">backbone\n{backbone}\n")
         (out / "recovery.fasta").write_text(
             f">tail\n{recovery_tail}\n"
+            f">head\n{recovery_head}\n"
             f">exact\n{recovery_exact}\n"
             f">middle\n{recovery_mid}\n"
             f">novel\n{mostly_novel}\n"
@@ -66,11 +69,11 @@ def main() -> None:
                 "--replace-fraction",
                 "0.80",
                 "--segment-anchor-bases",
-                "50",
+                "21",
                 "--min-novel-kmers",
                 "4",
                 "--min-segment-length",
-                "120",
+                "21",
             ],
             check=True,
         )
@@ -79,14 +82,26 @@ def main() -> None:
         assert recovery_exact not in seqs
         assert mostly_novel in seqs
         assert recovery_tail not in seqs
+        assert recovery_head not in seqs
         assert recovery_mid not in seqs
-        assert any(
-            seq.endswith(novel_tail) and len(seq) < len(recovery_tail) for seq in seqs
-        )
-        assert any(novel_mid in seq and len(seq) < len(recovery_mid) for seq in seqs)
+
+        tail_segments = [seq for seq in seqs if seq.endswith(novel_tail)]
+        head_segments = [seq for seq in seqs if seq.startswith(novel_head)]
+        mid_segments = [seq for seq in seqs if novel_mid in seq]
+        assert tail_segments and head_segments and mid_segments
+
+        # Terminal novel sequence gets only one represented-side anchor.
+        assert max(map(len, tail_segments)) <= len(novel_tail) + 21 + 20
+        assert max(map(len, head_segments)) <= len(novel_head) + 21 + 20
+        # Internal novel sequence keeps two anchors so it can graft both sides.
+        assert max(map(len, mid_segments)) <= len(novel_mid) + 2 * (21 + 20)
+
         report = (out / "report.tsv").read_text()
         assert "keep_segment" in report
         assert "replace_full" in report
+        assert "represented_segment_kmers" in report
+        assert "terminal" in report
+        assert "internal" in report
     print("segment-level replacement synthetic test: ok")
 
 
