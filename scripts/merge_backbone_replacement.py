@@ -144,6 +144,7 @@ def main() -> None:
     ap.add_argument("--recovery", type=Path, required=True)
     ap.add_argument("-o", "--output", type=Path, required=True)
     ap.add_argument("--report", type=Path, required=True)
+    ap.add_argument("--stats-json", type=Path)
     ap.add_argument("-k", type=int, default=31)
     ap.add_argument("--replace-fraction", type=float, default=0.85)
     ap.add_argument("--min-informative-kmers", type=int, default=20)
@@ -315,6 +316,8 @@ def main() -> None:
     stats["output_bases"] = stats["backbone_bases"] + sum(
         len(seq) for _, _, seq in emitted
     )
+    if args.stats_json:
+        args.stats_json.write_text(json.dumps(stats, indent=2, sort_keys=True) + "\n")
     print(json.dumps(stats, sort_keys=True))
 
 
