@@ -8,9 +8,10 @@ k31 path extraction with four cumulative graph-only refinements:
   3 high-k evidence only at ambiguous target-graph junctions
   4 context-aware second-pass read threading and graph re-resolution
 
-Each optimized graph assembly is merged with the current recovery output only
-through containment/exact-overlap post-processing so low-abundance sequence is
-not discarded while the dominant backbone can become more contiguous.
+For final emission the new graph backbone replaces old recovery contigs whose
+canonical k-mers are already mostly represented by that backbone. Only novel
+recovery sequence is retained, avoiding the duplication inflation caused by a
+plain union of overlapping old and new backbone fragments.
 """
 from __future__ import annotations
 
@@ -117,8 +118,21 @@ def main() -> None:
     outputs: dict[str, str] = {"current": str(current)}
     for name, candidate in stage_files.items():
         stage_dir = out / name
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        replacement = stage_dir / "backbone_replacement_union.fasta"
         t0 = time.monotonic()
-        final = postprocess(scripts, [current, candidate], stage_dir)
+        timings[f"replace_{name}"] = run([
+            sys.executable,
+            scripts / "merge_backbone_replacement.py",
+            "--backbone", candidate,
+            "--recovery", current,
+            "-o", replacement,
+            "--report", stage_dir / "backbone_replacement.tsv",
+            "-k", 31,
+            "--replace-fraction", 0.85,
+            "--min-informative-kmers", 20,
+        ])
+        final = postprocess(scripts, [replacement], stage_dir)
         timings[f"postprocess_{name}"] = time.monotonic() - t0
         copied = out / f"{name}.fasta"
         shutil.copy2(final, copied)
@@ -126,7 +140,7 @@ def main() -> None:
 
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
-        "pipeline": "bridge-na50-graph-v1",
+        "pipeline": "bridge-na50-graph-v2",
         "wall_seconds": time.monotonic() - started,
         "peak_child_rss_mib": usage.ru_maxrss / 1024.0,
         "timings_seconds": timings,
