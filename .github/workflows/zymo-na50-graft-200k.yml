@@ -6,6 +6,11 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - .github/workflows/zymo-na50-graft-200k.yml
+      - scripts/na50_graft_pipeline.py
+      - scripts/merge_backbone_replacement.py
+      - scripts/postprocess_segment_grafts.py
+      - scripts/test_merge_backbone_replacement.py
+      - scripts/test_postprocess_segment_grafts.py
   workflow_dispatch:
 
 concurrency:
@@ -157,7 +162,7 @@ jobs:
           Path('benchmark/module_timings.tsv').write_text('\n'.join(timing)+'\n')
           PY
           cp /tmp/zymo-log/subset_provenance.json benchmark/
-          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\nshort_segment_graft\t1\n' \
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\nsegment_anchor_bases\t31\nshort_min_length\t31\nsegment_graft\tminimal_terminal_anchor\n' \
             "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
 
       - uses: actions/upload-artifact@v4
