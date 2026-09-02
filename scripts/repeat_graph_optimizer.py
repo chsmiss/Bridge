@@ -230,7 +230,7 @@ def simplify_graph(
     tip_edges = 0
     dominated_edges = 0
 
-    for src, children in graph.out.items():
+    for src, children in list(graph.out.items()):
         if len(children) <= 1:
             continue
         src_cov = max(1e-6, graph.coverage.get(src, 0.0))
@@ -238,7 +238,7 @@ def simplify_graph(
             ev = graph.edge.get((src, dst), gp.EdgeEvidence())
             dst_cov = graph.coverage.get(dst, 0.0)
             if (
-                len(graph.out[dst]) == 0
+                len(graph.out.get(dst, [])) == 0
                 and len(graph.seqs[dst]) <= max_tip_bp
                 and ev.direct <= 1
                 and ev.pairs == 0
@@ -248,7 +248,7 @@ def simplify_graph(
                 masked.add((src, dst))
                 tip_edges += 1
 
-    for dst, parents in graph.inc.items():
+    for dst, parents in list(graph.inc.items()):
         if len(parents) <= 1:
             continue
         dst_cov = max(1e-6, graph.coverage.get(dst, 0.0))
@@ -256,7 +256,7 @@ def simplify_graph(
             ev = graph.edge.get((src, dst), gp.EdgeEvidence())
             src_cov = graph.coverage.get(src, 0.0)
             if (
-                len(graph.inc[src]) == 0
+                len(graph.inc.get(src, [])) == 0
                 and len(graph.seqs[src]) <= max_tip_bp
                 and ev.direct <= 1
                 and ev.pairs == 0
@@ -266,7 +266,7 @@ def simplify_graph(
                 masked.add((src, dst))
                 tip_edges += 1
 
-    for src, children in graph.out.items():
+    for src, children in list(graph.out.items()):
         active = [dst for dst in children if (src, dst) not in masked]
         if len(active) <= 1:
             continue
@@ -300,7 +300,7 @@ def simplify_graph(
             masked.add((src, dst))
             dominated_edges += 1
 
-    for dst, parents in graph.inc.items():
+    for dst, parents in list(graph.inc.items()):
         active = [src for src in parents if (src, dst) not in masked]
         if len(active) <= 1:
             continue
