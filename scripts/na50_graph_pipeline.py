@@ -132,7 +132,7 @@ def main() -> None:
             "-k", 31,
             "--replace-fraction", 0.85,
             "--min-informative-kmers", 20,
-            "--segment-anchor-bases", 96,
+            "--segment-anchor-bases", 64,
             "--min-novel-kmers", 4,
             "--merge-represented-gap-kmers", 8,
             "--max-novel-hole-kmers", 2,
@@ -146,7 +146,7 @@ def main() -> None:
 
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     manifest = {
-        "pipeline": "bridge-na50-graph-v3-segment-replacement",
+        "pipeline": "bridge-na50-graph-v3-segment-anchor64",
         "wall_seconds": time.monotonic() - started,
         "peak_child_rss_mib": usage.ru_maxrss / 1024.0,
         "timings_seconds": timings,
