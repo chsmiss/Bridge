@@ -4,9 +4,8 @@
 Maps reads to preliminary contigs with minimap2, estimates the library insert
 size from unique same-contig FR pairs, then joins reciprocal-dominant contig
 ends. Negative/zero estimated gaps are accepted only when the oriented contig
-ends have an exact suffix/prefix overlap; positive gaps are represented with Ns
-for later local assembly. Thus pair evidence alone never invents a 1-bp bridge
-when the insert model says the contigs should already overlap.
+ends have an exact suffix/prefix overlap consistent with the insert-size model;
+positive gaps are represented with Ns for later local assembly.
 """
 from __future__ import annotations
 import argparse, re, statistics, subprocess
@@ -41,7 +40,8 @@ def parse_rec(fields):
     return {'q':fields[0],'flag':flag,'r':fields[2],'start':start,'end':start+span,'mapq':int(fields[4]),'rev':bool(flag&16),'tlen':int(fields[8]),'qlen':0 if fields[9]=='*' else len(fields[9])}
 
 def run_mapping(contigs:Path,r1:Path,r2:Path,threads:int):
-    cmd=['minimap2','-ax','sr','--secondary=no','-t',str(threads),str(contigs),str(r1),str(r2)]; proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,text=True,bufsize=1); pending={}
+    cmd=['minimap2','-ax','sr','--secondary=no','-t',str(threads),str(contigs),str(r1),str(r2)]
+    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,text=True,bufsize=1); pending={}
     assert proc.stdout is not None
     for line in proc.stdout:
         if line.startswith('@'): continue
@@ -85,21 +85,29 @@ def oriented_from_endpoint(seq:str,side:str,as_source:bool)->str:
     if as_source: return seq if side=='R' else rc(seq)
     return seq if side=='L' else rc(seq)
 
-def validate_selected_edges(records,selected,min_overlap,max_gap):
-    seq={h:s for h,s in records}; safe={}; rejected_overlap=0; rejected_gap=0
+def validate_selected_edges(records,selected,min_overlap,max_gap,gap_tolerance):
+    seq={h:s for h,s in records}; safe={}; rejected_overlap=0; rejected_inconsistent=0; rejected_gap=0
     for edge,data in selected.items():
         aa,bb=edge; gap=int(round(data['gap']))
-        if gap>max_gap: rejected_gap+=1; continue
+        if gap>max_gap:
+            rejected_gap+=1; continue
         if gap<=0:
-            aseq=oriented_from_endpoint(seq[aa[0]],aa[1],True); bseq=oriented_from_endpoint(seq[bb[0]],bb[1],False); max_ov=min(len(aseq),len(bseq),max(4*min_overlap,abs(gap)+150)); ov=longest_overlap(aseq,bseq,min_overlap,max_ov)
-            if not ov:
-                bsrc=oriented_from_endpoint(seq[bb[0]],bb[1],True); atgt=oriented_from_endpoint(seq[aa[0]],aa[1],False); ov=longest_overlap(bsrc,atgt,min_overlap,max_ov)
-            if not ov: rejected_overlap+=1; continue
+            expected=abs(gap); max_ov=min(len(seq[aa[0]]),len(seq[bb[0]]),max(4*min_overlap,expected+150))
+            aseq=oriented_from_endpoint(seq[aa[0]],aa[1],True); bseq=oriented_from_endpoint(seq[bb[0]],bb[1],False)
+            ov1=longest_overlap(aseq,bseq,min_overlap,max_ov)
+            bsrc=oriented_from_endpoint(seq[bb[0]],bb[1],True); atgt=oriented_from_endpoint(seq[aa[0]],aa[1],False)
+            ov2=longest_overlap(bsrc,atgt,min_overlap,max_ov)
+            overlaps=[ov for ov in (ov1,ov2) if ov]
+            if not overlaps:
+                rejected_overlap+=1; continue
+            ov=min(overlaps,key=lambda x:(abs(x-expected),-x))
+            if abs(ov-expected)>gap_tolerance:
+                rejected_inconsistent+=1; continue
             data=dict(data); data['overlap']=ov; data['emitted_gap']=0
         else:
             data=dict(data); data['overlap']=0; data['emitted_gap']=max(1,min(max_gap,gap))
         safe[edge]=data
-    return safe,rejected_overlap,rejected_gap
+    return safe,rejected_overlap,rejected_inconsistent,rejected_gap
 
 def orient(seq,linked_left_side): return seq if linked_left_side=='L' else rc(seq)
 
@@ -120,7 +128,8 @@ def build_scaffolds(records,selected):
                 overlap=longest_overlap(current_seq,nxt,max(1,min(overlap,31)),max(overlap+20,31))
                 if not overlap: break
                 current_seq += nxt[overlap:]; emitted_gap=0
-            else: current_seq += 'N'*emitted_gap+nxt
+            else:
+                current_seq += 'N'*emitted_gap+nxt
             links.append((outgoing[0],outgoing[1],oid,oside,data['support'],data['gap'],emitted_gap,overlap)); used.add(oid); outgoing=(oid,'R' if oside=='L' else 'L')
         outputs.append(canonical(current_seq))
     for cid,s in seq.items():
@@ -167,14 +176,15 @@ def main():
         if best.get(edge[0],(None,None))[1]!=edge or best.get(edge[1],(None,None))[1]!=edge: continue
         if data['support']/max(1,endpoint_total[edge[0]])<a.dominance or data['support']/max(1,endpoint_total[edge[1]])<a.dominance: continue
         selected[edge]=data
-    safe,rejected_overlap,rejected_gap=validate_selected_edges(records,selected,a.min_overlap,a.max_gap); seqs,links=build_scaffolds(records,safe)
+    gap_tolerance=max(40.0,2.0*mad)
+    safe,rejected_overlap,rejected_inconsistent,rejected_gap=validate_selected_edges(records,selected,a.min_overlap,a.max_gap,gap_tolerance); seqs,links=build_scaffolds(records,safe)
     a.output.parent.mkdir(parents=True,exist_ok=True)
     with a.output.open('w') as f:
         for i,s in enumerate(seqs,1):
             f.write(f'>pair_refined_{i:07d} len={len(s)}\n')
             for j in range(0,len(s),80): f.write(s[j:j+80]+'\n')
     with a.links.open('w') as f:
-        f.write(f'# insert_median={insert:.3f}\tinsert_mad={mad:.3f}\tinsert_pairs={n_insert}\n'); f.write('source\tsource_side\ttarget\ttarget_side\tsupport\testimated_gap\temitted_gap\toverlap\n')
+        f.write(f'# insert_median={insert:.3f}\tinsert_mad={mad:.3f}\tgap_tolerance={gap_tolerance:.3f}\tinsert_pairs={n_insert}\n'); f.write('source\tsource_side\ttarget\ttarget_side\tsupport\testimated_gap\temitted_gap\toverlap\n')
         for row in links: f.write('\t'.join(map(str,row))+'\n')
-    print(f'insert_median\t{insert:.3f}'); print(f'insert_mad\t{mad:.3f}'); print(f'insert_pairs\t{n_insert}'); print(f'candidate_links\t{len(candidates)}'); print(f'reciprocal_links\t{len(selected)}'); print(f'safe_links\t{len(safe)}'); print(f'rejected_negative_gap_without_overlap\t{rejected_overlap}'); print(f'rejected_gap_range\t{rejected_gap}'); print(f'emitted_links\t{len(links)}'); print(f'output_records\t{len(seqs)}')
+    print(f'insert_median\t{insert:.3f}'); print(f'insert_mad\t{mad:.3f}'); print(f'gap_tolerance\t{gap_tolerance:.3f}'); print(f'insert_pairs\t{n_insert}'); print(f'candidate_links\t{len(candidates)}'); print(f'reciprocal_links\t{len(selected)}'); print(f'safe_links\t{len(safe)}'); print(f'rejected_negative_gap_without_overlap\t{rejected_overlap}'); print(f'rejected_negative_gap_inconsistent_overlap\t{rejected_inconsistent}'); print(f'rejected_gap_range\t{rejected_gap}'); print(f'emitted_links\t{len(links)}'); print(f'output_records\t{len(seqs)}')
 if __name__=='__main__': main()
