@@ -8,7 +8,9 @@ on:
       - .github/workflows/zymo-na50-graph-200k.yml
       - scripts/graph_path_phaser.py
       - scripts/na50_graph_pipeline.py
+      - scripts/merge_backbone_replacement.py
       - scripts/test_graph_path_phaser.py
+      - scripts/test_merge_backbone_replacement.py
       - scripts/bridge_evidence_pipeline.py
       - scripts/bridge_recovery_pipeline.py
       - scripts/make_virtual_pairs.py
@@ -71,8 +73,11 @@ jobs:
           python3 -m py_compile \
             scripts/graph_path_phaser.py \
             scripts/na50_graph_pipeline.py \
-            scripts/test_graph_path_phaser.py
+            scripts/merge_backbone_replacement.py \
+            scripts/test_graph_path_phaser.py \
+            scripts/test_merge_backbone_replacement.py
           PYTHONPATH=scripts python3 scripts/test_graph_path_phaser.py
+          PYTHONPATH=scripts python3 scripts/test_merge_backbone_replacement.py
           cargo build --release
 
       - name: Run cumulative graph NA50 optimizations
@@ -178,6 +183,8 @@ jobs:
             benchmark/bridge_na50/graph_optimizer/*.json
             benchmark/bridge_na50/graph_optimizer/*.tsv
             benchmark/bridge_na50/*/containment_stats.json
+            benchmark/bridge_na50/*/backbone_replacement.json
+            benchmark/bridge_na50/*/backbone_replacement.tsv
             benchmark/metaquast/combined_reference/report.tsv
             benchmark/metaquast/combined_reference/transposed_report.tsv
             benchmark/species_quast/*/report.tsv
