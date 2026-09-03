@@ -1,0 +1,252 @@
+name: Zymo 200k Stage13 three methods
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage13-three-methods-200k.yml
+      - scripts/stage13_three_methods.py
+      - scripts/test_stage13_three_methods.py
+      - scripts/adaptive_k_local_v2.py
+      - scripts/stitch_exact_overlaps.py
+      - scripts/stage10_multik_rescue.py
+      - scripts/stage8_backbone_optimizer.py
+      - scripts/low_abundance_rescue.py
+      - scripts/graph_path_phaser.py
+      - scripts/na50_repeat_pipeline.py
+      - scripts/repeat_graph_optimizer.py
+      - scripts/repeat_graph_optimizer_v2.py
+      - scripts/stage789_optimizer.py
+      - scripts/merge_backbone_replacement.py
+      - scripts/postprocess_segment_grafts.py
+      - scripts/filter_contained_fasta.py
+      - scripts/merge_fasta_unique.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage13-three-methods-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spades curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/graph_path_phaser.py \
+            scripts/adaptive_k_local_v2.py \
+            scripts/stitch_exact_overlaps.py \
+            scripts/stage10_multik_rescue.py \
+            scripts/stage13_three_methods.py \
+            scripts/test_stage13_three_methods.py
+          PYTHONPATH=scripts python3 scripts/test_stage789_optimizer.py
+          PYTHONPATH=scripts python3 scripts/test_low_abundance_rescue.py
+          PYTHONPATH=scripts python3 scripts/test_stage10_multik_rescue.py
+          PYTHONPATH=scripts python3 scripts/test_stage13_three_methods.py
+          cargo build --release
+
+      - name: Build fixed Stage8 backbone
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/bridge_repeat \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+              --pipeline-dir benchmark/bridge_repeat \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --segment-anchor-bases 31 \
+              --lookahead-depth 3 \
+              --lookahead-max-branch 4
+
+      - name: Build Stage10 strict low-abundance baseline
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage10.time.txt \
+            python3 scripts/stage10_multik_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/bridge_repeat \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" \
+              --ks 17,21,25,31
+
+      - name: Run Stage13 three methods
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage13.time.txt \
+            python3 scripts/stage13_three_methods.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/bridge_repeat \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" \
+              --ks 17,21,25,31
+          cp benchmark/bridge_repeat/bridge_backbone.fasta benchmark/assemblies/bridge_stage8.fasta
+          cp benchmark/bridge_repeat/stage10_multik_rescue/candidate_multik_strict/primary_contigs.fasta benchmark/assemblies/bridge_stage10_strict.fasta
+          cp benchmark/bridge_repeat/stage13_three_methods/superread/candidate_superread/primary_contigs.fasta benchmark/assemblies/bridge_stage13_superread.fasta
+          cp benchmark/bridge_repeat/stage13_three_methods/multiplex/candidate_multiplex/primary_contigs.fasta benchmark/assemblies/bridge_stage13_multiplex.fasta
+          cp benchmark/bridge_repeat/stage13_three_methods/flow/candidate_flow/primary_contigs.fasta benchmark/assemblies/bridge_stage13_flow.fasta
+          cp benchmark/bridge_repeat/stage13_three_methods/combined/candidate_combined/primary_contigs.fasta benchmark/assemblies/bridge_stage13_combined.fasta
+
+      - name: FASTA stats
+        run: |
+          for f in benchmark/assemblies/bridge_*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run metaSPAdes control
+        run: |
+          /usr/bin/time -v -o benchmark/metaspades.time.txt \
+            metaspades.py -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                          -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                          -o benchmark/metaspades -t "$THREADS" -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
+
+      - name: Run combined-reference MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_stage8.fasta \
+            benchmark/assemblies/bridge_stage10_strict.fasta \
+            benchmark/assemblies/bridge_stage13_superread.fasta \
+            benchmark/assemblies/bridge_stage13_multiplex.fasta \
+            benchmark/assemblies/bridge_stage13_flow.fasta \
+            benchmark/assemblies/bridge_stage13_combined.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json \
+            | tee benchmark/metaquast_summary.tsv
+
+      - name: Run per-bacterium QUAST
+        run: |
+          set -euo pipefail
+          assemblies=(benchmark/assemblies/bridge_stage8.fasta benchmark/assemblies/bridge_stage10_strict.fasta benchmark/assemblies/bridge_stage13_superread.fasta benchmark/assemblies/bridge_stage13_multiplex.fasta benchmark/assemblies/bridge_stage13_flow.fasta benchmark/assemblies/bridge_stage13_combined.fasta benchmark/assemblies/metaspades.fasta)
+          for ref in /tmp/zymo-species-refs/{Bacillus_subtilis,Enterococcus_faecalis,Escherichia_coli,Lactobacillus_fermentum,Listeria_monocytogenes,Pseudomonas_aeruginosa,Salmonella_enterica,Staphylococcus_aureus}.fasta; do
+            species="$(basename "$ref" .fasta)"
+            python3 /tmp/quast-5.3.0/quast.py "${assemblies[@]}" -r "$ref" \
+              -o "benchmark/species_quast/$species" --threads "$THREADS" --min-contig 200 --no-plots
+          done
+          python3 scripts/summarize_species_quast.py benchmark/species_quast \
+            --json benchmark/species_summary.json | tee benchmark/species_summary.tsv
+
+      - name: Score Stage13 gates
+        run: |
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          def rows(path):
+              with Path(path).open() as handle:
+                  return list(csv.DictReader(handle, delimiter='\t'))
+
+          meta = {r['Assembly']: r for r in rows('benchmark/metaquast_summary.tsv')}
+          species = {r['assembly']: r for r in rows('benchmark/species_summary.tsv')}
+          baseline = 'bridge_stage10_strict'
+          candidates = [
+              'bridge_stage13_superread',
+              'bridge_stage13_multiplex',
+              'bridge_stage13_flow',
+              'bridge_stage13_combined',
+          ]
+          b = meta[baseline]
+          bgf = float(species[baseline]['bacteria_mean_gf'])
+          bna = float(b['NA50'])
+          with Path('benchmark/stage13_gate.tsv').open('w') as out:
+              out.write('assembly\tmean_gf\tdelta_gf\tpseudomonas_gf\tcombined_gf\tna50\tdelta_na50\tdup\tmisassemblies\tlocal_misassemblies\tstrict_gate\tbreakthrough_gate\n')
+              for name in candidates:
+                  m = meta[name]
+                  s = species[name]
+                  gf = float(s['bacteria_mean_gf'])
+                  na = float(m['NA50'])
+                  dup = float(m['Duplication ratio'])
+                  mis = int(float(m['# misassemblies']))
+                  local = int(float(m['# local misassemblies']))
+                  strict = dup <= 1.008 and mis <= 12 and local <= 6 and gf >= bgf and na >= 0.95 * bna
+                  breakthrough = (
+                      dup <= 1.012 and mis <= 14 and local <= 8 and
+                      ((gf >= bgf + 0.03 and na >= 0.98 * bna) or
+                       (na >= 1.15 * bna and gf >= bgf - 0.02))
+                  )
+                  out.write(
+                      f"{name}\t{gf:.4f}\t{gf-bgf:+.4f}\t{s['pseudomonas_gf']}\t{m['Genome fraction (%)']}\t"
+                      f"{na:.1f}\t{na-bna:+.1f}\t{dup:.4f}\t{mis}\t{local}\t"
+                      f"{'PASS' if strict else 'FAIL'}\t{'PASS' if breakthrough else 'FAIL'}\n"
+                  )
+          print(Path('benchmark/stage13_gate.tsv').read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\nbaseline\tStage10_strict\nmethod_A\treciprocal_best_exact_superread_closure\nmethod_B\tbounded_local_adaptive_multiplex_k17_21_25_31\nmethod_C\tlocal_bubble_multi_path_nnls_flow\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage13-three-methods-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/bridge_repeat/pipeline_manifest.json
+            benchmark/bridge_repeat/stage8_backbone_stats.json
+            benchmark/bridge_repeat/stage10_multik_rescue/*.json
+            benchmark/bridge_repeat/stage10_multik_rescue/*.tsv
+            benchmark/bridge_repeat/stage13_three_methods/**/*.json
+            benchmark/bridge_repeat/stage13_three_methods/**/*.tsv
+            benchmark/metaquast/combined_reference/report.tsv
+            benchmark/metaquast/combined_reference/transposed_report.tsv
+            benchmark/species_quast/*/report.tsv
+          retention-days: 14
