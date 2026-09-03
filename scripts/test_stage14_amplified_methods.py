@@ -109,3 +109,5 @@ class Stage14Tests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+# Trigger Stage14 benchmark through the contents API.
