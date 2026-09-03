@@ -119,6 +119,7 @@ jobs:
       - name: Run Stage13 three methods
         run: |
           set -euo pipefail
+          mkdir -p benchmark/bridge_repeat/stage13_three_methods/flow
           /usr/bin/time -v -o benchmark/stage13.time.txt \
             python3 scripts/stage13_three_methods.py \
               --bridgeasm target/release/bridgeasm \
