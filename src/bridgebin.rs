@@ -65,231 +65,191 @@ pub struct BinningResult {
 }
 
 #[derive(Clone, Debug)]
-struct FeatureVector {
+struct Feature {
     id: String,
-    length: usize,
+    len: usize,
     gc: f64,
-    composition: [f64; 256],
-    coverage: Vec<f64>,
+    tnf: [f64; 256],
+    cov: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
 struct BinState {
     members: Vec<usize>,
-    total_bp: usize,
+    bp: usize,
     gc_sum: f64,
-    composition_sum: [f64; 256],
-    coverage_sum: Vec<f64>,
+    tnf_sum: [f64; 256],
+    cov_sum: Vec<f64>,
 }
 
 impl BinState {
-    fn new(feature_index: usize, f: &FeatureVector) -> Self {
-        let weight = f.length as f64;
-        let mut composition_sum = [0.0; 256];
-        for (dst, src) in composition_sum.iter_mut().zip(f.composition.iter()) {
-            *dst = *src * weight;
+    fn new(index: usize, f: &Feature) -> Self {
+        let w = f.len as f64;
+        let mut tnf_sum = [0.0; 256];
+        for (dst, src) in tnf_sum.iter_mut().zip(f.tnf.iter()) {
+            *dst = *src * w;
         }
-        let coverage_sum = f.coverage.iter().map(|v| v * weight).collect();
         Self {
-            members: vec![feature_index],
-            total_bp: f.length,
-            gc_sum: f.gc * weight,
-            composition_sum,
-            coverage_sum,
+            members: vec![index],
+            bp: f.len,
+            gc_sum: f.gc * w,
+            tnf_sum,
+            cov_sum: f.cov.iter().map(|v| v * w).collect(),
         }
     }
 
-    fn add(&mut self, feature_index: usize, f: &FeatureVector) {
-        let weight = f.length as f64;
-        self.members.push(feature_index);
-        self.total_bp += f.length;
-        self.gc_sum += f.gc * weight;
-        for (dst, src) in self.composition_sum.iter_mut().zip(f.composition.iter()) {
-            *dst += *src * weight;
+    fn add(&mut self, index: usize, f: &Feature) {
+        let w = f.len as f64;
+        self.members.push(index);
+        self.bp += f.len;
+        self.gc_sum += f.gc * w;
+        for (dst, src) in self.tnf_sum.iter_mut().zip(f.tnf.iter()) {
+            *dst += *src * w;
         }
-        if self.coverage_sum.is_empty() && !f.coverage.is_empty() {
-            self.coverage_sum.resize(f.coverage.len(), 0.0);
+        if self.cov_sum.is_empty() && !f.cov.is_empty() {
+            self.cov_sum.resize(f.cov.len(), 0.0);
         }
-        if self.coverage_sum.len() == f.coverage.len() {
-            for (dst, src) in self.coverage_sum.iter_mut().zip(f.coverage.iter()) {
-                *dst += *src * weight;
+        if self.cov_sum.len() == f.cov.len() {
+            for (dst, src) in self.cov_sum.iter_mut().zip(f.cov.iter()) {
+                *dst += *src * w;
             }
         }
     }
 
-    fn centroid(&self) -> FeatureVector {
-        let denom = self.total_bp.max(1) as f64;
-        let mut composition = [0.0; 256];
-        for (dst, src) in composition.iter_mut().zip(self.composition_sum.iter()) {
-            *dst = *src / denom;
+    fn centroid(&self) -> Feature {
+        let d = self.bp.max(1) as f64;
+        let mut tnf = [0.0; 256];
+        for (dst, src) in tnf.iter_mut().zip(self.tnf_sum.iter()) {
+            *dst = *src / d;
         }
-        let coverage = self.coverage_sum.iter().map(|v| *v / denom).collect();
-        FeatureVector {
+        Feature {
             id: String::new(),
-            length: self.total_bp,
-            gc: self.gc_sum / denom,
-            composition,
-            coverage,
+            len: self.bp,
+            gc: self.gc_sum / d,
+            tnf,
+            cov: self.cov_sum.iter().map(|v| *v / d).collect(),
         }
     }
 }
 
 pub fn read_fasta<P: AsRef<Path>>(path: P) -> io::Result<Vec<Contig>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut contigs = Vec::new();
+    let reader = BufReader::new(File::open(path)?);
+    let mut out = Vec::new();
     let mut seen = HashSet::new();
-    let mut current_id: Option<String> = None;
-    let mut current_seq = Vec::new();
+    let mut id: Option<String> = None;
+    let mut seq = Vec::new();
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let s = line.trim();
+        if s.is_empty() {
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('>') {
-            if let Some(id) = current_id.take() {
-                contigs.push(Contig {
-                    id,
-                    seq: std::mem::take(&mut current_seq),
+        if let Some(header) = s.strip_prefix('>') {
+            if let Some(old_id) = id.take() {
+                out.push(Contig {
+                    id: old_id,
+                    seq: std::mem::take(&mut seq),
                 });
             }
-            let id = rest
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty FASTA header"))?;
-            if id.is_empty() {
+            let new_id = header.split_whitespace().next().unwrap_or("");
+            if new_id.is_empty() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "empty FASTA id"));
             }
-            if !seen.insert(id.to_string()) {
+            if !seen.insert(new_id.to_string()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("duplicate FASTA id '{}' at line {}", id, line_no + 1),
+                    format!("duplicate FASTA id '{}' at line {}", new_id, line_no + 1),
                 ));
             }
-            current_id = Some(id.to_string());
+            id = Some(new_id.to_string());
         } else {
-            if current_id.is_none() {
+            if id.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("sequence before first FASTA header at line {}", line_no + 1),
+                    "sequence before first FASTA header",
                 ));
             }
-            current_seq.extend(trimmed.as_bytes().iter().map(|b| b.to_ascii_uppercase()));
+            seq.extend(s.as_bytes().iter().map(|b| b.to_ascii_uppercase()));
         }
     }
-
-    if let Some(id) = current_id.take() {
-        contigs.push(Contig { id, seq: current_seq });
+    if let Some(last_id) = id {
+        out.push(Contig { id: last_id, seq });
     }
-    if contigs.is_empty() {
+    if out.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "FASTA contains no contigs"));
     }
-    Ok(contigs)
+    Ok(out)
 }
 
 pub fn read_coverage_table<P: AsRef<Path>>(path: P) -> io::Result<CoverageTable> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
-    let mut sample_names: Vec<String> = Vec::new();
-    let mut expected_cols: Option<usize> = None;
-    let mut first_data_seen = false;
+    let reader = BufReader::new(File::open(path)?);
+    let mut sample_names = Vec::new();
+    let mut expected: Option<usize> = None;
+    let mut values = HashMap::new();
+    let mut first = true;
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        let fields: Vec<&str> = s.split_whitespace().collect();
         if fields.len() < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("coverage row {} has fewer than 2 columns", line_no + 1),
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "coverage row needs >=2 columns"));
         }
-
-        if !first_data_seen && fields[1].parse::<f64>().is_err() {
-            sample_names = fields[1..].iter().map(|s| (*s).to_string()).collect();
-            expected_cols = Some(sample_names.len());
-            first_data_seen = true;
+        if first && fields[1].parse::<f64>().is_err() {
+            sample_names = fields[1..].iter().map(|x| (*x).to_string()).collect();
+            expected = Some(sample_names.len());
+            first = false;
             continue;
         }
-        first_data_seen = true;
-
+        first = false;
         let n = fields.len() - 1;
-        match expected_cols {
-            Some(m) if m != n => {
+        if let Some(m) = expected {
+            if m != n {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "coverage row {} has {} sample columns; expected {}",
-                        line_no + 1,
-                        n,
-                        m
-                    ),
+                    format!("coverage row {} has {} columns; expected {}", line_no + 1, n, m),
                 ));
             }
-            None => {
-                expected_cols = Some(n);
-                sample_names = (1..=n).map(|i| format!("sample{}", i)).collect();
-            }
-            _ => {}
+        } else {
+            expected = Some(n);
+            sample_names = (1..=n).map(|i| format!("sample{}", i)).collect();
         }
-
-        let mut values = Vec::with_capacity(n);
+        let mut row = Vec::with_capacity(n);
         for raw in &fields[1..] {
-            let value = raw.parse::<f64>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid coverage value '{}' at line {}", raw, line_no + 1),
-                )
+            let v = raw.parse::<f64>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("invalid coverage '{}'", raw))
             })?;
-            if !value.is_finite() || value < 0.0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("coverage must be finite and >= 0 at line {}", line_no + 1),
-                ));
+            if !v.is_finite() || v < 0.0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "coverage must be finite and >=0"));
             }
-            values.push(value);
+            row.push(v);
         }
-        rows.push((fields[0].to_string(), values));
-    }
-
-    if rows.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "coverage table contains no data rows",
-        ));
-    }
-
-    let mut map = HashMap::with_capacity(rows.len());
-    for (id, values) in rows {
-        if map.insert(id.clone(), values).is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("duplicate contig '{}' in coverage table", id),
-            ));
+        if values.insert(fields[0].to_string(), row).is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate coverage contig"));
         }
     }
-
+    if values.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "coverage table has no data"));
+    }
     Ok(CoverageTable {
         sample_names,
-        values: map,
+        values,
     })
 }
 
 pub fn bin_contigs(
     contigs: &[Contig],
     coverage: Option<&CoverageTable>,
-    config: &BridgeBinConfig,
+    cfg: &BridgeBinConfig,
 ) -> BinningResult {
-    let features: Vec<FeatureVector> = contigs
+    let features: Vec<Feature> = contigs
         .iter()
-        .filter(|c| c.seq.len() >= config.min_contig_len)
-        .map(|c| feature_for_contig(c, coverage))
+        .filter(|c| c.seq.len() >= cfg.min_contig_len)
+        .map(|c| feature(c, coverage))
         .collect();
 
     if features.is_empty() {
@@ -307,53 +267,51 @@ pub fn bin_contigs(
         };
     }
 
-    let mut seed_indices: Vec<usize> = features
+    let mut seeds: Vec<usize> = features
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| (f.length >= config.seed_min_len).then_some(i))
+        .filter_map(|(i, f)| (f.len >= cfg.seed_min_len).then_some(i))
         .collect();
-    if seed_indices.is_empty() {
-        seed_indices = (0..features.len()).collect();
+    if seeds.is_empty() {
+        seeds = (0..features.len()).collect();
     }
-    seed_indices.sort_by(|&a, &b| features[b].length.cmp(&features[a].length));
+    seeds.sort_by(|&a, &b| features[b].len.cmp(&features[a].len));
+    let seed_set: HashSet<usize> = seeds.iter().copied().collect();
 
-    let seed_set: HashSet<usize> = seed_indices.iter().copied().collect();
     let mut bins: Vec<BinState> = Vec::new();
-    let mut assignment_by_feature: Vec<Option<(usize, f64)>> = vec![None; features.len()];
-
-    for &idx in &seed_indices {
-        let (best_bin, best_score, _) = best_two_bins(&features[idx], &bins, config);
-        if let Some(bin_idx) = best_bin.filter(|_| best_score >= config.join_threshold) {
-            bins[bin_idx].add(idx, &features[idx]);
-            assignment_by_feature[idx] = Some((bin_idx, best_score));
+    let mut assigned: Vec<Option<(usize, f64)>> = vec![None; features.len()];
+    for &i in &seeds {
+        let (best, score, _) = best_two(&features[i], &bins, cfg);
+        if let Some(bin) = best.filter(|_| score >= cfg.join_threshold) {
+            bins[bin].add(i, &features[i]);
+            assigned[i] = Some((bin, score));
         } else {
-            let bin_idx = bins.len();
-            bins.push(BinState::new(idx, &features[idx]));
-            assignment_by_feature[idx] = Some((bin_idx, 1.0));
+            let bin = bins.len();
+            bins.push(BinState::new(i, &features[i]));
+            assigned[i] = Some((bin, 1.0));
         }
     }
 
-    let mut rescue_indices: Vec<usize> = (0..features.len())
+    let mut rescue: Vec<usize> = (0..features.len())
         .filter(|i| !seed_set.contains(i))
         .collect();
-    rescue_indices.sort_by(|&a, &b| features[b].length.cmp(&features[a].length));
-    for idx in rescue_indices {
-        let (best_bin, best_score, second_score) = best_two_bins(&features[idx], &bins, config);
-        let margin_ok = bins.len() <= 1 || best_score - second_score >= config.rescue_margin;
-        if let Some(bin_idx) = best_bin.filter(|_| best_score >= config.rescue_threshold && margin_ok) {
-            bins[bin_idx].add(idx, &features[idx]);
-            assignment_by_feature[idx] = Some((bin_idx, best_score));
+    rescue.sort_by(|&a, &b| features[b].len.cmp(&features[a].len));
+    for i in rescue {
+        let (best, score, second) = best_two(&features[i], &bins, cfg);
+        let margin_ok = bins.len() <= 1 || score - second >= cfg.rescue_margin;
+        if let Some(bin) = best.filter(|_| score >= cfg.rescue_threshold && margin_ok) {
+            bins[bin].add(i, &features[i]);
+            assigned[i] = Some((bin, score));
         }
     }
 
     let mut order: Vec<usize> = (0..bins.len()).collect();
-    order.sort_by(|&a, &b| bins[b].total_bp.cmp(&bins[a].total_bp).then_with(|| a.cmp(&b)));
+    order.sort_by(|&a, &b| bins[b].bp.cmp(&bins[a].bp).then_with(|| a.cmp(&b)));
     let mut remap = vec![0usize; bins.len()];
-    for (new_idx, old_idx) in order.iter().copied().enumerate() {
-        remap[old_idx] = new_idx;
+    for (new, old) in order.iter().copied().enumerate() {
+        remap[old] = new;
     }
-
-    let feature_index_by_id: HashMap<&str, usize> = features
+    let by_id: HashMap<&str, usize> = features
         .iter()
         .enumerate()
         .map(|(i, f)| (f.id.as_str(), i))
@@ -361,47 +319,33 @@ pub fn bin_contigs(
 
     let assignments = contigs
         .iter()
-        .map(|c| {
-            if let Some(&fi) = feature_index_by_id.get(c.id.as_str()) {
-                if let Some((old_bin, score)) = assignment_by_feature[fi] {
-                    Assignment {
-                        contig_id: c.id.clone(),
-                        bin_index: Some(remap[old_bin]),
-                        score,
-                        length: c.seq.len(),
-                    }
-                } else {
-                    Assignment {
-                        contig_id: c.id.clone(),
-                        bin_index: None,
-                        score: 0.0,
-                        length: c.seq.len(),
-                    }
-                }
-            } else {
-                Assignment {
-                    contig_id: c.id.clone(),
-                    bin_index: None,
-                    score: 0.0,
-                    length: c.seq.len(),
-                }
-            }
+        .map(|c| match by_id.get(c.id.as_str()).and_then(|&i| assigned[i]) {
+            Some((old, score)) => Assignment {
+                contig_id: c.id.clone(),
+                bin_index: Some(remap[old]),
+                score,
+                length: c.seq.len(),
+            },
+            None => Assignment {
+                contig_id: c.id.clone(),
+                bin_index: None,
+                score: 0.0,
+                length: c.seq.len(),
+            },
         })
         .collect();
 
     let mut summaries = Vec::with_capacity(bins.len());
-    for old_idx in order {
-        let state = &bins[old_idx];
-        let centroid = state.centroid();
+    for old in order {
+        let c = bins[old].centroid();
         summaries.push(BinSummary {
-            bin_index: remap[old_idx],
-            contig_count: state.members.len(),
-            total_bp: state.total_bp,
-            mean_gc: centroid.gc,
+            bin_index: remap[old],
+            contig_count: bins[old].members.len(),
+            total_bp: bins[old].bp,
+            mean_gc: c.gc,
         });
     }
     summaries.sort_by_key(|b| b.bin_index);
-
     BinningResult {
         assignments,
         bins: summaries,
@@ -414,58 +358,50 @@ pub fn write_outputs<P: AsRef<Path>>(
     out_dir: P,
     emit_unbinned: bool,
 ) -> io::Result<()> {
-    let out_dir = out_dir.as_ref();
-    fs::create_dir_all(out_dir)?;
-    let bins_dir = out_dir.join("bins");
+    let out = out_dir.as_ref();
+    let bins_dir = out.join("bins");
     fs::create_dir_all(&bins_dir)?;
-
-    let mut assignment_map: HashMap<&str, Option<usize>> = HashMap::new();
-    for a in &result.assignments {
-        assignment_map.insert(a.contig_id.as_str(), a.bin_index);
-    }
-
-    let mut writers: HashMap<usize, BufWriter<File>> = HashMap::new();
-    for summary in &result.bins {
-        let path = bins_dir.join(format!("bin_{:04}.fa", summary.bin_index + 1));
-        writers.insert(summary.bin_index, BufWriter::new(File::create(path)?));
+    let assignment: HashMap<&str, Option<usize>> = result
+        .assignments
+        .iter()
+        .map(|a| (a.contig_id.as_str(), a.bin_index))
+        .collect();
+    let mut writers = HashMap::new();
+    for b in &result.bins {
+        writers.insert(
+            b.bin_index,
+            BufWriter::new(File::create(bins_dir.join(format!("bin_{:04}.fa", b.bin_index + 1)))?),
+        );
     }
     let mut unbinned = if emit_unbinned {
-        Some(BufWriter::new(File::create(out_dir.join("unbinned.fa"))?))
+        Some(BufWriter::new(File::create(out.join("unbinned.fa"))?))
     } else {
         None
     };
-
-    for contig in contigs {
-        let target = assignment_map.get(contig.id.as_str()).copied().flatten();
-        match target {
-            Some(bin_idx) => {
-                if let Some(writer) = writers.get_mut(&bin_idx) {
-                    write_fasta_record(writer, contig)?;
-                }
-            }
+    for c in contigs {
+        match assignment.get(c.id.as_str()).copied().flatten() {
+            Some(bin) => write_fasta(writers.get_mut(&bin).expect("known bin"), c)?,
             None => {
-                if let Some(writer) = unbinned.as_mut() {
-                    write_fasta_record(writer, contig)?;
+                if let Some(w) = unbinned.as_mut() {
+                    write_fasta(w, c)?;
                 }
             }
         }
     }
-
-    let mut assignments = BufWriter::new(File::create(out_dir.join("assignments.tsv"))?);
-    writeln!(assignments, "contig\tbin\tlength\tscore")?;
+    let mut aout = BufWriter::new(File::create(out.join("assignments.tsv"))?);
+    writeln!(aout, "contig\tbin\tlength\tscore")?;
     for a in &result.assignments {
-        let bin_name = a
+        let name = a
             .bin_index
             .map(|i| format!("bin_{:04}", i + 1))
             .unwrap_or_else(|| "unbinned".to_string());
-        writeln!(assignments, "{}\t{}\t{}\t{:.6}", a.contig_id, bin_name, a.length, a.score)?;
+        writeln!(aout, "{}\t{}\t{}\t{:.6}", a.contig_id, name, a.length, a.score)?;
     }
-
-    let mut summary = BufWriter::new(File::create(out_dir.join("bins.tsv"))?);
-    writeln!(summary, "bin\tcontigs\ttotal_bp\tmean_gc")?;
+    let mut bout = BufWriter::new(File::create(out.join("bins.tsv"))?);
+    writeln!(bout, "bin\tcontigs\ttotal_bp\tmean_gc")?;
     for b in &result.bins {
         writeln!(
-            summary,
+            bout,
             "bin_{:04}\t{}\t{}\t{:.6}",
             b.bin_index + 1,
             b.contig_count,
@@ -476,166 +412,141 @@ pub fn write_outputs<P: AsRef<Path>>(
     Ok(())
 }
 
-fn write_fasta_record<W: Write>(writer: &mut W, contig: &Contig) -> io::Result<()> {
-    writeln!(writer, ">{}", contig.id)?;
-    for chunk in contig.seq.chunks(80) {
-        writer.write_all(chunk)?;
-        writer.write_all(b"\n")?;
+fn write_fasta<W: Write>(w: &mut W, c: &Contig) -> io::Result<()> {
+    writeln!(w, ">{}", c.id)?;
+    for chunk in c.seq.chunks(80) {
+        w.write_all(chunk)?;
+        w.write_all(b"\n")?;
     }
     Ok(())
 }
 
-fn feature_for_contig(contig: &Contig, coverage: Option<&CoverageTable>) -> FeatureVector {
-    FeatureVector {
-        id: contig.id.clone(),
-        length: contig.seq.len(),
-        gc: gc_fraction(&contig.seq),
-        composition: canonical_tnf(&contig.seq),
-        coverage: coverage
-            .and_then(|t| t.values.get(&contig.id))
+fn feature(c: &Contig, coverage: Option<&CoverageTable>) -> Feature {
+    Feature {
+        id: c.id.clone(),
+        len: c.seq.len(),
+        gc: gc_fraction(&c.seq),
+        tnf: canonical_tnf(&c.seq),
+        cov: coverage
+            .and_then(|x| x.values.get(&c.id))
             .cloned()
             .unwrap_or_default(),
     }
 }
 
-fn best_two_bins(
-    feature: &FeatureVector,
-    bins: &[BinState],
-    config: &BridgeBinConfig,
-) -> (Option<usize>, f64, f64) {
-    let mut best_bin = None;
-    let mut best_score = f64::NEG_INFINITY;
-    let mut second_score = f64::NEG_INFINITY;
-    for (bin_idx, bin) in bins.iter().enumerate() {
-        let centroid = bin.centroid();
-        let score = similarity(feature, &centroid, config);
-        if score > best_score {
-            second_score = best_score;
-            best_score = score;
-            best_bin = Some(bin_idx);
-        } else if score > second_score {
-            second_score = score;
+fn best_two(f: &Feature, bins: &[BinState], cfg: &BridgeBinConfig) -> (Option<usize>, f64, f64) {
+    let mut best = None;
+    let mut s1 = f64::NEG_INFINITY;
+    let mut s2 = f64::NEG_INFINITY;
+    for (i, bin) in bins.iter().enumerate() {
+        let s = similarity(f, &bin.centroid(), cfg);
+        if s > s1 {
+            s2 = s1;
+            s1 = s;
+            best = Some(i);
+        } else if s > s2 {
+            s2 = s;
         }
     }
-    if best_bin.is_none() {
+    if best.is_none() {
         (None, 0.0, 0.0)
     } else {
-        let second = if second_score.is_finite() { second_score } else { 0.0 };
-        (best_bin, best_score, second)
+        (best, s1, if s2.is_finite() { s2 } else { 0.0 })
     }
 }
 
-fn similarity(a: &FeatureVector, b: &FeatureVector, config: &BridgeBinConfig) -> f64 {
-    let comp_distance = hellinger(&a.composition, &b.composition);
-    let comp_similarity = (-comp_distance / 0.30).exp();
-    let gc_similarity = (-(a.gc - b.gc).abs() / 0.08).exp();
-
-    let mut weighted = config.composition_weight * comp_similarity + config.gc_weight * gc_similarity;
-    let mut total_weight = config.composition_weight + config.gc_weight;
-
-    if !a.coverage.is_empty() && a.coverage.len() == b.coverage.len() {
-        let cov_distance = a
-            .coverage
+fn similarity(a: &Feature, b: &Feature, cfg: &BridgeBinConfig) -> f64 {
+    let comp = (-hellinger(&a.tnf, &b.tnf) / 0.30).exp();
+    let gc = (-(a.gc - b.gc).abs() / 0.08).exp();
+    let mut score = cfg.composition_weight * comp + cfg.gc_weight * gc;
+    let mut weight = cfg.composition_weight + cfg.gc_weight;
+    if !a.cov.is_empty() && a.cov.len() == b.cov.len() {
+        let d = a
+            .cov
             .iter()
-            .zip(b.coverage.iter())
+            .zip(b.cov.iter())
             .map(|(x, y)| ((x + 0.5) / (y + 0.5)).ln().abs())
             .sum::<f64>()
-            / a.coverage.len() as f64;
-        let cov_similarity = (-cov_distance / 0.85).exp();
-        weighted += config.coverage_weight * cov_similarity;
-        total_weight += config.coverage_weight;
+            / a.cov.len() as f64;
+        score += cfg.coverage_weight * (-d / 0.85).exp();
+        weight += cfg.coverage_weight;
     }
-
-    if total_weight <= f64::EPSILON {
+    if weight <= f64::EPSILON {
         0.0
     } else {
-        weighted / total_weight
+        score / weight
     }
 }
 
 fn hellinger(a: &[f64; 256], b: &[f64; 256]) -> f64 {
-    let sum = a
-        .iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x.sqrt() - y.sqrt()).powi(2))
-        .sum::<f64>();
-    (0.5 * sum).sqrt()
+    (0.5
+        * a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x.sqrt() - y.sqrt()).powi(2))
+            .sum::<f64>())
+    .sqrt()
 }
 
 fn gc_fraction(seq: &[u8]) -> f64 {
     let mut gc = 0usize;
-    let mut valid = 0usize;
+    let mut n = 0usize;
     for &b in seq {
         match b.to_ascii_uppercase() {
             b'G' | b'C' => {
                 gc += 1;
-                valid += 1;
+                n += 1;
             }
-            b'A' | b'T' => valid += 1,
+            b'A' | b'T' => n += 1,
             _ => {}
         }
     }
-    if valid == 0 {
+    if n == 0 {
         0.0
     } else {
-        gc as f64 / valid as f64
+        gc as f64 / n as f64
     }
 }
 
 fn canonical_tnf(seq: &[u8]) -> [f64; 256] {
-    let mut counts = [0.0f64; 256];
-    let mut total = 0.0f64;
-    if seq.len() < 4 {
-        return counts;
-    }
-    for window in seq.windows(4) {
-        if let (Some(code), Some(rc)) = (encode_4mer(window), encode_revcomp_4mer(window)) {
-            counts[code.min(rc)] += 1.0;
+    let mut counts = [0.0; 256];
+    let mut total = 0.0;
+    for w in seq.windows(4) {
+        if let (Some(fwd), Some(rc)) = (encode4(w, false), encode4(w, true)) {
+            counts[fwd.min(rc)] += 1.0;
             total += 1.0;
         }
     }
     if total > 0.0 {
-        for value in &mut counts {
-            *value /= total;
+        for x in &mut counts {
+            *x /= total;
         }
     }
     counts
 }
 
-fn encode_4mer(window: &[u8]) -> Option<usize> {
+fn encode4(w: &[u8], reverse_complement: bool) -> Option<usize> {
     let mut code = 0usize;
-    for &b in window {
-        code = (code << 2) | base_code(b)?;
+    if reverse_complement {
+        for &b in w.iter().rev() {
+            code = (code << 2) | base_code(b, true)?;
+        }
+    } else {
+        for &b in w {
+            code = (code << 2) | base_code(b, false)?;
+        }
     }
     Some(code)
 }
 
-fn encode_revcomp_4mer(window: &[u8]) -> Option<usize> {
-    let mut code = 0usize;
-    for &b in window.iter().rev() {
-        code = (code << 2) | complement_code(b)?;
-    }
-    Some(code)
-}
-
-fn base_code(b: u8) -> Option<usize> {
-    match b.to_ascii_uppercase() {
-        b'A' => Some(0),
-        b'C' => Some(1),
-        b'G' => Some(2),
-        b'T' => Some(3),
-        _ => None,
-    }
-}
-
-fn complement_code(b: u8) -> Option<usize> {
-    match b.to_ascii_uppercase() {
-        b'A' => Some(3),
-        b'C' => Some(2),
-        b'G' => Some(1),
-        b'T' => Some(0),
-        _ => None,
-    }
+fn base_code(b: u8, complement: bool) -> Option<usize> {
+    let x = match b.to_ascii_uppercase() {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => return None,
+    };
+    Some(if complement { 3 - x } else { x })
 }
 
 #[cfg(test)]
@@ -651,30 +562,30 @@ mod tests {
     }
 
     #[test]
-    fn canonical_tnf_is_reverse_complement_invariant() {
-        let x = canonical_tnf(b"AAAACGTTCCGA");
-        let rc = canonical_tnf(b"TCGGAACGTTTT");
+    fn tnf_is_reverse_complement_invariant() {
+        let a = canonical_tnf(b"AAAACGTTCCGA");
+        let b = canonical_tnf(b"TCGGAACGTTTT");
         for i in 0..256 {
-            assert!((x[i] - rc[i]).abs() < 1e-12);
+            assert!((a[i] - b[i]).abs() < 1e-12);
         }
     }
 
     #[test]
-    fn coverage_table_accepts_header() {
+    fn coverage_header_is_supported() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "bridgebin_cov_{}_{}.tsv",
-            std::process::id(),
-            stamp
-        ));
+        let path = std::env::temp_dir().join(format!("bridgebin_cov_{}_{}.tsv", process_id(), stamp));
         fs::write(&path, "contig\ts1\ts2\na\t10\t2\nb\t9.5\t2.5\n").unwrap();
         let table = read_coverage_table(&path).unwrap();
         fs::remove_file(path).ok();
         assert_eq!(table.sample_names, vec!["s1", "s2"]);
         assert_eq!(table.values["a"], vec![10.0, 2.0]);
+    }
+
+    fn process_id() -> u32 {
+        std::process::id()
     }
 
     #[test]
@@ -697,6 +608,7 @@ mod tests {
         let mut cfg = BridgeBinConfig::default();
         cfg.min_contig_len = 1_000;
         cfg.seed_min_len = 2_000;
+        cfg.join_threshold = 0.60;
         let result = bin_contigs(&contigs, Some(&coverage), &cfg);
         let bins: HashMap<&str, usize> = result
             .assignments
@@ -712,13 +624,13 @@ mod tests {
     #[test]
     fn short_contigs_remain_unbinned() {
         let contigs = vec![contig("tiny", "ACGT", 10), contig("long", "ACGT", 800)];
-        let cfg = BridgeBinConfig::default();
-        let result = bin_contigs(&contigs, None, &cfg);
-        let tiny = result
+        let result = bin_contigs(&contigs, None, &BridgeBinConfig::default());
+        assert!(result
             .assignments
             .iter()
             .find(|a| a.contig_id == "tiny")
-            .unwrap();
-        assert!(tiny.bin_index.is_none());
+            .unwrap()
+            .bin_index
+            .is_none());
     }
 }
