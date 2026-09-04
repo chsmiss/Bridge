@@ -1,0 +1,219 @@
+name: BridgeBin DNABERT-S first-pass conflict probe
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_dna_embed.py
+      - scripts/bridgebin_bio_features.py
+      - scripts/bridgebin_pair_head.py
+      - scripts/bridgebin_detect_conflicts.py
+      - scripts/bridgebin_reference_hardneg_panel.py
+      - .github/workflows/bridgebin-dnaberts-conflict-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and install CPU-safe DNABERT-S
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
+          curl -L --retry 3 -o /usr/local/bin/datasets \
+            'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'
+          chmod +x /usr/local/bin/datasets
+          python -m py_compile \
+            scripts/bridgebin_candidate_pairs.py \
+            scripts/bridgebin_dna_embed.py \
+            scripts/bridgebin_bio_features.py \
+            scripts/bridgebin_pair_head.py \
+            scripts/bridgebin_detect_conflicts.py \
+            scripts/bridgebin_reference_hardneg_panel.py \
+            scripts/bridgebin_make_pair_dataset.py \
+            scripts/bridgebin_zymo_reference_benchmark.py \
+            scripts/split_zymo_references.py
+
+      - name: Train transferable DNA-only identity head on references
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/dnaberts_conflict_probe/reference_groups
+          train=benchmark/dnaberts_conflict_probe/train
+          mkdir -p "$root"
+          fetch_group () {
+            label="$1"; taxon="$2"
+            mkdir -p "$root/$label/raw"
+            datasets download genome taxon "$taxon" --reference --include genome \
+              --no-progressbar --filename "/tmp/${label}.zip"
+            unzip -q "/tmp/${label}.zip" -d "$root/$label/raw"
+          }
+          fetch_group Escherichia_coli 'Escherichia coli'
+          fetch_group Salmonella_enterica 'Salmonella enterica'
+          fetch_group Klebsiella_pneumoniae 'Klebsiella pneumoniae'
+          fetch_group Enterobacter_cloacae 'Enterobacter cloacae'
+          fetch_group Citrobacter_freundii 'Citrobacter freundii'
+          fetch_group Shigella_flexneri 'Shigella flexneri'
+          fetch_group Serratia_marcescens 'Serratia marcescens'
+
+          python scripts/bridgebin_reference_hardneg_panel.py \
+            --input-dir "$root" --output-dir "$train" \
+            --fragment-bp 6000 --fragments-per-group 6 --samples 4 --seed 43
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$train/contigs.fa" --output "$train/dnaberts_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$train/dnaberts_windows.tsv" --output "$train/features.tsv"
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$train/truth.tsv" --output "$train/pairs.tsv" \
+            --anchors-per-genome 6 --positive-per-contig 4 \
+            --negative-genomes-per-contig 6 --negative-anchors-per-genome 2
+          python scripts/bridgebin_pair_head.py train \
+            --features "$train/features.tsv" --pairs "$train/pairs.tsv" \
+            --model-out "$train/pair_head.json" \
+            --validation-fraction 0.28 --epochs 700 --negative-weight 5 \
+            --precision-target 0.99 --require-group-holdout \
+            | tee "$train/pair_head.metrics.jsonl"
+
+      - name: Prepare full 5771-contig Zymo fixture and v2 bins
+        run: |
+          set -euo pipefail
+          b=benchmark/dnaberts_conflict_probe/zymo
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$b" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          target/release/bridgebin \
+            --contigs "$b/contigs.fa" --coverage "$b/coverage.tsv" \
+            --out-dir "$b/v2" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
+            >"$b/v2.log" 2>&1
+
+      - name: Mine six diverse anchors per bin and embed only endpoints
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/dnaberts_conflict_probe
+          b="$root/zymo"
+          train="$root/train"
+          python scripts/bridgebin_candidate_pairs.py \
+            --contigs "$b/contigs.fa" --assignments "$b/v2/assignments.tsv" \
+            --coverage "$b/coverage.tsv" --output "$b/probe_pairs.tsv" \
+            --min-length 1500 --anchors-per-bin 6 --anchor-strategy diverse \
+            --probe-only --max-pairs 250000
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$b/contigs.fa" --pairs "$b/probe_pairs.tsv" \
+            --output "$b/probe_dnaberts_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4 \
+            | tee "$b/probe_dna.log"
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$b/probe_dnaberts_windows.tsv" --output "$b/probe_features.tsv"
+          python scripts/bridgebin_pair_head.py score \
+            --features "$b/probe_features.tsv" --pairs "$b/probe_pairs.tsv" \
+            --model "$train/pair_head.json" --output "$b/probe_scores.tsv" \
+            --model-name ref-hardneg-dnaberts-probe
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          model=json.loads(Path('benchmark/dnaberts_conflict_probe/train/pair_head.json').read_text())
+          tr=model['training']
+          Path('/tmp/conflict_thresholds').write_text(
+              f"{tr['recommended_join_min_same']}\n{tr['recommended_split_max_same']}\n"
+          )
+          print('probe_thresholds', json.dumps({
+              'join':tr['recommended_join_min_same'],
+              'split':tr['recommended_split_max_same'],
+              'validation_groups':tr['validation_groups'],
+          },sort_keys=True))
+          PY
+
+      - name: Detect conflicted bins without truth
+        run: |
+          set -euo pipefail
+          b=benchmark/dnaberts_conflict_probe/zymo
+          split=$(sed -n '2p' /tmp/conflict_thresholds)
+          python scripts/bridgebin_detect_conflicts.py \
+            --assignments "$b/v2/assignments.tsv" \
+            --pair-scores "$b/probe_scores.tsv" \
+            --split-max-same "$split" --min-confidence 0 \
+            --min-hard-pairs 2 --min-distinct-contigs 2 \
+            --output "$b/conflicted_bins.tsv" --summary "$b/conflict_detection.json"
+          cat "$b/conflicted_bins.tsv"
+
+      - name: Benchmark-only detection audit
+        run: |
+          python - <<'PY'
+          import csv, json
+          from collections import defaultdict, Counter
+          from pathlib import Path
+          b=Path('benchmark/dnaberts_conflict_probe/zymo')
+          truth={r['contig']:r['genome'] for r in csv.DictReader((b/'truth.tsv').open(),delimiter='\t') if int(r.get('eligible','1'))}
+          assignments={}
+          by_bin=defaultdict(list)
+          for r in csv.DictReader((b/'v2/assignments.tsv').open(),delimiter='\t'):
+              cid=r['contig']; bn=r['bin']
+              assignments[cid]=bn
+              if cid in truth and bn not in ('','.','NA','unbinned'):
+                  by_bin[bn].append(cid)
+          true_mixed={bn for bn,members in by_bin.items() if len({truth[c] for c in members})>1}
+          selected=[]
+          with (b/'conflicted_bins.tsv').open() as h:
+              selected=[r['bin'] for r in csv.DictReader(h,delimiter='\t')]
+          selected_set=set(selected)
+          tp=len(selected_set & true_mixed)
+          fp=len(selected_set - true_mixed)
+          fn=len(true_mixed - selected_set)
+          selected_members={cid for cid,bn in assignments.items() if bn in selected_set and cid in truth}
+          eligible=set(truth)
+          composition={}
+          for bn in sorted(selected_set):
+              composition[bn]=dict(Counter(truth[c] for c in by_bin.get(bn,[])))
+          metrics={
+              'true_mixed_bins':sorted(true_mixed),
+              'selected_bins':sorted(selected_set),
+              'tp':tp,'fp':fp,'fn':fn,
+              'precision':None if tp+fp==0 else tp/(tp+fp),
+              'recall':None if tp+fn==0 else tp/(tp+fn),
+              'selected_member_contigs':len(selected_members),
+              'eligible_contigs':len(eligible),
+              'second_pass_member_fraction':len(selected_members)/max(1,len(eligible)),
+              'selected_bin_truth_composition':composition,
+          }
+          (b/'conflict_truth_audit.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(metrics,sort_keys=True))
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-dnaberts-conflict-probe
+          path: benchmark/dnaberts_conflict_probe
+          retention-days: 14
