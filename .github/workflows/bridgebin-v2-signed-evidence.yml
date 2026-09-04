@@ -1,0 +1,99 @@
+name: BridgeBin v2 signed evidence
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - src/bridgebin.rs
+      - src/bridgebin_v2.rs
+      - src/bridgebin_reconcile.rs
+      - src/bridgebin_quant.rs
+      - src/bin/bridgebin.rs
+      - src/lib.rs
+      - scripts/bridgebin_benchmark.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - scripts/split_zymo_references.py
+      - .github/workflows/bridgebin-v2-signed-evidence.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate and build
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings -A clippy::field-reassign-with-default -A clippy::unnecessary-sort-by
+          cargo test --all-targets --all-features
+          cargo build --release --bin bridgebin
+          python3 -m py_compile scripts/bridgebin_benchmark.py scripts/bridgebin_zymo_reference_benchmark.py scripts/split_zymo_references.py
+
+      - name: Prepare Zymo reference benchmark
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/bridgebin_v2 \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+
+      - name: Run v0 v1 and v2
+        run: |
+          set -euo pipefail
+          base='benchmark/bridgebin_v2'
+          run_one () {
+            tag="$1"; shift
+            /usr/bin/time -v -o "$base/$tag.runtime.txt" \
+              target/release/bridgebin \
+                --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+                --out-dir "$base/$tag" "$@" \
+                >"$base/$tag.log" 2>&1
+            python3 scripts/bridgebin_benchmark.py evaluate \
+              --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+              --assignments "$base/$tag/assignments.tsv" --abundance "$base/$tag/abundance.tsv" \
+              --output "$base/$tag.metrics.json" >/dev/null
+          }
+
+          run_one v0 --algorithm v0
+          run_one v1 --algorithm v1
+          run_one v2_default --algorithm v2
+          run_one v2_purity --algorithm v2 \
+            --v2-core-attraction 0.84 --v2-component-attraction 0.76 \
+            --v2-rescue-attraction 0.80 --v2-rescue-margin 0.07
+          run_one v2_recall --algorithm v2 \
+            --v2-core-attraction 0.77 --v2-component-attraction 0.69 \
+            --v2-rescue-attraction 0.73 --v2-rescue-margin 0.04
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('benchmark/bridgebin_v2')
+          rows=[]
+          for p in root.glob('*.metrics.json'):
+              m=json.loads(p.read_text())
+              rows.append((m['f1'], p.stem, m))
+          print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tdepth_mape\trel_abundance_mae')
+          for _, name, m in sorted(rows, reverse=True):
+              print(f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t{m['depth_mape']:.6f}\t{m['relative_abundance_mae']:.6f}")
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v2-signed-evidence
+          path: benchmark/bridgebin_v2
+          retention-days: 14
