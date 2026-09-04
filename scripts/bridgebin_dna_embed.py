@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Extract orientation-robust DNA foundation-model embeddings for BridgeBin.
 
-The default model is a Hugging Face DNABERT-S implementation, but any AutoModel that
-returns ``last_hidden_state`` can be supplied. Long contigs are represented by overlapping
-windows; each window is encoded in both forward and reverse-complement orientation and
-the two pooled embeddings are averaged. The resulting per-window TSV is consumed by
+The default model is ``multimolecule/dnaberts``. MultiMolecule-hosted models are loaded
+through their native ``multimolecule.AutoModel/AutoTokenizer`` API; other models use the
+standard Transformers AutoModel interface. Long contigs are represented by overlapping
+windows; each window is encoded in both forward and reverse-complement orientation and the
+two pooled embeddings are averaged. The resulting per-window TSV is consumed by
 ``bridgebin_bio_features.py --dna-embeddings``.
 
-Optional dependencies: torch, transformers.
+Optional dependencies:
+  default DNABERT-S:  pip install torch multimolecule
+  generic HF model:  pip install torch transformers
 """
 
 from __future__ import annotations
@@ -32,7 +35,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-window-bp", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="allow custom Transformers code for non-MultiMolecule model repositories",
+    )
     return parser.parse_args(argv)
 
 
@@ -82,9 +89,8 @@ def windows(sequence: str, window_bp: int, stride_bp: int, min_window_bp: int):
 def load_runtime(model_name: str, requested_device: str, trust_remote_code: bool):
     try:
         import torch
-        from transformers import AutoModel, AutoTokenizer
     except ImportError as error:  # pragma: no cover - optional dependency
-        raise RuntimeError("install optional dependencies: pip install torch transformers") from error
+        raise RuntimeError("install the optional runtime with: pip install torch") from error
 
     device = (
         "cuda"
@@ -93,22 +99,46 @@ def load_runtime(model_name: str, requested_device: str, trust_remote_code: bool
         if requested_device == "auto"
         else requested_device
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+
+    if model_name.startswith("multimolecule/"):
+        try:
+            from multimolecule import AutoModel, AutoTokenizer
+        except ImportError as error:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "MultiMolecule DNABERT models require: pip install torch multimolecule"
+            ) from error
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        backend = "multimolecule"
+    else:
+        try:
+            from transformers import AutoModel, AutoTokenizer
+        except ImportError as error:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "generic DNA models require: pip install torch transformers"
+            ) from error
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=trust_remote_code
+        )
+        model = AutoModel.from_pretrained(
+            model_name, trust_remote_code=trust_remote_code
+        )
+        backend = "transformers"
+
     model.to(device)
     model.eval()
-    return torch, tokenizer, model, device
+    return torch, tokenizer, model, device, backend
 
 
 def mean_pool(hidden, attention_mask, torch):
     mask = attention_mask.clone()
     if mask.shape[1] > 0:
-        mask[:, 0] = 0  # CLS/BOS
+        mask[:, 0] = 0  # exclude CLS/BOS when present
     lengths = attention_mask.sum(dim=1)
     for row, length in enumerate(lengths.tolist()):
-        sep = int(length) - 1
-        if 0 <= sep < mask.shape[1]:
-            mask[row, sep] = 0
+        terminal = int(length) - 1
+        if 0 <= terminal < mask.shape[1]:
+            mask[row, terminal] = 0  # exclude terminal SEP/EOS when present
     weights = mask.unsqueeze(-1).to(hidden.dtype)
     summed = (hidden * weights).sum(dim=1)
     denom = weights.sum(dim=1).clamp_min(1.0)
@@ -116,7 +146,7 @@ def mean_pool(hidden, attention_mask, torch):
 
 
 def encode_sequences(sequences: Sequence[str], runtime, max_tokens: int):
-    torch, tokenizer, model, device = runtime
+    torch, tokenizer, model, device, _backend = runtime
     encoded = tokenizer(
         list(sequences),
         return_tensors="pt",
@@ -124,6 +154,8 @@ def encode_sequences(sequences: Sequence[str], runtime, max_tokens: int):
         truncation=True,
         max_length=max_tokens,
     )
+    if "attention_mask" not in encoded:
+        encoded["attention_mask"] = torch.ones_like(encoded["input_ids"])
     encoded = {key: value.to(device) for key, value in encoded.items()}
     with torch.no_grad():
         output = model(**encoded)
@@ -151,7 +183,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     runtime = load_runtime(args.model, args.device, args.trust_remote_code)
     records = []
     for contig, sequence in read_fasta(args.contigs):
-        for serial, piece in windows(sequence, args.window_bp, args.stride_bp, args.min_window_bp):
+        for serial, piece in windows(
+            sequence, args.window_bp, args.stride_bp, args.min_window_bp
+        ):
             records.append((contig, serial, piece))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +211,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ]
                 )
                 written += 1
-    print(f"bridgebin-dna: windows={written} contigs={len({c for c, _, _ in records})} model={args.model}")
+    backend = runtime[-1]
+    print(
+        f"bridgebin-dna: windows={written} contigs={len({c for c, _, _ in records})} "
+        f"model={args.model} backend={backend}"
+    )
     return 0
 
 
