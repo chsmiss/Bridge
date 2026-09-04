@@ -5,7 +5,7 @@ on:
     branches:
       - codex/bridgebin-v2-signed-evidence
     paths:
-      - src/bin/bridgebin_v21.rs
+      - src/bin/bridgebin-v21.rs
       - src/bridgebin_v21.rs
       - src/bridgebin_v21_merge.rs
       - scripts/bridgebin_pair_oracle_fixture.py
@@ -32,7 +32,7 @@ jobs:
           cargo fmt --all
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::field-reassign-with-default -A clippy::unnecessary-sort-by
           cargo test --all-targets --all-features -- --skip bridgebin_reconcile::tests::reciprocal_reconciliation_merges_split_signatures
-          cargo build --release --bin bridgebin --bin bridgebin_v21
+          cargo build --release --bin bridgebin --bin bridgebin-v21
           python3 -m py_compile scripts/bridgebin_pair_oracle_fixture.py scripts/bridgebin_benchmark.py scripts/bridgebin_zymo_reference_benchmark.py scripts/split_zymo_references.py
 
       - name: Prepare Zymo fixture
@@ -58,10 +58,10 @@ jobs:
           target/release/bridgebin \
             --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
             --out-dir "$base/v2" --algorithm v2 \
-            --v2-core-attraction 0.75 --v2-component-attraction 0.67 \
-            --v2-rescue-attraction 0.70 --v2-rescue-margin 0.03 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
             >"$base/v2.log" 2>&1
-          target/release/bridgebin_v21 \
+          target/release/bridgebin-v21 \
             --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
             --pair-scores "$base/oracle_pair_scores.tsv" \
             --out-dir "$base/v21_oracle" \
