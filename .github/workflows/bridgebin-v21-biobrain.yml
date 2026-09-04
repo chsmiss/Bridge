@@ -15,6 +15,9 @@ on:
       - scripts/bridgebin_bio_features.py
       - scripts/bridgebin_esmc_embed.py
       - scripts/bridgebin_dna_embed.py
+      - scripts/bridgebin_generanno_cds.py
+      - scripts/bridgebin_protein_repertoire.py
+      - scripts/bridgebin_join_features.py
       - scripts/bridgebin_benchmark.py
       - scripts/bridgebin_zymo_reference_benchmark.py
       - scripts/split_zymo_references.py
@@ -49,7 +52,70 @@ jobs:
             scripts/bridgebin_make_pair_dataset.py \
             scripts/bridgebin_bio_features.py \
             scripts/bridgebin_esmc_embed.py \
-            scripts/bridgebin_dna_embed.py
+            scripts/bridgebin_dna_embed.py \
+            scripts/bridgebin_generanno_cds.py \
+            scripts/bridgebin_protein_repertoire.py \
+            scripts/bridgebin_join_features.py
+
+      - name: Smoke Biological Brain feature join and pair head
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bridgebin-biobrain-smoke
+          cat > /tmp/bridgebin-biobrain-smoke/base.tsv <<'TSV'
+          contig	dna_embedding	dna_confidence	gene_profile	gene_confidence	esm_embedding	protein_confidence	taxonomy	taxonomy_confidence
+          a1	1,0,0	1	1,0	1	1,0	1	Bacteria;Alpha	1
+          a2	0.98,0.02,0	1	0.95,0.05	1	0.98,0.02	1	Bacteria;Alpha	1
+          b1	0,1,0	1	0,1	1	0,1	1	Bacteria;Beta	1
+          b2	0.02,0.98,0	1	0.05,0.95	1	0.02,0.98	1	Bacteria;Beta	1
+          c1	0,0,1	1	0.5,0.5	1	0.5,0.5	1	Bacteria;Gamma	1
+          c2	0.01,0,0.99	1	0.52,0.48	1	0.48,0.52	1	Bacteria;Gamma	1
+          TSV
+          cat > /tmp/bridgebin-biobrain-smoke/architecture.tsv <<'TSV'
+          contig	gene_architecture	architecture_confidence
+          a1	1,0	1
+          a2	0.99,0.01	1
+          b1	0,1	1
+          b2	0.01,0.99	1
+          c1	0.5,0.5	1
+          c2	0.52,0.48	1
+          TSV
+          cat > /tmp/bridgebin-biobrain-smoke/repertoire.tsv <<'TSV'
+          contig	protein_repertoire	repertoire_confidence
+          a1	1,0,0	1
+          a2	0.95,0.05,0	1
+          b1	0,1,0	1
+          b2	0.05,0.95,0	1
+          c1	0,0,1	1
+          c2	0.01,0,0.99	1
+          TSV
+          python3 scripts/bridgebin_join_features.py \
+            --input /tmp/bridgebin-biobrain-smoke/base.tsv \
+            --input /tmp/bridgebin-biobrain-smoke/architecture.tsv \
+            --input /tmp/bridgebin-biobrain-smoke/repertoire.tsv \
+            --output /tmp/bridgebin-biobrain-smoke/features.tsv
+          cat > /tmp/bridgebin-biobrain-smoke/pairs.tsv <<'TSV'
+          left	right	label	left_genome	right_genome	coverage_similarity	composition_similarity	gc_similarity	physical_support
+          a1	a2	1	A	A	0.99	0.95	0.99	0.8
+          b1	b2	1	B	B	0.99	0.95	0.99	0.8
+          c1	c2	1	C	C	0.99	0.70	0.99	0.5
+          a1	b1	0	A	B	0.99	0.90	0.99	0
+          a2	b2	0	A	B	0.99	0.90	0.99	0
+          a1	c1	0	A	C	0.80	0.60	0.90	0
+          b1	c1	0	B	C	0.80	0.60	0.90	0
+          a2	c2	0	A	C	0.80	0.60	0.90	0
+          b2	c2	0	B	C	0.80	0.60	0.90	0
+          TSV
+          python3 scripts/bridgebin_pair_head.py train \
+            --features /tmp/bridgebin-biobrain-smoke/features.tsv \
+            --pairs /tmp/bridgebin-biobrain-smoke/pairs.tsv \
+            --model-out /tmp/bridgebin-biobrain-smoke/model.json \
+            --validation-fraction 0.34 --epochs 80 --precision-target 0.90
+          python3 scripts/bridgebin_pair_head.py score \
+            --features /tmp/bridgebin-biobrain-smoke/features.tsv \
+            --pairs /tmp/bridgebin-biobrain-smoke/pairs.tsv \
+            --model /tmp/bridgebin-biobrain-smoke/model.json \
+            --output /tmp/bridgebin-biobrain-smoke/scores.tsv
+          test -s /tmp/bridgebin-biobrain-smoke/scores.tsv
 
       - name: Prepare real Zymo reference-fragment fixture
         run: |
@@ -96,7 +162,6 @@ jobs:
             --out-dir "$base/v21_no_pair" \
             >"$base/v21_no_pair.log" 2>&1
 
-          # Disable cross-bin merging to preserve the previous oracle-interface result.
           target/release/bridgebin-v21 \
             --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
             --pair-scores "$base/oracle_pair_scores.tsv" \
@@ -105,7 +170,6 @@ jobs:
             --v21-bin-merge-min-support 1000000 \
             >"$base/v21_oracle_no_merge.log" 2>&1
 
-          # Same pair evidence, now allowing only multi-supported, veto-aware bin merges.
           target/release/bridgebin-v21 \
             --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
             --pair-scores "$base/oracle_pair_scores.tsv" \
@@ -140,7 +204,6 @@ jobs:
           for key in ('weighted_purity', 'bp_recall', 'f1', 'ari', 'bp_binned_fraction'):
               if abs(a[key] - b[key]) > 1e-9:
                   raise SystemExit(f'neutral v2.1 refiner changed {key}: {a[key]} vs {b[key]}')
-          # Cross-bin consolidation must never lower oracle purity/HQ in this plumbing test.
           before, after = metrics['v21_oracle_no_merge'], metrics['v21_oracle_merge']
           if after['weighted_purity'] + 1e-9 < before['weighted_purity']:
               raise SystemExit('constrained bin merge reduced oracle purity')
