@@ -224,10 +224,10 @@ fn prepartition_initial(
         let (Some(&a), Some(&b)) = (by_id.get(left.as_str()), by_id.get(right.as_str())) else {
             return true;
         };
-        match (new_bin_of[a], new_bin_of[b]) {
-            (Some(left_bin), Some(right_bin)) if left_bin == right_bin => false,
-            _ => true,
-        }
+        !matches!(
+            (new_bin_of[a], new_bin_of[b]),
+            (Some(left_bin), Some(right_bin)) if left_bin == right_bin
+        )
     });
 
     (initial, filtered_scores, prep)
