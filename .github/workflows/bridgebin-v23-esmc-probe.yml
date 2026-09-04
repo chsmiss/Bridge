@@ -1,0 +1,120 @@
+name: BridgeBin v2.3 ESM-C protein identity probe
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_predict_orfs.py
+      - scripts/bridgebin_esmc_embed.py
+      - scripts/bridgebin_bio_features.py
+      - .github/workflows/bridgebin-v23-esmc-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  esmc-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install ESM-C CPU runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install esm pyrodigal
+          python -m py_compile scripts/bridgebin_predict_orfs.py scripts/bridgebin_esmc_embed.py
+      - name: Build a small independent Zymo protein panel
+        run: |
+          set -euo pipefail
+          base=benchmark/v23_esmc
+          mkdir -p "$base"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$base/full" \
+            --seed 43 --min-fragment 5000 --max-fragment 8500 --min-contig 1500
+          python - <<'PY'
+          import csv
+          from collections import defaultdict
+          from pathlib import Path
+          src=Path('benchmark/v23_esmc/full'); out=Path('benchmark/v23_esmc/panel'); out.mkdir(parents=True,exist_ok=True)
+          truth=list(csv.DictReader((src/'truth.tsv').open(),delimiter='\t'))
+          groups=defaultdict(list)
+          for row in truth:
+              if int(row['eligible']): groups[row['genome']].append(row)
+          chosen=[]
+          for genome,rs in sorted(groups.items()):
+              rs.sort(key=lambda x:(-int(x['length']),x['contig']))
+              chosen.extend(rs[:2])
+          ids={row['contig'] for row in chosen}
+          seq={}; name=None; chunks=[]
+          for raw in (src/'contigs.fa').read_text().splitlines():
+              if raw.startswith('>'):
+                  if name is not None: seq[name]=''.join(chunks)
+                  name=raw[1:].split()[0]; chunks=[]
+              else: chunks.append(raw.strip())
+          if name is not None: seq[name]=''.join(chunks)
+          with (out/'contigs.fa').open('w') as h:
+              for cid in sorted(ids):
+                  h.write(f'>{cid}\n'); s=seq[cid]
+                  for i in range(0,len(s),80): h.write(s[i:i+80]+'\n')
+          fields=['contig','genome','length','eligible','record','start','end']
+          with (out/'truth.tsv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=fields,delimiter='\t'); w.writeheader(); w.writerows(sorted(chosen,key=lambda x:x['contig']))
+          print('protein_panel',len(chosen),'genomes',len(groups))
+          PY
+      - name: Predict sparse ORFs and embed with ESM-C 300M
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+        run: |
+          set -euo pipefail
+          p=benchmark/v23_esmc/panel
+          python scripts/bridgebin_predict_orfs.py \
+            --contigs "$p/contigs.fa" --output-faa "$p/proteins.faa" --mapping "$p/protein_map.tsv" \
+            --min-aa 70 --max-proteins-per-contig 3
+          python scripts/bridgebin_esmc_embed.py \
+            --proteins "$p/proteins.faa" --mapping "$p/protein_map.tsv" --output "$p/esmc.tsv" \
+            --model biohub/ESMC-300M --device cpu --batch-size 1 --max-aa 512 --truncate
+          python scripts/bridgebin_bio_features.py \
+            --protein-embeddings "$p/esmc.tsv" --output "$p/features.tsv"
+      - name: Evaluate raw protein identity geometry
+        run: |
+          python - <<'PY'
+          import csv,json,math
+          from pathlib import Path
+          p=Path('benchmark/v23_esmc/panel')
+          truth={r['contig']:r['genome'] for r in csv.DictReader((p/'truth.tsv').open(),delimiter='\t')}
+          features={}
+          for r in csv.DictReader((p/'features.tsv').open(),delimiter='\t'):
+              raw=r.get('esm_embedding','')
+              if raw and raw!='.': features[r['contig']]=[float(x) for x in raw.split(',')]
+          def cos(a,b):
+              dot=sum(x*y for x,y in zip(a,b)); na=math.sqrt(sum(x*x for x in a)); nb=math.sqrt(sum(y*y for y in b)); return dot/max(1e-12,na*nb)
+          scored=[]; names=sorted(features)
+          for i,a in enumerate(names):
+              for b in names[i+1:]: scored.append((cos(features[a],features[b]),int(truth[a]==truth[b]),a,b))
+          pos=[s for s,l,*_ in scored if l]; neg=[s for s,l,*_ in scored if not l]
+          wins=sum(1 if a>b else 0.5 if a==b else 0 for a in pos for b in neg)
+          auc=wins/max(1,len(pos)*len(neg))
+          median=lambda xs: sorted(xs)[len(xs)//2] if xs else float('nan')
+          hard=[s for s,l,a,b in scored if not l and {truth[a],truth[b]}=={'Escherichia_coli','Salmonella_enterica'}]
+          metrics={'contigs':len(features),'positive_pairs':len(pos),'negative_pairs':len(neg),'auc':auc,'same_median':median(pos),'different_median':median(neg),'ecoli_salmonella_median':median(hard)}
+          (p/'esmc_probe.metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(metrics,sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bridgebin-v23-esmc-probe
+          path: benchmark/v23_esmc
+          retention-days: 14
