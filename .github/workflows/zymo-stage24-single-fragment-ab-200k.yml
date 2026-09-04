@@ -1,0 +1,248 @@
+name: Zymo 200k Stage24 one-pair singleton A-B
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage24-single-fragment-ab-200k.yml
+      - scripts/stage23_guided_singleton_rescue.py
+      - scripts/test_stage23_guided_singleton_rescue.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage24-single-fragment-ab-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile scripts/stage23_guided_singleton_rescue.py scripts/test_stage23_guided_singleton_rescue.py
+          PYTHONPATH=scripts python3 scripts/test_stage23_guided_singleton_rescue.py
+          PYTHONPATH=scripts python3 - <<'PY'
+          from scripts.test_stage23_guided_singleton_rescue import synthetic_case
+          import stage23_guided_singleton_rescue as s23
+          k, record, nodes, _edges, observations, fragments, quality_sum, supporters, edge_fragments = synthetic_case()
+          supporters[nodes[8]] = 101
+          segments, rescued, stats = s23.select_guided_segments(
+              [record], k=k, observations=observations, fragment_count=fragments,
+              quality_sum=quality_sum, singleton_supporter=supporters,
+              edge_fragments=edge_fragments, singleton_quality=30.0,
+              min_distinct_singleton_fragments=1)
+          assert len(segments) == 1
+          assert stats['selected_segments'] == 1
+          assert len(segments[0].singleton_fragments) == 1
+          print('stage24 min1 synthetic gate: passed')
+          PY
+          cargo build --release
+
+      - name: Build fixed Stage8 and Stage10 once
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/current \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/current \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 3 \
+            --lookahead-max-branch 4
+          /usr/bin/time -v -o benchmark/stage10.time.txt \
+            python3 scripts/stage10_multik_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" --ks 17,21,25,31
+          cp benchmark/current/stage10_multik_rescue/candidate_multik_strict/primary_contigs.fasta \
+             benchmark/assemblies/bridge_stage10.fasta
+
+      - name: Run pair2 control
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/pair2.time.txt \
+            python3 scripts/stage23_guided_singleton_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" \
+              --singleton-quality 30 \
+              --min-distinct-singleton-fragments 2
+          mv benchmark/current/stage23_guided_singleton benchmark/current/stage24_pair2
+          cp benchmark/current/stage24_pair2/guided_k31_primary.fasta benchmark/assemblies/bridge_pair2_guided_k31.fasta
+          cp benchmark/current/stage24_pair2/candidate_guided_singleton/primary_contigs.fasta benchmark/assemblies/bridge_pair2_final.fasta
+          cp benchmark/current/stage24_pair2/stage23_stats.json benchmark/pair2_stats.json
+
+      - name: Run pair1 treatment
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/pair1.time.txt \
+            python3 scripts/stage23_guided_singleton_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" \
+              --singleton-quality 30 \
+              --min-distinct-singleton-fragments 1
+          mv benchmark/current/stage23_guided_singleton benchmark/current/stage24_pair1
+          cp benchmark/current/stage24_pair1/guided_k31_primary.fasta benchmark/assemblies/bridge_pair1_guided_k31.fasta
+          cp benchmark/current/stage24_pair1/candidate_guided_singleton/primary_contigs.fasta benchmark/assemblies/bridge_pair1_final.fasta
+          cp benchmark/current/stage24_pair1/stage23_stats.json benchmark/pair1_stats.json
+
+      - name: Quantify newly admitted one-pair segments
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+          def headers(path):
+              rows=[]
+              for line in Path(path).read_text().splitlines():
+                  if not line.startswith('>'): continue
+                  m=re.search(r'singleton_fragments=(\d+)', line)
+                  if m: rows.append(int(m.group(1)))
+              return rows
+          p2=json.loads(Path('benchmark/pair2_stats.json').read_text())
+          p1=json.loads(Path('benchmark/pair1_stats.json').read_text())
+          h2=headers('benchmark/current/stage24_pair2/guided_segments.fasta')
+          h1=headers('benchmark/current/stage24_pair1/guided_segments.fasta')
+          with Path('benchmark/stage24_gate_effect.tsv').open('w') as out:
+              out.write('metric\tpair2\tpair1\tdelta\n')
+              metrics=[
+                  ('selected_segments',p2['selection']['selected_segments'],p1['selection']['selected_segments']),
+                  ('selected_bases',p2['selection']['selected_bases'],p1['selection']['selected_bases']),
+                  ('selected_singleton_keys',p2['selection']['selected_singleton_keys'],p1['selection']['selected_singleton_keys']),
+                  ('selected_singleton_physical_fragments',p2['selection']['selected_singleton_physical_fragments'],p1['selection']['selected_singleton_physical_fragments']),
+                  ('rejected_single_fragment',p2['selection']['rejected_single_fragment'],p1['selection']['rejected_single_fragment']),
+                  ('selected_output_records',p2['additions']['selected_output_records'],p1['additions']['selected_output_records']),
+                  ('selected_output_bases',p2['additions']['selected_output_bases'],p1['additions']['selected_output_bases']),
+                  ('segments_with_exactly_1_fragment',sum(x==1 for x in h2),sum(x==1 for x in h1)),
+                  ('segments_with_ge2_fragments',sum(x>=2 for x in h2),sum(x>=2 for x in h1)),
+              ]
+              for name,a,b in metrics:
+                  out.write(f'{name}\t{a}\t{b}\t{b-a:+}\n')
+          print(Path('benchmark/stage24_gate_effect.tsv').read_text())
+          PY
+
+      - name: FASTA stats
+        run: |
+          for f in benchmark/assemblies/*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run combined-reference MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_stage10.fasta \
+            benchmark/assemblies/bridge_pair2_guided_k31.fasta \
+            benchmark/assemblies/bridge_pair2_final.fasta \
+            benchmark/assemblies/bridge_pair1_guided_k31.fasta \
+            benchmark/assemblies/bridge_pair1_final.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Run per-bacterium QUAST
+        run: |
+          set -euo pipefail
+          assemblies=(benchmark/assemblies/bridge_stage10.fasta benchmark/assemblies/bridge_pair2_final.fasta benchmark/assemblies/bridge_pair1_final.fasta)
+          for ref in /tmp/zymo-species-refs/{Bacillus_subtilis,Enterococcus_faecalis,Escherichia_coli,Lactobacillus_fermentum,Listeria_monocytogenes,Pseudomonas_aeruginosa,Salmonella_enterica,Staphylococcus_aureus}.fasta; do
+            species="$(basename "$ref" .fasta)"
+            python3 /tmp/quast-5.3.0/quast.py "${assemblies[@]}" -r "$ref" \
+              -o "benchmark/species_quast/$species" --threads "$THREADS" --min-contig 200 --no-plots
+          done
+          python3 scripts/summarize_species_quast.py benchmark/species_quast \
+            --json benchmark/species_summary.json | tee benchmark/species_summary.tsv
+
+      - name: Summarize one-pair effect without metric gates
+        run: |
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          def rows(path):
+              with Path(path).open() as h: return list(csv.DictReader(h,delimiter='\t'))
+          meta={r['Assembly']:r for r in rows('benchmark/metaquast_summary.tsv')}
+          species={r['assembly']:r for r in rows('benchmark/species_summary.tsv')}
+          names=['bridge_stage10','bridge_pair2_final','bridge_pair1_final']
+          p=Path('benchmark/stage24_comparison.tsv')
+          with p.open('w') as out:
+              out.write('assembly\tmean_gf\tpseudomonas_gf\tcombined_gf\tna50\tdup\tmisassemblies\tlocal_misassemblies\n')
+              for name in names:
+                  m=meta[name]; sp=species[name]
+                  out.write(f'{name}\t{float(sp["bacteria_mean_gf"]):.4f}\t{float(sp["pseudomonas_gf"]):.4f}\t{float(m["Genome fraction (%)"]):.4f}\t{float(m["NA50"]):.1f}\t{float(m["Duplication ratio"]):.4f}\t{int(float(m["# misassemblies"]))}\t{int(float(m["# local misassemblies"]))}\n')
+          print(p.read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nexperiment\tStage23 distinct physical singleton fragments 2 versus 1\nselection_policy\troot_cause_ab_no_metric_targets\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage24-single-fragment-ab-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/current/stage24_pair2/stage23_stats.json
+            benchmark/current/stage24_pair2/guided_segments.fasta
+            benchmark/current/stage24_pair2/guided_additions.fasta
+            benchmark/current/stage24_pair1/stage23_stats.json
+            benchmark/current/stage24_pair1/guided_segments.fasta
+            benchmark/current/stage24_pair1/guided_additions.fasta
