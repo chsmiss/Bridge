@@ -1,0 +1,73 @@
+name: BridgeBin one-off focused expansion patch
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - .github/workflows/bridgebin-oneoff-focused-expansion.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgebin-v2-signed-evidence
+      - name: Add conflicted-bin focused candidate expansion
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/bridgebin_candidate_pairs.py')
+          s=p.read_text()
+          old='''    parser.add_argument("--max-pairs", type=int, default=250000)\n    parser.add_argument(\n        "--probe-only",\n'''
+          new='''    parser.add_argument("--max-pairs", type=int, default=250000)\n    parser.add_argument(\n        "--focus-bins",\n        type=Path,\n        help=(\n            "optional TSV/text file of bin IDs; per-member within-bin expansion is limited "\n            "to these bins while anchor probes remain global"\n        ),\n    )\n    parser.add_argument(\n        "--skip-residual-rescue",\n        action="store_true",\n        help="omit residual-to-bin candidate expansion in this pass",\n    )\n    parser.add_argument(\n        "--probe-only",\n'''
+          if old not in s:
+              raise SystemExit('parser insertion point not found')
+          s=s.replace(old,new,1)
+
+          marker='''def base_code(base: str) -> Optional[int]:\n'''
+          helper='''def read_focus_bins(path: Optional[Path]) -> Optional[Set[str]]:\n    if path is None:\n        return None\n    bins: Set[str] = set()\n    with path.open("r", encoding="utf-8", newline="") as handle:\n        first_line = handle.readline()\n        if not first_line:\n            return bins\n        fields = first_line.rstrip("\\n").split("\\t")\n        if fields and fields[0].strip().lower() in {"bin", "bin_id", "cluster"}:\n            for raw in handle:\n                value = raw.rstrip("\\n").split("\\t", 1)[0].strip()\n                if value:\n                    bins.add(value)\n        else:\n            value = fields[0].strip() if fields else ""\n            if value:\n                bins.add(value)\n            for raw in handle:\n                value = raw.rstrip("\\n").split("\\t", 1)[0].strip()\n                if value:\n                    bins.add(value)\n    return bins\n\n\n'''
+          if marker not in s:
+              raise SystemExit('focus helper marker not found')
+          s=s.replace(marker,helper+marker,1)
+
+          old='''    records: Dict[Tuple[str, str], PairRecord] = {}\n\n    # Probe every current bin for hidden mixtures. Anchor all-vs-all ensures a mixed bin\n'''
+          new='''    records: Dict[Tuple[str, str], PairRecord] = {}\n    focus_bins = read_focus_bins(args.focus_bins)\n\n    # Probe every current bin for hidden mixtures. Anchor all-vs-all ensures a mixed bin\n'''
+          if old not in s:
+              raise SystemExit('focus init point not found')
+          s=s.replace(old,new,1)
+
+          old='''        if not args.probe_only:\n            for member in members:\n'''
+          new='''        if not args.probe_only and (focus_bins is None or bin_name in focus_bins):\n            for member in members:\n'''
+          if old not in s:
+              raise SystemExit('member expansion guard not found')
+          s=s.replace(old,new,1)
+
+          old='''    if not args.probe_only:\n        for residual in sorted(residuals, key=lambda feature: (-feature.length, feature.contig)):\n'''
+          new='''    if not args.probe_only and not args.skip_residual_rescue:\n        for residual in sorted(residuals, key=lambda feature: (-feature.length, feature.contig)):\n'''
+          if old not in s:
+              raise SystemExit('residual guard not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          python3 -m py_compile scripts/bridgebin_candidate_pairs.py scripts/bridgebin_detect_conflicts.py
+          python3 - <<'PY'
+          import tempfile, sys
+          from pathlib import Path
+          sys.path.insert(0,'scripts')
+          import bridgebin_candidate_pairs as m
+          with tempfile.TemporaryDirectory() as td:
+              p=Path(td)/'bins.tsv'
+              p.write_text('bin\thard_pairs\nbin_A\t3\nbin_B\t5\n')
+              assert m.read_focus_bins(p) == {'bin_A','bin_B'}
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/bridgebin_candidate_pairs.py scripts/bridgebin_detect_conflicts.py
+          git commit -m 'feat(bridgebin): focus second-pass candidates on conflicted bins'
+          git push origin HEAD:codex/bridgebin-v2-signed-evidence
