@@ -1,0 +1,98 @@
+name: BridgeBin Biological Brain candidate recall
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_eval_candidates.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - scripts/split_zymo_references.py
+      - src/bridgebin_v2_signed.rs
+      - src/bin/bridgebin.rs
+      - .github/workflows/bridgebin-candidate-recall.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recall:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build signed core and validate scripts
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin
+          python3 -m py_compile \
+            scripts/bridgebin_candidate_pairs.py \
+            scripts/bridgebin_eval_candidates.py \
+            scripts/bridgebin_zymo_reference_benchmark.py \
+            scripts/split_zymo_references.py
+
+      - name: Prepare deterministic real-Zymo fragment benchmark
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/candidate_recall \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+
+      - name: Run v2-balanced and truth-free candidate mining
+        run: |
+          set -euo pipefail
+          base='benchmark/candidate_recall'
+          target/release/bridgebin \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --out-dir "$base/v2_balanced" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
+            >"$base/v2_balanced.log" 2>&1
+          python3 scripts/bridgebin_candidate_pairs.py \
+            --contigs "$base/contigs.fa" \
+            --coverage "$base/coverage.tsv" \
+            --assignments "$base/v2_balanced/assignments.tsv" \
+            --output "$base/candidate_pairs.tsv" \
+            --min-length 1000 --anchors-per-bin 10 \
+            --max-pairs 250000 \
+            | tee "$base/candidate_miner.log"
+
+      - name: Evaluate candidate exposure with truth only after mining
+        run: |
+          set -euo pipefail
+          base='benchmark/candidate_recall'
+          python3 scripts/bridgebin_eval_candidates.py \
+            --truth "$base/truth.tsv" \
+            --assignments "$base/v2_balanced/assignments.tsv" \
+            --candidates "$base/candidate_pairs.tsv" \
+            --output "$base/candidate_recall_metrics.json"
+          cat "$base/candidate_recall_metrics.json"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m=json.loads(Path('benchmark/candidate_recall/candidate_recall_metrics.json').read_text())
+          for key in ('mixed_bin_exposure_recall','fragmented_genome_exposure_recall','residual_exposure_recall'):
+              value=m[key]
+              if value is None or value < 0.99:
+                  raise SystemExit(f'{key} below 0.99: {value}')
+          if m['candidate_pairs'] > 250000:
+              raise SystemExit('candidate budget exceeded')
+          PY
+
+      - name: Upload candidate-recall artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-candidate-recall
+          path: benchmark/candidate_recall
+          retention-days: 14
