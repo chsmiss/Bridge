@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Train or run BridgeBin's multimodal same-genome pair head.
 
-The expensive foundation models stay outside Rust.  This script consumes contig-level
+The expensive foundation models stay outside Rust. This script consumes contig-level
 embeddings/features and learns the actual decision BridgeBin needs:
 
     P(contig A and contig B originate from the same genome)
 
-Training deliberately supports asymmetric false-merge cost and reports conservative
-positive/negative thresholds on a held-out split.  It has no sklearn dependency so that
-the pair head can be audited and reproduced in minimal environments.
+Training supports asymmetric false-merge cost and conservative held-out calibration.
+When pair rows contain genome/group columns, validation holds out whole genomes: every
+pair touching a held-out genome is excluded from training. This avoids the common but
+serious leakage caused by putting contigs from one genome in both train and validation.
+If no group metadata is available the script falls back to deterministic pair splitting
+and records that weaker protocol in the model metadata.
 
 Feature TSV columns are header-based. Supported biological fields include:
   dna_embedding / dna_lm_embedding / dnabert_embedding
@@ -18,8 +21,9 @@ Feature TSV columns are header-based. Supported biological fields include:
 
 Pair TSVs require left/right IDs. Training additionally requires label (0/1). Optional
 cheap/physical columns are coverage_similarity, composition_similarity, gc_similarity,
-and physical_support. Missing modalities are represented explicitly rather than silently
-being treated as zero similarity.
+and physical_support. For leakage-safe validation use left_genome/right_genome (aliases
+left_group/right_group, genome_left/genome_right, source_genome/target_genome).
+Missing modalities are represented explicitly rather than silently treated as similarity.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 BIO_FEATURES = ("dna", "gene", "protein", "taxonomy")
@@ -60,6 +64,8 @@ class Example:
     right: str
     features: List[float]
     label: Optional[int]
+    left_group: str = ""
+    right_group: str = ""
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -77,6 +83,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     train.add_argument("--negative-weight", type=float, default=3.0)
     train.add_argument("--precision-target", type=float, default=0.995)
     train.add_argument("--seed", type=int, default=43)
+    train.add_argument(
+        "--require-group-holdout",
+        action="store_true",
+        help="fail instead of pair-splitting if genome/group columns are absent",
+    )
 
     score = sub.add_parser("score", help="score candidate pairs with a trained head")
     score.add_argument("--features", type=Path, required=True)
@@ -148,8 +159,7 @@ def read_contig_features(path: Path) -> Dict[str, ContigFeature]:
             ),
             taxonomy=first(row, ("taxonomy", "lineage", "taxon")),
             taxonomy_confidence=probability(
-                first(row, ("taxonomy_confidence", "tax_confidence", "tax_conf")),
-                0.0,
+                first(row, ("taxonomy_confidence", "tax_confidence", "tax_conf")), 0.0
             ),
         )
     return out
@@ -198,9 +208,7 @@ def optional_pair_value(row: Dict[str, str], names: Sequence[str]) -> Optional[f
 
 
 def make_features(
-    left: ContigFeature,
-    right: ContigFeature,
-    pair_row: Dict[str, str],
+    left: ContigFeature, right: ContigFeature, pair_row: Dict[str, str]
 ) -> List[float]:
     sims: Dict[str, Optional[float]] = {
         "dna": cosine(left.dna, right.dna),
@@ -226,29 +234,23 @@ def make_features(
         "gc": 1.0,
         "physical": 1.0,
     }
-    values = []
-    present = []
+    values: List[float] = []
+    present: List[float] = []
     for name in BIO_FEATURES + PAIR_FEATURES:
         value = sims[name]
         if value is None:
             values.append(0.0)
             present.append(0.0)
         else:
-            # Biological cosine may be negative. Map it to [0,1], then multiply by
-            # modality confidence so low-quality annotation cannot masquerade as evidence.
             normalized = (value + 1.0) * 0.5 if name in {"dna", "gene", "protein"} else value
             values.append(max(0.0, min(1.0, normalized)) * confidences[name])
             present.append(confidences[name])
     return values + present
 
 
-def read_examples(
-    feature_path: Path,
-    pair_path: Path,
-    require_label: bool,
-) -> List[Example]:
+def read_examples(feature_path: Path, pair_path: Path, require_label: bool) -> List[Example]:
     features = read_contig_features(feature_path)
-    examples = []
+    examples: List[Example] = []
     for row in rows(pair_path):
         left = first(row, ("left", "source", "contig_a", "contig1"))
         right = first(row, ("right", "target", "contig_b", "contig2"))
@@ -269,6 +271,12 @@ def read_examples(
                 right=right,
                 features=make_features(features[left], features[right], row),
                 label=label,
+                left_group=first(
+                    row, ("left_group", "left_genome", "genome_left", "source_genome")
+                ),
+                right_group=first(
+                    row, ("right_group", "right_genome", "genome_right", "target_genome")
+                ),
             )
         )
     if not examples:
@@ -276,11 +284,60 @@ def read_examples(
     return examples
 
 
-def deterministic_validation(example: Example, fraction: float, seed: int) -> bool:
-    key = "\0".join(sorted((example.left, example.right))) + f"\0{seed}"
-    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
-    unit = int.from_bytes(digest, "little") / float(2**64 - 1)
-    return unit < fraction
+def hash_unit(value: str, seed: int) -> float:
+    digest = hashlib.blake2b(f"{value}\0{seed}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little") / float(2**64 - 1)
+
+
+def pair_validation(example: Example, fraction: float, seed: int) -> bool:
+    return hash_unit("\0".join(sorted((example.left, example.right))), seed) < fraction
+
+
+def split_examples(
+    examples: Sequence[Example], fraction: float, seed: int, require_group_holdout: bool
+) -> Tuple[List[Example], List[Example], Dict[str, object]]:
+    grouped = [example for example in examples if example.left_group and example.right_group]
+    groups: Set[str] = {
+        group
+        for example in grouped
+        for group in (example.left_group, example.right_group)
+    }
+    if len(grouped) == len(examples) and len(groups) >= 3:
+        ordered_groups = sorted(groups, key=lambda group: (hash_unit(group, seed), group))
+        holdout_count = max(1, min(len(ordered_groups) - 2, round(len(ordered_groups) * fraction)))
+        validation_groups = set(ordered_groups[:holdout_count])
+        train = [
+            example
+            for example in examples
+            if example.left_group not in validation_groups
+            and example.right_group not in validation_groups
+        ]
+        valid = [
+            example
+            for example in examples
+            if example.left_group in validation_groups
+            or example.right_group in validation_groups
+        ]
+        protocol = {
+            "split_protocol": "whole_genome_holdout",
+            "validation_groups": sorted(validation_groups),
+            "all_groups": len(groups),
+        }
+    else:
+        if require_group_holdout:
+            raise ValueError(
+                "--require-group-holdout needs group metadata on every row and at least 3 groups"
+            )
+        train = [example for example in examples if not pair_validation(example, fraction, seed)]
+        valid = [example for example in examples if pair_validation(example, fraction, seed)]
+        protocol = {
+            "split_protocol": "pair_hash_fallback",
+            "validation_groups": [],
+            "all_groups": len(groups),
+        }
+    if not train or not valid:
+        raise ValueError("validation split produced empty train or validation set")
+    return train, valid, protocol
 
 
 def sigmoid(value: float) -> float:
@@ -303,11 +360,12 @@ def fit_standardizer(examples: Sequence[Example]) -> Tuple[List[float], List[flo
         for index, value in enumerate(example.features):
             variances[index] += (value - means[index]) ** 2
     scales = [math.sqrt(value / len(examples)) for value in variances]
-    scales = [value if value > 1e-8 else 1.0 for value in scales]
-    return means, scales
+    return means, [value if value > 1e-8 else 1.0 for value in scales]
 
 
-def standardized(values: Sequence[float], means: Sequence[float], scales: Sequence[float]) -> List[float]:
+def standardized(
+    values: Sequence[float], means: Sequence[float], scales: Sequence[float]
+) -> List[float]:
     return [(value - mean) / scale for value, mean, scale in zip(values, means, scales)]
 
 
@@ -317,20 +375,13 @@ def train_model(args: argparse.Namespace) -> int:
     if not 0.5 < args.precision_target < 1.0:
         raise ValueError("--precision-target must be in (0.5,1)")
     examples = read_examples(args.features, args.pairs, require_label=True)
-    train = [
-        example
-        for example in examples
-        if not deterministic_validation(example, args.validation_fraction, args.seed)
-    ]
-    valid = [
-        example
-        for example in examples
-        if deterministic_validation(example, args.validation_fraction, args.seed)
-    ]
-    if not train or not valid:
-        raise ValueError("deterministic split produced empty train or validation set")
+    train, valid, protocol = split_examples(
+        examples, args.validation_fraction, args.seed, args.require_group_holdout
+    )
     if len({example.label for example in train}) < 2:
         raise ValueError("training split needs both positive and negative labels")
+    if len({example.label for example in valid}) < 2:
+        raise ValueError("validation split needs both positive and negative labels")
 
     means, scales = fit_standardizer(train)
     weights = [0.0] * len(FEATURE_NAMES)
@@ -356,11 +407,10 @@ def train_model(args: argparse.Namespace) -> int:
             total_weight += sample_weight
         inv = 1.0 / max(total_weight, 1.0)
         for index in range(len(weights)):
-            grad = grad_w[index] * inv + args.l2 * weights[index]
-            weights[index] -= rate * grad
+            weights[index] -= rate * (grad_w[index] * inv + args.l2 * weights[index])
         bias -= rate * grad_b * inv
 
-    validation = []
+    validation: List[Tuple[float, int]] = []
     for example in valid:
         x = standardized(example.features, means, scales)
         probability_same = sigmoid(bias + sum(w * value for w, value in zip(weights, x)))
@@ -370,7 +420,7 @@ def train_model(args: argparse.Namespace) -> int:
     split_threshold = precision_threshold(validation, args.precision_target, positive=False)
     metrics = classification_metrics(validation, 0.5)
     model = {
-        "version": 1,
+        "version": 2,
         "feature_names": list(FEATURE_NAMES),
         "means": means,
         "scales": scales,
@@ -384,6 +434,7 @@ def train_model(args: argparse.Namespace) -> int:
             "recommended_join_min_same": join_threshold,
             "recommended_split_max_same": split_threshold,
             "validation_at_0_5": metrics,
+            **protocol,
         },
     }
     args.model_out.parent.mkdir(parents=True, exist_ok=True)
@@ -395,6 +446,7 @@ def train_model(args: argparse.Namespace) -> int:
                 "validation": len(valid),
                 "join_min_same": join_threshold,
                 "split_max_same": split_threshold,
+                **protocol,
                 **metrics,
             },
             sort_keys=True,
@@ -423,7 +475,9 @@ def precision_threshold(
     return best
 
 
-def classification_metrics(predictions: Sequence[Tuple[float, int]], threshold: float) -> Dict[str, float]:
+def classification_metrics(
+    predictions: Sequence[Tuple[float, int]], threshold: float
+) -> Dict[str, float]:
     tp = fp = tn = fn = 0
     for probability, label in predictions:
         pred = int(probability >= threshold)
@@ -438,7 +492,13 @@ def classification_metrics(predictions: Sequence[Tuple[float, int]], threshold: 
     precision = tp / max(1, tp + fp)
     recall = tp / max(1, tp + fn)
     specificity = tn / max(1, tn + fp)
-    return {"precision": precision, "recall": recall, "specificity": specificity}
+    false_merge_rate = fp / max(1, fp + tn)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "false_merge_rate": false_merge_rate,
+    }
 
 
 def score_model(args: argparse.Namespace) -> int:
@@ -458,7 +518,6 @@ def score_model(args: argparse.Namespace) -> int:
         for example in examples:
             x = standardized(example.features, means, scales)
             probability_same = sigmoid(bias + sum(w * value for w, value in zip(weights, x)))
-            # Normalized Bernoulli entropy: 0 at p=0/1 and 1 at p=0.5.
             p = min(max(probability_same, 1e-12), 1.0 - 1e-12)
             entropy = -(p * math.log(p) + (1.0 - p) * math.log(1.0 - p)) / math.log(2.0)
             confidence = max(0.0, min(1.0, 1.0 - entropy))
