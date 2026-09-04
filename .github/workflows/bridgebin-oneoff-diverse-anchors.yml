@@ -1,0 +1,63 @@
+name: BridgeBin one-off diverse anchor patch
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - .github/workflows/bridgebin-oneoff-diverse-anchors.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgebin-v2-signed-evidence
+      - name: Add diversity-aware anchor selection
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/bridgebin_candidate_pairs.py')
+          s=p.read_text()
+          old='''    parser.add_argument("--anchors-per-bin", type=int, default=10)\n    parser.add_argument("--within-neighbors", type=int, default=3)\n'''
+          new='''    parser.add_argument("--anchors-per-bin", type=int, default=10)\n    parser.add_argument(\n        "--anchor-strategy",\n        choices=("longest", "diverse"),\n        default="longest",\n        help=(\n            "anchor selection policy: longest preserves the legacy behavior; diverse keeps "\n            "two long cores then uses cheap-feature farthest-point sampling"\n        ),\n    )\n    parser.add_argument("--within-neighbors", type=int, default=3)\n'''
+          if old not in s:
+              raise SystemExit('anchor parser insertion point not found')
+          s=s.replace(old,new,1)
+
+          marker='''def ranked_anchors(member: Feature, anchors: Sequence[Feature]) -> List[Tuple[float, Feature]]:\n'''
+          helper='''def select_anchors(\n    members: Sequence[Feature], count: int, strategy: str\n) -> List[Feature]:\n    if count <= 0 or not members:\n        return []\n    count = min(count, len(members))\n    if strategy == "longest":\n        return list(members[:count])\n    if strategy != "diverse":\n        raise ValueError(f"unknown anchor strategy: {strategy}")\n\n    # Preserve a small long-contig core for representation quality, then deliberately\n    # explore cheap-feature space.  The length factor prevents a tiny composition outlier\n    # from winning solely because it is noisy, while still allowing minority components\n    # to beat another nearly identical long contig.\n    seed_count = min(2, count)\n    selected = list(members[:seed_count])\n    selected_ids = {feature.contig for feature in selected}\n    max_length = max(feature.length for feature in members)\n    while len(selected) < count:\n        best = None\n        best_key = None\n        for candidate in members:\n            if candidate.contig in selected_ids:\n                continue\n            min_distance = min(\n                1.0 - cheap_similarity(candidate, anchor) for anchor in selected\n            )\n            length_fraction = candidate.length / max(1, max_length)\n            score = min_distance * (0.65 + 0.35 * math.sqrt(length_fraction))\n            key = (score, min_distance, candidate.length, candidate.contig)\n            if best_key is None or key > best_key:\n                best_key = key\n                best = candidate\n        if best is None:\n            break\n        selected.append(best)\n        selected_ids.add(best.contig)\n    return selected\n\n\n'''
+          if marker not in s:
+              raise SystemExit('ranked_anchors marker not found')
+          s=s.replace(marker,helper+marker,1)
+
+          old='''    anchors: Dict[str, List[Feature]] = {\n        bin_name: members[: args.anchors_per_bin]\n        for bin_name, members in bins.items()\n        if members\n    }\n'''
+          new='''    anchors: Dict[str, List[Feature]] = {\n        bin_name: select_anchors(members, args.anchors_per_bin, args.anchor_strategy)\n        for bin_name, members in bins.items()\n        if members\n    }\n'''
+          if old not in s:
+              raise SystemExit('anchor selection block not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          python3 -m py_compile scripts/bridgebin_candidate_pairs.py
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0,'scripts')
+          import bridgebin_candidate_pairs as m
+          def f(name,length,gc):
+              v=[0.0]*256; v[0]=1.0-gc; v[1]=gc
+              return m.Feature(name,length,gc,v,[10.0])
+          members=[f('core1',10000,.50),f('core2',9500,.51),f('near',9000,.50),f('minor',7000,.75)]
+          longest=m.select_anchors(members,3,'longest')
+          diverse=m.select_anchors(members,3,'diverse')
+          assert [x.contig for x in longest] == ['core1','core2','near']
+          assert 'minor' in {x.contig for x in diverse}\n          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/bridgebin_candidate_pairs.py
+          git commit -m 'feat(bridgebin): add diversity-aware Biological Brain anchors'
+          git push origin HEAD:codex/bridgebin-v2-signed-evidence
