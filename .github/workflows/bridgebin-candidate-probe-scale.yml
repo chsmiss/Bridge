@@ -1,0 +1,124 @@
+name: BridgeBin anchor-probe scale benchmark
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_eval_candidates.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - .github/workflows/bridgebin-candidate-probe-scale.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build BridgeBin
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin
+          python3 -m py_compile \
+            scripts/bridgebin_candidate_pairs.py \
+            scripts/bridgebin_eval_candidates.py \
+            scripts/bridgebin_zymo_reference_benchmark.py \
+            scripts/split_zymo_references.py
+
+      - name: Prepare full 5771-contig Zymo reference fixture
+        run: |
+          set -euo pipefail
+          b=benchmark/probe_scale
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$b" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          target/release/bridgebin \
+            --contigs "$b/contigs.fa" --coverage "$b/coverage.tsv" \
+            --out-dir "$b/v2" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
+            >"$b/v2.log" 2>&1
+
+      - name: Sweep anchor-only probe budgets
+        run: |
+          set -euo pipefail
+          b=benchmark/probe_scale
+          for a in 6 10 16 24; do
+            out="$b/probe_a${a}.tsv"
+            python3 scripts/bridgebin_candidate_pairs.py \
+              --contigs "$b/contigs.fa" --assignments "$b/v2/assignments.tsv" \
+              --coverage "$b/coverage.tsv" --output "$out" \
+              --min-length 1500 --anchors-per-bin "$a" --max-pairs 250000 \
+              --probe-only
+            python3 scripts/bridgebin_eval_candidates.py \
+              --truth "$b/truth.tsv" --assignments "$b/v2/assignments.tsv" \
+              --candidates "$out" --output "$b/probe_a${a}.metrics.json" >/dev/null
+          done
+          python3 scripts/bridgebin_candidate_pairs.py \
+            --contigs "$b/contigs.fa" --assignments "$b/v2/assignments.tsv" \
+            --coverage "$b/coverage.tsv" --output "$b/full_candidates.tsv" \
+            --min-length 1500 --anchors-per-bin 10 --max-pairs 250000
+          python3 scripts/bridgebin_eval_candidates.py \
+            --truth "$b/truth.tsv" --assignments "$b/v2/assignments.tsv" \
+            --candidates "$b/full_candidates.tsv" --output "$b/full_candidates.metrics.json" >/dev/null
+
+      - name: Summarize exposure versus model endpoint cost
+        run: |
+          python3 - <<'PY'
+          import csv, json
+          from pathlib import Path
+          b=Path('benchmark/probe_scale')
+          truth=list(csv.DictReader((b/'truth.tsv').open(),delimiter='\t'))
+          eligible={r['contig'] for r in truth if int(r.get('eligible','1'))}
+          def endpoints(path):
+              ids=set(); n=0
+              with path.open() as h:
+                  for r in csv.DictReader(h,delimiter='\t'):
+                      ids.add(r['left']); ids.add(r['right']); n+=1
+              return n,len(ids)
+          print('mode\tanchors\tpairs\tunique_endpoints\tendpoint_fraction\tmixed_bins\tmixed_exposure\tfragmented_exposure')
+          rows=[]
+          for a in (6,10,16,24):
+              m=json.loads((b/f'probe_a{a}.metrics.json').read_text())
+              pairs,ids=endpoints(b/f'probe_a{a}.tsv')
+              row={
+                  'mode':'probe','anchors':a,'pairs':pairs,'unique_endpoints':ids,
+                  'endpoint_fraction':ids/max(1,len(eligible)),
+                  'mixed_bins':m['mixed_bins'],
+                  'mixed_exposure':m['mixed_bin_exposure_recall'],
+                  'fragmented_exposure':m['fragmented_genome_exposure_recall'],
+              }
+              rows.append(row)
+          m=json.loads((b/'full_candidates.metrics.json').read_text())
+          pairs,ids=endpoints(b/'full_candidates.tsv')
+          rows.append({
+              'mode':'full','anchors':10,'pairs':pairs,'unique_endpoints':ids,
+              'endpoint_fraction':ids/max(1,len(eligible)),
+              'mixed_bins':m['mixed_bins'],
+              'mixed_exposure':m['mixed_bin_exposure_recall'],
+              'fragmented_exposure':m['fragmented_genome_exposure_recall'],
+          })
+          for r in rows:
+              print(f"{r['mode']}\t{r['anchors']}\t{r['pairs']}\t{r['unique_endpoints']}\t{r['endpoint_fraction']:.6f}\t{r['mixed_bins']}\t{r['mixed_exposure']}\t{r['fragmented_exposure']}")
+          (b/'probe_scale_summary.json').write_text(json.dumps(rows,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-anchor-probe-scale
+          path: benchmark/probe_scale
+          retention-days: 14
