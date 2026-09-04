@@ -1,0 +1,195 @@
+name: Zymo 200k Stage18 short handoff
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage18-short-handoff-200k.yml
+      - scripts/stage18_short_handoff.py
+      - scripts/test_stage18_short_handoff.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage18-short-handoff-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate Stage18 and build BridgeAsm
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/stage18_short_handoff.py scripts/test_stage18_short_handoff.py
+          PYTHONPATH=scripts python3 scripts/test_stage18_short_handoff.py
+          cargo build --release
+
+      - name: Build fixed Stage8 backbone
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/bridge_repeat \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/bridge_repeat \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 3 \
+            --lookahead-max-branch 4
+
+      - name: Build Stage10 strict baseline
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage10.time.txt \
+            python3 scripts/stage10_multik_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/bridge_repeat \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" --ks 17,21,25,31
+          cp benchmark/bridge_repeat/stage10_multik_rescue/candidate_multik_strict/primary_contigs.fasta \
+             benchmark/assemblies/bridge_stage10_strict.fasta
+
+      - name: Run Stage18 short-fragment handoff
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage18.time.txt \
+            python3 scripts/stage18_short_handoff.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/bridge_repeat \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS"
+          cp benchmark/bridge_repeat/stage18_short_handoff/candidate_short_handoff/primary_contigs.fasta \
+             benchmark/assemblies/bridge_stage18_short_handoff.fasta
+
+      - name: Summarize Stage18 mechanism
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('benchmark/bridge_repeat/stage18_short_handoff/stage18_stats.json').read_text())
+          m=s['method']
+          rows=[]
+          for k in ('k31','k41','k55'):
+              st=m['stages'][k]
+              for key,value in st['virtual'].items(): rows.append((f'{k}_virtual_{key}',value))
+              for key,value in st['connected'].items(): rows.append((f'{k}_connected_{key}',value))
+          for key in ('input_seed_records','signature_eligible_seeds','evidence_records','selected_records','selected_seed_loci','selected_bases','selected_fresh31'):
+              rows.append((key,m.get(key,0)))
+          p=Path('benchmark/stage18_diagnostics.tsv')
+          with p.open('w') as out:
+              out.write('metric\tvalue\n')
+              for key,value in rows: out.write(f'{key}\t{value}\n')
+          print(p.read_text())
+          PY
+
+      - name: FASTA stats
+        run: |
+          for f in benchmark/assemblies/*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run combined-reference MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_stage10_strict.fasta \
+            benchmark/assemblies/bridge_stage18_short_handoff.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Run per-bacterium QUAST
+        run: |
+          set -euo pipefail
+          assemblies=(benchmark/assemblies/bridge_stage10_strict.fasta benchmark/assemblies/bridge_stage18_short_handoff.fasta)
+          for ref in /tmp/zymo-species-refs/{Bacillus_subtilis,Enterococcus_faecalis,Escherichia_coli,Lactobacillus_fermentum,Listeria_monocytogenes,Pseudomonas_aeruginosa,Salmonella_enterica,Staphylococcus_aureus}.fasta; do
+            species="$(basename "$ref" .fasta)"
+            python3 /tmp/quast-5.3.0/quast.py "${assemblies[@]}" -r "$ref" \
+              -o "benchmark/species_quast/$species" --threads "$THREADS" --min-contig 200 --no-plots
+          done
+          python3 scripts/summarize_species_quast.py benchmark/species_quast \
+            --json benchmark/species_summary.json | tee benchmark/species_summary.tsv
+
+      - name: Compare Stage18 without metric gates
+        run: |
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          def rows(path):
+              with Path(path).open() as h: return list(csv.DictReader(h, delimiter='\t'))
+          meta={r['Assembly']:r for r in rows('benchmark/metaquast_summary.tsv')}
+          species={r['assembly']:r for r in rows('benchmark/species_summary.tsv')}
+          b=meta['bridge_stage10_strict']; bs=species['bridge_stage10_strict']
+          bgf=float(bs['bacteria_mean_gf']); bps=float(bs['pseudomonas_gf']); bna=float(b['NA50'])
+          names=['bridge_stage10_strict','bridge_stage18_short_handoff']
+          p=Path('benchmark/stage18_comparison.tsv')
+          with p.open('w') as out:
+              out.write('assembly\tmean_gf\tdelta_mean_gf\tpseudomonas_gf\tdelta_pseudomonas\tcombined_gf\tna50\tdelta_na50\tdup\tmisassemblies\tlocal_misassemblies\n')
+              for name in names:
+                  m=meta[name]; sp=species[name]
+                  gf=float(sp['bacteria_mean_gf']); ps=float(sp['pseudomonas_gf']); na=float(m['NA50'])
+                  out.write(f'{name}\t{gf:.4f}\t{gf-bgf:+.4f}\t{ps:.4f}\t{ps-bps:+.4f}\t{m["Genome fraction (%)"]}\t{na:.1f}\t{na-bna:+.1f}\t{float(m["Duplication ratio"]):.4f}\t{int(float(m["# misassemblies"]))}\t{int(float(m["# local misassemblies"]))}\n')
+          print(p.read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\nbaseline\tStage10_strict\nselection_policy\troot_cause_no_metric_targets\nhandoff\tstage10_short_fragments_single_copy_k31_k41_k55\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage18-short-handoff-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/bridge_repeat/stage18_short_handoff/stage18_stats.json
+            benchmark/bridge_repeat/stage18_short_handoff/*.tsv
