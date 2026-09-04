@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Aggregate gene annotation and protein-language-model outputs for BridgeBin v2.
+"""Aggregate DNA, gene annotation, and protein-language-model outputs for BridgeBin.
 
 This utility deliberately separates expensive Python/GPU inference from the Rust
-partitioner.  It accepts generic per-gene annotations and per-protein embeddings and
-produces the header-based ``--bio-features`` TSV consumed by bridgebin v2.
+partitioner. It accepts generic contig DNA embeddings, per-gene annotations, per-protein
+embeddings, and taxonomy, then produces a header-based feature TSV.
 
 Gene profiles use deterministic feature hashing, so outputs from GENERanno, Prodigal +
-HMM/DIAMOND annotation, or another gene annotator can share the same interface.  Protein
-embeddings may come from ESM-C or another protein model.  We preserve more information
-than a naive mean by concatenating the confidence-weighted mean and standard deviation of
-ORF embeddings on each contig.
+HMM/DIAMOND annotation, or another gene annotator can share the same interface. Protein
+embeddings may come from ESM-C or another protein model. DNA embeddings may come from
+DNABERT-S, GENERanno-base, or another nucleotide foundation model. For variable numbers
+of windows/ORFs we preserve more information than a naive mean by concatenating the
+confidence-weighted mean and standard deviation.
 """
 
 from __future__ import annotations
@@ -57,11 +58,11 @@ class WeightedVectors:
         ]
         return mean + [math.sqrt(value) for value in variance]
 
-    def confidence(self) -> float:
+    def confidence(self, saturation: float = 4.0) -> float:
         if self.total_weight <= 0.0:
             return 0.0
         mean_weight = min(1.0, self.total_weight / max(1, self.observations))
-        amount = 1.0 - math.exp(-self.observations / 4.0)
+        amount = 1.0 - math.exp(-self.observations / saturation)
         return max(0.0, min(1.0, mean_weight * amount))
 
 
@@ -96,6 +97,11 @@ class GeneProfile:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--dna-embeddings",
+        type=Path,
+        help="TSV: contig, embedding, optional window_id and confidence",
+    )
     parser.add_argument(
         "--gene-hits",
         type=Path,
@@ -143,7 +149,7 @@ def probability(raw: str, default: float = 1.0) -> float:
 def vector(raw: str) -> List[float]:
     values = [float(value) for value in raw.split(",") if value.strip()]
     if not values or any(not math.isfinite(value) for value in values):
-        raise ValueError("protein embedding must contain finite comma-separated floats")
+        raise ValueError("embedding must contain finite comma-separated floats")
     return values
 
 
@@ -152,6 +158,7 @@ def format_vector(values: Sequence[float]) -> str:
 
 
 def build(args: argparse.Namespace) -> Tuple[
+    Dict[str, WeightedVectors],
     Dict[str, GeneProfile],
     Dict[str, WeightedVectors],
     Dict[str, Tuple[str, float]],
@@ -159,9 +166,19 @@ def build(args: argparse.Namespace) -> Tuple[
     if args.gene_dim <= 0:
         raise ValueError("--gene-dim must be positive")
 
+    dna: Dict[str, WeightedVectors] = defaultdict(WeightedVectors)
     genes: Dict[str, GeneProfile] = {}
     proteins: Dict[str, WeightedVectors] = defaultdict(WeightedVectors)
     taxonomy: Dict[str, Tuple[str, float]] = {}
+
+    if args.dna_embeddings:
+        for row in rows(args.dna_embeddings):
+            contig = first(row, ("contig", "contig_id", "sequence"))
+            embedding = first(row, ("embedding", "dna_embedding", "dna_lm_embedding", "dnabert_embedding"))
+            if not contig or not embedding:
+                continue
+            confidence = probability(first(row, ("confidence", "score")), 1.0)
+            dna[contig].add(vector(embedding), confidence)
 
     if args.gene_hits:
         for row in rows(args.gene_hits):
@@ -193,16 +210,17 @@ def build(args: argparse.Namespace) -> Tuple[
             if current is None or confidence > current[1]:
                 taxonomy[contig] = (lineage, confidence)
 
-    return genes, proteins, taxonomy
+    return dna, genes, proteins, taxonomy
 
 
 def write_output(
     output: Path,
+    dna: Dict[str, WeightedVectors],
     genes: Dict[str, GeneProfile],
     proteins: Dict[str, WeightedVectors],
     taxonomy: Dict[str, Tuple[str, float]],
 ) -> None:
-    contigs = sorted(set(genes) | set(proteins) | set(taxonomy))
+    contigs = sorted(set(dna) | set(genes) | set(proteins) | set(taxonomy))
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
@@ -211,6 +229,8 @@ def write_output(
                 "contig",
                 "taxonomy",
                 "taxonomy_confidence",
+                "dna_embedding",
+                "dna_confidence",
                 "gene_profile",
                 "gene_confidence",
                 "esm_embedding",
@@ -218,6 +238,7 @@ def write_output(
             ]
         )
         for contig in contigs:
+            dna_feature = dna.get(contig)
             gene = genes.get(contig)
             protein = proteins.get(contig)
             lineage, tax_conf = taxonomy.get(contig, (".", 0.0))
@@ -226,6 +247,8 @@ def write_output(
                     contig,
                     lineage,
                     f"{tax_conf:.6f}",
+                    format_vector(dna_feature.mean_std()) if dna_feature else ".",
+                    f"{dna_feature.confidence(saturation=2.0):.6f}" if dna_feature else "0",
                     format_vector(gene.normalized()) if gene else ".",
                     f"{gene.confidence():.6f}" if gene else "0",
                     format_vector(protein.mean_std()) if protein else ".",
@@ -236,13 +259,15 @@ def write_output(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    if not any((args.gene_hits, args.protein_embeddings, args.taxonomy)):
-        raise SystemExit("provide at least one of --gene-hits, --protein-embeddings, --taxonomy")
-    genes, proteins, taxonomy = build(args)
-    write_output(args.output, genes, proteins, taxonomy)
+    if not any((args.dna_embeddings, args.gene_hits, args.protein_embeddings, args.taxonomy)):
+        raise SystemExit(
+            "provide at least one of --dna-embeddings, --gene-hits, --protein-embeddings, --taxonomy"
+        )
+    dna, genes, proteins, taxonomy = build(args)
+    write_output(args.output, dna, genes, proteins, taxonomy)
     print(
-        f"bridgebin-bio: contigs={len(set(genes) | set(proteins) | set(taxonomy))} "
-        f"gene={len(genes)} protein={len(proteins)} taxonomy={len(taxonomy)}"
+        f"bridgebin-bio: contigs={len(set(dna) | set(genes) | set(proteins) | set(taxonomy))} "
+        f"dna={len(dna)} gene={len(genes)} protein={len(proteins)} taxonomy={len(taxonomy)}"
     )
     return 0
 
