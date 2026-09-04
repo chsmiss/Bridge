@@ -63,6 +63,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rescue-bin-neighbors", type=int, default=4)
     parser.add_argument("--rescue-anchor-pairs", type=int, default=4)
     parser.add_argument("--max-pairs", type=int, default=250000)
+    parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help=(
+            "emit only anchor-level within-bin and cross-bin pairs; skip member expansion "
+            "and residual rescue for a cheap first-pass conflict probe"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -313,13 +321,14 @@ def mine(
         for left_index in range(len(bin_anchors)):
             for right_index in range(left_index + 1, len(bin_anchors)):
                 add_pair(records, bin_anchors[left_index], bin_anchors[right_index], "within_bin_anchor")
-        for member in members:
-            ranked = ranked_anchors(member, bin_anchors)
-            for _score, anchor in ranked[: args.within_neighbors]:
-                add_pair(records, member, anchor, "within_bin_neighbor")
-            if args.within_contrast > 0:
-                for _score, anchor in ranked[-args.within_contrast :]:
-                    add_pair(records, member, anchor, "within_bin_contrast")
+        if not args.probe_only:
+            for member in members:
+                ranked = ranked_anchors(member, bin_anchors)
+                for _score, anchor in ranked[: args.within_neighbors]:
+                    add_pair(records, member, anchor, "within_bin_neighbor")
+                if args.within_contrast > 0:
+                    for _score, anchor in ranked[-args.within_contrast :]:
+                        add_pair(records, member, anchor, "within_bin_contrast")
 
     # Current bins that are close under cheap features are candidates for conservative
     # biological re-merge. Select neighbors by bin centroid, then only score anchor pairs.
@@ -350,17 +359,19 @@ def mine(
             for _pair_score, left, right in possibilities[: args.cross_anchor_pairs]:
                 add_pair(records, left, right, "cross_bin_merge")
 
-    # Unbinned contigs only query their nearest few bin centroids and nearest anchors.
-    for residual in sorted(residuals, key=lambda feature: (-feature.length, feature.contig)):
-        neighbor_bins = [
-            (cheap_similarity(residual, center), bin_name)
-            for bin_name, center in centroids.items()
-        ]
-        neighbor_bins.sort(key=lambda item: (-item[0], item[1]))
-        for _bin_score, bin_name in neighbor_bins[: args.rescue_bin_neighbors]:
-            ranked = ranked_anchors(residual, anchors.get(bin_name, []))
-            for _score, anchor in ranked[: args.rescue_anchor_pairs]:
-                add_pair(records, residual, anchor, "residual_rescue")
+    # Residual rescue is deferred until after the anchor conflict probe.  This keeps the
+    # first-pass foundation-model endpoint set proportional to bin anchors, not all contigs.
+    if not args.probe_only:
+        for residual in sorted(residuals, key=lambda feature: (-feature.length, feature.contig)):
+            neighbor_bins = [
+                (cheap_similarity(residual, center), bin_name)
+                for bin_name, center in centroids.items()
+            ]
+            neighbor_bins.sort(key=lambda item: (-item[0], item[1]))
+            for _bin_score, bin_name in neighbor_bins[: args.rescue_bin_neighbors]:
+                ranked = ranked_anchors(residual, anchors.get(bin_name, []))
+                for _score, anchor in ranked[: args.rescue_anchor_pairs]:
+                    add_pair(records, residual, anchor, "residual_rescue")
 
     return records
 
