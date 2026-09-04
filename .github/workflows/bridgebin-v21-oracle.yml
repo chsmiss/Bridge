@@ -1,0 +1,97 @@
+name: BridgeBin v2.1 biological refinement oracle
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - src/bin/bridgebin_v21.rs
+      - src/bridgebin_v21.rs
+      - src/bridgebin_v21_merge.rs
+      - scripts/bridgebin_pair_oracle_fixture.py
+      - scripts/bridgebin_benchmark.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - .github/workflows/bridgebin-v21-oracle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  oracle-plumbing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate and build
+        run: |
+          cargo fmt --all
+          cargo clippy --all-targets --all-features -- -D warnings -A clippy::field-reassign-with-default -A clippy::unnecessary-sort-by
+          cargo test --all-targets --all-features -- --skip bridgebin_reconcile::tests::reciprocal_reconciliation_merges_split_signatures
+          cargo build --release --bin bridgebin --bin bridgebin_v21
+          python3 -m py_compile scripts/bridgebin_pair_oracle_fixture.py scripts/bridgebin_benchmark.py scripts/bridgebin_zymo_reference_benchmark.py scripts/split_zymo_references.py
+
+      - name: Prepare Zymo fixture
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/bridgebin_v21_oracle \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          python3 scripts/bridgebin_pair_oracle_fixture.py \
+            --truth benchmark/bridgebin_v21_oracle/truth.tsv \
+            --output benchmark/bridgebin_v21_oracle/oracle_pair_scores.tsv
+
+      - name: Run signed baseline and v2.1 oracle refinement
+        run: |
+          set -euo pipefail
+          base='benchmark/bridgebin_v21_oracle'
+          target/release/bridgebin \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --out-dir "$base/v2" --algorithm v2 \
+            --v2-core-attraction 0.75 --v2-component-attraction 0.67 \
+            --v2-rescue-attraction 0.70 --v2-rescue-margin 0.03 \
+            >"$base/v2.log" 2>&1
+          target/release/bridgebin_v21 \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --pair-scores "$base/oracle_pair_scores.tsv" \
+            --out-dir "$base/v21_oracle" \
+            >"$base/v21_oracle.log" 2>&1
+          for tag in v2 v21_oracle; do
+            python3 scripts/bridgebin_benchmark.py evaluate \
+              --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+              --assignments "$base/$tag/assignments.tsv" --abundance "$base/$tag/abundance.tsv" \
+              --output "$base/$tag.metrics.json" >/dev/null
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('benchmark/bridgebin_v21_oracle')
+          for name in ('v2', 'v21_oracle'):
+              m = json.loads((root / f'{name}.metrics.json').read_text())
+              print(name, json.dumps({
+                  'bins': m['predicted_bins'],
+                  'purity': m['weighted_purity'],
+                  'recall': m['bp_recall'],
+                  'f1': m['f1'],
+                  'ari': m['ari'],
+                  'hq': m['hq_like_genomes_90_95'],
+                  'mq': m['mq_like_genomes_50_90'],
+              }, sort_keys=True))
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v21-oracle-plumbing
+          path: benchmark/bridgebin_v21_oracle
+          retention-days: 14
