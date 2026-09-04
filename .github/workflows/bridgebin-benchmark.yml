@@ -1,0 +1,90 @@
+name: BridgeBin benchmark
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v0
+    paths:
+      - src/bridgebin.rs
+      - src/bridgebin_quant.rs
+      - src/bin/bridgebin.rs
+      - src/lib.rs
+      - scripts/bridgebin_benchmark.py
+      - .github/workflows/bridgebin-benchmark.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format working tree for validation
+        run: cargo fmt --all
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --all-targets --all-features
+
+      - name: Python syntax
+        run: python3 -m py_compile scripts/bridgebin_benchmark.py
+
+      - name: Build BridgeBin
+        run: cargo build --release --bin bridgebin
+
+      - name: Generate deterministic benchmark
+        run: |
+          python3 scripts/bridgebin_benchmark.py generate \
+            --out benchmark/bridgebin_v0 \
+            --seed 43 \
+            --min-contig 1500
+
+      - name: Run binning and quantification
+        run: |
+          /usr/bin/time -v -o benchmark/bridgebin_v0/runtime.txt \
+            target/release/bridgebin \
+              --contigs benchmark/bridgebin_v0/contigs.fa \
+              --coverage benchmark/bridgebin_v0/coverage.tsv \
+              --out-dir benchmark/bridgebin_v0/result
+          test -s benchmark/bridgebin_v0/result/assignments.tsv
+          test -s benchmark/bridgebin_v0/result/bins.tsv
+          test -s benchmark/bridgebin_v0/result/abundance.tsv
+
+      - name: Evaluate binning and abundance
+        run: |
+          python3 scripts/bridgebin_benchmark.py evaluate \
+            --truth benchmark/bridgebin_v0/truth.tsv \
+            --truth-abundance benchmark/bridgebin_v0/truth_abundance.tsv \
+            --assignments benchmark/bridgebin_v0/result/assignments.tsv \
+            --abundance benchmark/bridgebin_v0/result/abundance.tsv \
+            --output benchmark/bridgebin_v0/metrics.json \
+            | tee benchmark/bridgebin_v0/metrics.stdout.tsv
+          cat benchmark/bridgebin_v0/runtime.txt
+
+      - name: Basic functional gates
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m = json.loads(Path('benchmark/bridgebin_v0/metrics.json').read_text())
+          assert m['bp_binned_fraction'] > 0.50, m
+          assert m['weighted_purity'] > 0.50, m
+          assert m['depth_pearson'] > 0.50, m
+          assert m['depth_mape'] < 0.50, m
+          PY
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v0-benchmark
+          path: benchmark/bridgebin_v0
+          retention-days: 14
