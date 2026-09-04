@@ -2,28 +2,31 @@
 """Train or run BridgeBin's multimodal same-genome pair head.
 
 The expensive foundation models stay outside Rust. This script consumes contig-level
-embeddings/features and learns the actual decision BridgeBin needs:
+features and learns the decision BridgeBin actually needs:
 
     P(contig A and contig B originate from the same genome)
 
+Biological modalities are deliberately separated rather than concatenated blindly:
+  dna           species-aware DNA LM / GENERanno-base embedding
+  gene          functional gene-family profile when available
+  architecture  GENERanno CDS/coding-architecture vector
+  protein       pooled ESM-C protein representation
+  repertoire    ESM-C protein-prototype TF-IDF profile
+  taxonomy      soft lineage agreement
+
+Optional pair-level evidence is coverage, nucleotide composition, GC, and physical
+support. Every modality has an explicit presence/confidence feature, so missing model
+outputs cannot silently masquerade as zero similarity.
+
 Training supports asymmetric false-merge cost and conservative held-out calibration.
 When pair rows contain genome/group columns, validation holds out whole genomes: every
-pair touching a held-out genome is excluded from training. This avoids the common but
-serious leakage caused by putting contigs from one genome in both train and validation.
-If no group metadata is available the script falls back to deterministic pair splitting
-and records that weaker protocol in the model metadata.
+pair touching a held-out genome is excluded from training. This prevents leakage from
+putting contigs from the same genome into both train and validation. If no group metadata
+is available the script falls back to a deterministic pair split and records that weaker
+protocol in the model metadata.
 
-Feature TSV columns are header-based. Supported biological fields include:
-  dna_embedding / dna_lm_embedding / dnabert_embedding
-  gene_profile / gene_embedding
-  esm_embedding / esmc_embedding / protein_embedding
-  taxonomy / lineage, plus corresponding confidence columns
-
-Pair TSVs require left/right IDs. Training additionally requires label (0/1). Optional
-cheap/physical columns are coverage_similarity, composition_similarity, gc_similarity,
-and physical_support. For leakage-safe validation use left_genome/right_genome (aliases
-left_group/right_group, genome_left/genome_right, source_genome/target_genome).
-Missing modalities are represented explicitly rather than silently treated as similarity.
+For vector modalities, cosine is clipped to [0,1]. It is intentionally *not* transformed
+as (cos+1)/2: orthogonal genome representations must remain zero evidence, not 0.5.
 """
 
 from __future__ import annotations
@@ -39,10 +42,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-BIO_FEATURES = ("dna", "gene", "protein", "taxonomy")
+VECTOR_FEATURES = ("dna", "gene", "architecture", "protein", "repertoire")
+BIO_FEATURES = VECTOR_FEATURES + ("taxonomy",)
 PAIR_FEATURES = ("coverage", "composition", "gc", "physical")
-FEATURE_NAMES = tuple(f"{name}_similarity" for name in BIO_FEATURES + PAIR_FEATURES) + tuple(
-    f"{name}_present" for name in BIO_FEATURES + PAIR_FEATURES
+ALL_MODALITIES = BIO_FEATURES + PAIR_FEATURES
+FEATURE_NAMES = tuple(f"{name}_similarity" for name in ALL_MODALITIES) + tuple(
+    f"{name}_present" for name in ALL_MODALITIES
 )
 
 
@@ -52,8 +57,12 @@ class ContigFeature:
     dna_confidence: float
     gene: List[float]
     gene_confidence: float
+    architecture: List[float]
+    architecture_confidence: float
     protein: List[float]
     protein_confidence: float
+    repertoire: List[float]
+    repertoire_confidence: float
     taxonomy: str
     taxonomy_confidence: float
 
@@ -72,7 +81,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    train = sub.add_parser("train", help="fit a logistic pair head on labelled pairs")
+    train = sub.add_parser("train", help="fit a calibrated logistic same-genome head")
     train.add_argument("--features", type=Path, required=True)
     train.add_argument("--pairs", type=Path, required=True)
     train.add_argument("--model-out", type=Path, required=True)
@@ -80,7 +89,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     train.add_argument("--epochs", type=int, default=800)
     train.add_argument("--learning-rate", type=float, default=0.08)
     train.add_argument("--l2", type=float, default=1e-3)
-    train.add_argument("--negative-weight", type=float, default=3.0)
+    train.add_argument(
+        "--negative-weight",
+        type=float,
+        default=3.0,
+        help="relative training cost of a false merge / negative pair",
+    )
     train.add_argument("--precision-target", type=float, default=0.995)
     train.add_argument("--seed", type=int, default=43)
     train.add_argument(
@@ -132,6 +146,12 @@ def probability(raw: str, default: float = 0.0) -> float:
     return value
 
 
+def feature_confidence(
+    row: Dict[str, str], names: Sequence[str], present: bool, default_if_present: float = 1.0
+) -> float:
+    return probability(first(row, names), default_if_present if present else 0.0)
+
+
 def read_contig_features(path: Path) -> Dict[str, ContigFeature]:
     out: Dict[str, ContigFeature] = {}
     for row in rows(path):
@@ -139,27 +159,50 @@ def read_contig_features(path: Path) -> Dict[str, ContigFeature]:
         if not contig:
             continue
         dna = parse_vector(first(row, ("dna_embedding", "dna_lm_embedding", "dnabert_embedding")))
-        gene = parse_vector(first(row, ("gene_profile", "gene_embedding")))
+        gene = parse_vector(first(row, ("gene_profile", "gene_embedding", "gene_repertoire")))
+        architecture = parse_vector(
+            first(row, ("gene_architecture", "architecture_embedding", "coding_architecture"))
+        )
         protein = parse_vector(
             first(row, ("protein_embedding", "esm_embedding", "esmc_embedding"))
         )
+        repertoire = parse_vector(
+            first(row, ("protein_repertoire", "protein_prototypes", "repertoire_embedding"))
+        )
+        taxonomy = first(row, ("taxonomy", "lineage", "taxon"))
         out[contig] = ContigFeature(
             dna=dna,
-            dna_confidence=probability(
-                first(row, ("dna_confidence", "dna_lm_confidence")), 1.0 if dna else 0.0
+            dna_confidence=feature_confidence(
+                row, ("dna_confidence", "dna_lm_confidence"), bool(dna)
             ),
             gene=gene,
-            gene_confidence=probability(
-                first(row, ("gene_confidence", "gene_conf")), 1.0 if gene else 0.0
+            gene_confidence=feature_confidence(
+                row, ("gene_confidence", "gene_conf", "gene_repertoire_confidence"), bool(gene)
+            ),
+            architecture=architecture,
+            architecture_confidence=feature_confidence(
+                row,
+                ("architecture_confidence", "gene_architecture_confidence"),
+                bool(architecture),
             ),
             protein=protein,
-            protein_confidence=probability(
-                first(row, ("protein_confidence", "esm_confidence", "protein_conf")),
-                1.0 if protein else 0.0,
+            protein_confidence=feature_confidence(
+                row,
+                ("protein_confidence", "esm_confidence", "protein_conf"),
+                bool(protein),
             ),
-            taxonomy=first(row, ("taxonomy", "lineage", "taxon")),
-            taxonomy_confidence=probability(
-                first(row, ("taxonomy_confidence", "tax_confidence", "tax_conf")), 0.0
+            repertoire=repertoire,
+            repertoire_confidence=feature_confidence(
+                row,
+                ("repertoire_confidence", "protein_repertoire_confidence"),
+                bool(repertoire),
+            ),
+            taxonomy=taxonomy,
+            taxonomy_confidence=feature_confidence(
+                row,
+                ("taxonomy_confidence", "tax_confidence", "tax_conf"),
+                bool(taxonomy),
+                default_if_present=0.5,
             ),
         )
     return out
@@ -174,6 +217,14 @@ def cosine(left: Sequence[float], right: Sequence[float]) -> Optional[float]:
     if lnorm <= 1e-12 or rnorm <= 1e-12:
         return None
     return max(-1.0, min(1.0, dot / (lnorm * rnorm)))
+
+
+def vector_similarity(left: Sequence[float], right: Sequence[float]) -> Optional[float]:
+    value = cosine(left, right)
+    if value is None:
+        return None
+    # Negative/orthogonal representations are not positive same-genome evidence.
+    return max(0.0, value)
 
 
 def lineage_parts(value: str) -> List[str]:
@@ -211,9 +262,11 @@ def make_features(
     left: ContigFeature, right: ContigFeature, pair_row: Dict[str, str]
 ) -> List[float]:
     sims: Dict[str, Optional[float]] = {
-        "dna": cosine(left.dna, right.dna),
-        "gene": cosine(left.gene, right.gene),
-        "protein": cosine(left.protein, right.protein),
+        "dna": vector_similarity(left.dna, right.dna),
+        "gene": vector_similarity(left.gene, right.gene),
+        "architecture": vector_similarity(left.architecture, right.architecture),
+        "protein": vector_similarity(left.protein, right.protein),
+        "repertoire": vector_similarity(left.repertoire, right.repertoire),
         "taxonomy": taxonomy_similarity(left.taxonomy, right.taxonomy),
         "coverage": optional_pair_value(pair_row, ("coverage_similarity", "coverage")),
         "composition": optional_pair_value(
@@ -227,7 +280,9 @@ def make_features(
     confidences = {
         "dna": min(left.dna_confidence, right.dna_confidence),
         "gene": min(left.gene_confidence, right.gene_confidence),
+        "architecture": min(left.architecture_confidence, right.architecture_confidence),
         "protein": min(left.protein_confidence, right.protein_confidence),
+        "repertoire": min(left.repertoire_confidence, right.repertoire_confidence),
         "taxonomy": min(left.taxonomy_confidence, right.taxonomy_confidence),
         "coverage": 1.0,
         "composition": 1.0,
@@ -236,15 +291,15 @@ def make_features(
     }
     values: List[float] = []
     present: List[float] = []
-    for name in BIO_FEATURES + PAIR_FEATURES:
+    for name in ALL_MODALITIES:
         value = sims[name]
-        if value is None:
+        confidence = confidences[name]
+        if value is None or confidence <= 0.0:
             values.append(0.0)
             present.append(0.0)
         else:
-            normalized = (value + 1.0) * 0.5 if name in {"dna", "gene", "protein"} else value
-            values.append(max(0.0, min(1.0, normalized)) * confidences[name])
-            present.append(confidences[name])
+            values.append(max(0.0, min(1.0, value)) * confidence)
+            present.append(confidence)
     return values + present
 
 
@@ -304,7 +359,9 @@ def split_examples(
     }
     if len(grouped) == len(examples) and len(groups) >= 3:
         ordered_groups = sorted(groups, key=lambda group: (hash_unit(group, seed), group))
-        holdout_count = max(1, min(len(ordered_groups) - 2, round(len(ordered_groups) * fraction)))
+        holdout_count = max(
+            1, min(len(ordered_groups) - 2, round(len(ordered_groups) * fraction))
+        )
         validation_groups = set(ordered_groups[:holdout_count])
         train = [
             example
@@ -374,6 +431,8 @@ def train_model(args: argparse.Namespace) -> int:
         raise ValueError("--validation-fraction must be in (0,0.5)")
     if not 0.5 < args.precision_target < 1.0:
         raise ValueError("--precision-target must be in (0.5,1)")
+    if args.negative_weight <= 0.0:
+        raise ValueError("--negative-weight must be positive")
     examples = read_examples(args.features, args.pairs, require_label=True)
     train, valid, protocol = split_examples(
         examples, args.validation_fraction, args.seed, args.require_group_holdout
@@ -419,8 +478,13 @@ def train_model(args: argparse.Namespace) -> int:
     join_threshold = precision_threshold(validation, args.precision_target, positive=True)
     split_threshold = precision_threshold(validation, args.precision_target, positive=False)
     metrics = classification_metrics(validation, 0.5)
+    modality_weights = {
+        name: weights[index]
+        for index, name in enumerate(FEATURE_NAMES)
+        if name.endswith("_similarity")
+    }
     model = {
-        "version": 2,
+        "version": 3,
         "feature_names": list(FEATURE_NAMES),
         "means": means,
         "scales": scales,
@@ -434,6 +498,7 @@ def train_model(args: argparse.Namespace) -> int:
             "recommended_join_min_same": join_threshold,
             "recommended_split_max_same": split_threshold,
             "validation_at_0_5": metrics,
+            "learned_similarity_weights": modality_weights,
             **protocol,
         },
     }
@@ -504,7 +569,9 @@ def classification_metrics(
 def score_model(args: argparse.Namespace) -> int:
     model = json.loads(args.model.read_text(encoding="utf-8"))
     if tuple(model.get("feature_names", ())) != FEATURE_NAMES:
-        raise ValueError("pair-head model feature schema does not match this script")
+        raise ValueError(
+            "pair-head model feature schema does not match this script; retrain after modality changes"
+        )
     means = [float(value) for value in model["means"]]
     scales = [float(value) for value in model["scales"]]
     weights = [float(value) for value in model["weights"]]
