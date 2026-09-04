@@ -64,6 +64,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--rescue-anchor-pairs", type=int, default=4)
     parser.add_argument("--max-pairs", type=int, default=250000)
     parser.add_argument(
+        "--focus-bins",
+        type=Path,
+        help=(
+            "optional TSV/text file of bin IDs; per-member within-bin expansion is limited "
+            "to these bins while anchor probes remain global"
+        ),
+    )
+    parser.add_argument(
+        "--skip-residual-rescue",
+        action="store_true",
+        help="omit residual-to-bin candidate expansion in this pass",
+    )
+    parser.add_argument(
         "--probe-only",
         action="store_true",
         help=(
@@ -130,6 +143,31 @@ def read_assignments(path: Path) -> Dict[str, Optional[str]]:
                 continue
             result[contig] = None if raw_bin in {"", ".", "unbinned", "NA"} else raw_bin
     return result
+
+
+def read_focus_bins(path: Optional[Path]) -> Optional[Set[str]]:
+    if path is None:
+        return None
+    bins: Set[str] = set()
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        first_line = handle.readline()
+        if not first_line:
+            return bins
+        fields = first_line.rstrip("\n").split("\t")
+        if fields and fields[0].strip().lower() in {"bin", "bin_id", "cluster"}:
+            for raw in handle:
+                value = raw.rstrip("\n").split("\t", 1)[0].strip()
+                if value:
+                    bins.add(value)
+        else:
+            value = fields[0].strip() if fields else ""
+            if value:
+                bins.add(value)
+            for raw in handle:
+                value = raw.rstrip("\n").split("\t", 1)[0].strip()
+                if value:
+                    bins.add(value)
+    return bins
 
 
 def base_code(base: str) -> Optional[int]:
@@ -313,6 +351,7 @@ def mine(
         if members
     }
     records: Dict[Tuple[str, str], PairRecord] = {}
+    focus_bins = read_focus_bins(args.focus_bins)
 
     # Probe every current bin for hidden mixtures. Anchor all-vs-all ensures a mixed bin
     # with two long genome components presents cross-component examples to the model.
@@ -321,7 +360,7 @@ def mine(
         for left_index in range(len(bin_anchors)):
             for right_index in range(left_index + 1, len(bin_anchors)):
                 add_pair(records, bin_anchors[left_index], bin_anchors[right_index], "within_bin_anchor")
-        if not args.probe_only:
+        if not args.probe_only and (focus_bins is None or bin_name in focus_bins):
             for member in members:
                 ranked = ranked_anchors(member, bin_anchors)
                 for _score, anchor in ranked[: args.within_neighbors]:
@@ -361,7 +400,7 @@ def mine(
 
     # Residual rescue is deferred until after the anchor conflict probe.  This keeps the
     # first-pass foundation-model endpoint set proportional to bin anchors, not all contigs.
-    if not args.probe_only:
+    if not args.probe_only and not args.skip_residual_rescue:
         for residual in sorted(residuals, key=lambda feature: (-feature.length, feature.contig)):
             neighbor_bins = [
                 (cheap_similarity(residual, center), bin_name)
