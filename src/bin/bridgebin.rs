@@ -1,6 +1,7 @@
 use bridgeasm::bridgebin::{
     bin_contigs, read_coverage_table, read_fasta, write_outputs, BridgeBinConfig,
 };
+use bridgeasm::bridgebin_quant::{quantify_bins, write_abundance_table};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -32,6 +33,16 @@ fn run() -> io::Result<()> {
 
     let result = bin_contigs(&contigs, coverage.as_ref(), &cli.config);
     write_outputs(&contigs, &result, &cli.out_dir, cli.emit_unbinned)?;
+
+    if let Some(table) = coverage.as_ref() {
+        let abundance = quantify_bins(&result, table);
+        write_abundance_table(&abundance, &cli.out_dir)?;
+        eprintln!(
+            "bridgebin: quantified {} bins across {} samples",
+            result.bins.len(),
+            table.sample_names.len()
+        );
+    }
 
     let binned = result
         .assignments
@@ -66,7 +77,7 @@ fn parse_args() -> Result<Cli, String> {
         process::exit(0);
     }
     if args.iter().any(|a| a == "--version") {
-        println!("bridgebin 0.1.0");
+        println!("bridgebin 0.2.0");
         process::exit(0);
     }
 
@@ -83,9 +94,7 @@ fn parse_args() -> Result<Cli, String> {
             "--contigs" | "-c" => contigs = Some(PathBuf::from(value(&args, &mut i, key)?)),
             "--coverage" => coverage = Some(PathBuf::from(value(&args, &mut i, key)?)),
             "--out-dir" | "-o" => out_dir = Some(PathBuf::from(value(&args, &mut i, key)?)),
-            "--min-contig" => {
-                config.min_contig_len = parse_usize(value(&args, &mut i, key)?, key)?
-            }
+            "--min-contig" => config.min_contig_len = parse_usize(value(&args, &mut i, key)?, key)?,
             "--seed-min-contig" => {
                 config.seed_min_len = parse_usize(value(&args, &mut i, key)?, key)?
             }
@@ -104,14 +113,12 @@ fn parse_args() -> Result<Cli, String> {
             "--coverage-weight" => {
                 config.coverage_weight = parse_nonnegative(value(&args, &mut i, key)?, key)?
             }
-            "--gc-weight" => {
-                config.gc_weight = parse_nonnegative(value(&args, &mut i, key)?, key)?
-            }
+            "--gc-weight" => config.gc_weight = parse_nonnegative(value(&args, &mut i, key)?, key)?,
             "--no-unbinned" => emit_unbinned = false,
             unknown => {
                 return Err(format!(
                     "unknown argument '{unknown}'\n\nRun bridgebin --help for usage."
-                ))
+                ));
             }
         }
         i += 1;
@@ -169,12 +176,13 @@ fn parse_nonnegative(raw: String, key: &str) -> Result<f64, String> {
 
 fn print_help() {
     println!(
-        "bridgebin 0.1.0 - evidence-aware metagenomic contig binning\n\n\
+        "bridgebin 0.2.0 - evidence-aware metagenomic binning and quantification\n\n\
 USAGE:\n  bridgebin --contigs <FASTA> --out-dir <DIR> [OPTIONS]\n\n\
-INPUT:\n  -c, --contigs <FASTA>          Assembled contigs\n      --coverage <TSV>           Optional coverage matrix: contig sample1 [sample2 ...]\n  -o, --out-dir <DIR>            Output directory\n\n\
+INPUT:\n  -c, --contigs <FASTA>          Assembled contigs\n      --coverage <TSV>           Coverage matrix: contig sample1 [sample2 ...]\n  -o, --out-dir <DIR>            Output directory\n\n\
 BINNING:\n      --min-contig <BP>          Minimum contig length [default: 1500]\n      --seed-min-contig <BP>     Minimum length for seed contigs [default: 2500]\n      --join-threshold <0..1>    Seed-to-bin similarity threshold [default: 0.76]\n      --rescue-threshold <0..1>  Short-contig rescue threshold [default: 0.70]\n      --rescue-margin <0..1>     Required best-vs-second margin [default: 0.025]\n      --composition-weight <N>   Canonical TNF weight [default: 0.45]\n      --coverage-weight <N>      Multi-sample coverage weight [default: 0.50]\n      --gc-weight <N>            GC-content weight [default: 0.05]\n      --no-unbinned              Do not write unbinned.fa\n\n\
-OUTPUT:\n  assignments.tsv, bins.tsv, bins/bin_XXXX.fa, and optionally unbinned.fa\n\n\
+QUANTIFICATION:\n  When --coverage is supplied, BridgeBin also writes abundance.tsv with a\n  length-weighted median depth, length-weighted mean depth, and relative\n  abundance for every bin in every sample.\n\n\
+OUTPUT:\n  assignments.tsv, bins.tsv, bins/bin_XXXX.fa, abundance.tsv (with coverage),\n  and optionally unbinned.fa\n\n\
 The v0 algorithm uses exact centroid search with composition + differential coverage.\n\
-It is intentionally simple and deterministic; graph/read/protein evidence are planned next."
+It is deterministic; graph/read/protein evidence are planned next."
     );
 }
