@@ -362,6 +362,17 @@ fn best_binary_cut(
             .then_with(|| a.right.cmp(&b.right))
     });
 
+    if members.len() <= 18 {
+        return exact_binary_cut(
+            members,
+            model_hard,
+            marker_hard,
+            &diff_edges,
+            &same_edges,
+            contigs,
+        );
+    }
+
     let mut best: Option<CutCandidate> = None;
     for seed in diff_edges.iter().take(8) {
         let labels = greedy_signed_cut(members, seed, &diff_edges, &same_edges, contigs);
@@ -374,6 +385,118 @@ fn best_binary_cut(
             &same_edges,
             contigs,
         );
+        let replace = match &best {
+            None => true,
+            Some(existing) => {
+                candidate.objective > existing.objective + 1e-9
+                    || ((candidate.objective - existing.objective).abs() <= 1e-9
+                        && (
+                            candidate.cut_marker_hard,
+                            candidate.cut_model_hard,
+                            candidate.min_side_bp,
+                        ) > (
+                            existing.cut_marker_hard,
+                            existing.cut_model_hard,
+                            existing.min_side_bp,
+                        ))
+            }
+        };
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn exact_binary_cut(
+    members: &[usize],
+    model_hard: &HashMap<(usize, usize), f64>,
+    marker_hard: &HashSet<(usize, usize)>,
+    diff_edges: &[WeightedEdge],
+    same_edges: &[WeightedEdge],
+    contigs: &[Contig],
+) -> Option<CutCandidate> {
+    if members.len() < 2 || members.len() > 18 {
+        return None;
+    }
+    let positions: HashMap<usize, usize> = members
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, member)| (member, position))
+        .collect();
+    let total_model_hard = model_hard
+        .keys()
+        .filter(|&&(left, right)| positions.contains_key(&left) && positions.contains_key(&right))
+        .count();
+    let mut best: Option<CutCandidate> = None;
+    let total_masks = 1usize << members.len();
+
+    // Fix members[0] on side zero to remove the left/right mirror symmetry.  Mask zero is
+    // excluded so both sides are non-empty.  For n <= 18 this is at most 131,071 cuts.
+    for mask in 1usize..total_masks {
+        if mask & 1 != 0 {
+            continue;
+        }
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut left_bp = 0usize;
+        let mut right_bp = 0usize;
+        for (position, &member) in members.iter().enumerate() {
+            if (mask >> position) & 1 == 0 {
+                left.push(member);
+                left_bp += contigs[member].seq.len();
+            } else {
+                right.push(member);
+                right_bp += contigs[member].seq.len();
+            }
+        }
+        if left.is_empty() || right.is_empty() {
+            continue;
+        }
+
+        let mut objective = 0.0f64;
+        for edge in diff_edges {
+            let left_side = (mask >> positions[&edge.left]) & 1;
+            let right_side = (mask >> positions[&edge.right]) & 1;
+            if left_side != right_side {
+                objective += edge.weight;
+            }
+        }
+        for edge in same_edges {
+            let left_side = (mask >> positions[&edge.left]) & 1;
+            let right_side = (mask >> positions[&edge.right]) & 1;
+            if left_side == right_side {
+                objective += edge.weight;
+            }
+        }
+        let cut_model_hard = model_hard
+            .keys()
+            .filter(|&&(a, b)| {
+                let (Some(&a_pos), Some(&b_pos)) = (positions.get(&a), positions.get(&b)) else {
+                    return false;
+                };
+                ((mask >> a_pos) & 1) != ((mask >> b_pos) & 1)
+            })
+            .count();
+        let cut_marker_hard = marker_hard
+            .iter()
+            .filter(|&&(a, b)| {
+                let (Some(&a_pos), Some(&b_pos)) = (positions.get(&a), positions.get(&b)) else {
+                    return false;
+                };
+                ((mask >> a_pos) & 1) != ((mask >> b_pos) & 1)
+            })
+            .count();
+        let candidate = CutCandidate {
+            left,
+            right,
+            objective,
+            cut_model_hard,
+            cut_marker_hard,
+            total_model_hard,
+            min_side_bp: left_bp.min(right_bp),
+        };
         let replace = match &best {
             None => true,
             Some(existing) => {
