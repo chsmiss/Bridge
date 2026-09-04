@@ -1,0 +1,68 @@
+name: BridgeBin one-off DNA pair endpoint filter
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - .github/workflows/bridgebin-oneoff-dna-pair-filter.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgebin-v2-signed-evidence
+      - name: Add pair-endpoint filtering to DNA embedder
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/bridgebin_dna_embed.py')
+          s=p.read_text()
+          old='''    parser.add_argument("--output", type=Path, required=True)\n    parser.add_argument("--model", default="zhihan1996/DNABERT-S")\n'''
+          new='''    parser.add_argument("--output", type=Path, required=True)\n    parser.add_argument(\n        "--pairs",\n        type=Path,\n        help=(\n            "optional candidate-pair TSV; only contigs appearing in left/right (or source/target) "\n            "columns are embedded"\n        ),\n    )\n    parser.add_argument("--model", default="zhihan1996/DNABERT-S")\n'''
+          if old not in s:
+              raise SystemExit('parser insertion point not found')
+          s=s.replace(old,new,1)
+
+          marker='''def reverse_complement(sequence: str) -> str:\n'''
+          helper='''def read_pair_endpoints(path: Optional[Path]) -> Optional[set[str]]:\n    if path is None:\n        return None\n    with path.open("r", encoding="utf-8", newline="") as handle:\n        reader = csv.DictReader(handle, delimiter="\\t")\n        if not reader.fieldnames:\n            raise ValueError(f"{path}: missing header")\n        fields = {name.lower(): name for name in reader.fieldnames}\n        left_name = next((fields[name] for name in ("left", "source", "contig_a", "contig1") if name in fields), None)\n        right_name = next((fields[name] for name in ("right", "target", "contig_b", "contig2") if name in fields), None)\n        if left_name is None or right_name is None:\n            raise ValueError(f"{path}: pair table needs left/right or source/target columns")\n        endpoints: set[str] = set()\n        for row in reader:\n            left = (row.get(left_name) or "").strip()\n            right = (row.get(right_name) or "").strip()\n            if left:\n                endpoints.add(left)\n            if right:\n                endpoints.add(right)\n    return endpoints\n\n\n'''
+          if marker not in s:
+              raise SystemExit('helper insertion marker not found')
+          s=s.replace(marker,helper+marker,1)
+
+          old='''    runtime = load_runtime(args.model, args.device, args.trust_remote_code)\n    records = []\n    full_window_count = 0\n    for contig, sequence in read_fasta(args.contigs):\n'''
+          new='''    endpoints = read_pair_endpoints(args.pairs)\n    runtime = load_runtime(args.model, args.device, args.trust_remote_code)\n    records = []\n    full_window_count = 0\n    selected_contigs = 0\n    for contig, sequence in read_fasta(args.contigs):\n        if endpoints is not None and contig not in endpoints:\n            continue\n        selected_contigs += 1\n'''
+          if old not in s:
+              raise SystemExit('main loop insertion point not found')
+          s=s.replace(old,new,1)
+
+          old='''    backend = runtime[-1]\n    print(\n        f"bridgebin-dna: windows={written}/{full_window_count} "\n        f"contigs={len({c for c, _, _ in records})} model={args.model} backend={backend}"\n    )\n'''
+          new='''    backend = runtime[-1]\n    embedded_contigs = len({c for c, _, _ in records})\n    missing_endpoints = 0 if endpoints is None else max(0, len(endpoints) - selected_contigs)\n    print(\n        f"bridgebin-dna: windows={written}/{full_window_count} "\n        f"contigs={embedded_contigs} selected={selected_contigs} "\n        f"missing_pair_endpoints={missing_endpoints} model={args.model} backend={backend}"\n    )\n'''
+          if old not in s:
+              raise SystemExit('summary block not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          python3 -m py_compile scripts/bridgebin_dna_embed.py
+          python3 - <<'PY'
+          import tempfile
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'scripts')
+          import bridgebin_dna_embed as m
+          with tempfile.TemporaryDirectory() as td:
+              p=Path(td)/'pairs.tsv'
+              p.write_text('left\tright\nA\tB\nB\tC\n')
+              assert m.read_pair_endpoints(p) == {'A','B','C'}
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/bridgebin_dna_embed.py
+          git commit -m 'feat(bridgebin): embed only biological pair endpoints'
+          git push origin HEAD:codex/bridgebin-v2-signed-evidence
