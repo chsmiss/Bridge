@@ -226,11 +226,41 @@ def gc_fraction(sequence: str) -> float:
     return sum(base in "GC" for base in valid) / len(valid)
 
 
+def cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    if not left or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    lnorm = math.sqrt(sum(value * value for value in left))
+    rnorm = math.sqrt(sum(value * value for value in right))
+    if lnorm <= 1e-12 or rnorm <= 1e-12:
+        return 0.0
+    return max(-1.0, min(1.0, dot / (lnorm * rnorm)))
+
+
+def log_coverage_similarity(left: Sequence[float], right: Sequence[float]) -> Optional[float]:
+    if not left or len(left) != len(right):
+        return None
+    distance = sum(abs(math.log((a + 0.5) / (b + 0.5))) for a, b in zip(left, right)) / len(left)
+    return math.exp(-distance / 0.85)
+
+
+def cheap_similarity(left: Feature, right: Feature) -> float:
+    comp = max(0.0, cosine(left.composition, right.composition))
+    gc = math.exp(-abs(left.gc - right.gc) / 0.08)
+    cov = log_coverage_similarity(left.coverage, right.coverage)
+    weighted = 0.45 * comp + 0.05 * gc
+    total = 0.50
+    if cov is not None:
+        weighted += 0.50 * cov
+        total += 0.50
+    return weighted / total
+
+
 def build_features(
-    contig_path: Path, coverage: Dict[str, List[float]], min_length: int
+    contigs: Path, coverage: Dict[str, List[float]], min_length: int
 ) -> Dict[str, Feature]:
     result: Dict[str, Feature] = {}
-    for contig, sequence in read_fasta(contig_path):
+    for contig, sequence in read_fasta(contigs):
         if len(sequence) < min_length:
             continue
         result[contig] = Feature(
@@ -243,242 +273,192 @@ def build_features(
     return result
 
 
-def hellinger(left: Sequence[float], right: Sequence[float]) -> float:
-    return math.sqrt(
-        0.5
-        * sum((math.sqrt(a) - math.sqrt(b)) ** 2 for a, b in zip(left, right))
-    )
+def farthest_anchor_selection(candidates: Sequence[Feature], limit: int) -> List[Feature]:
+    if limit <= 0 or not candidates:
+        return []
+    ordered = sorted(candidates, key=lambda item: (-item.length, item.contig))
+    selected = ordered[: min(2, limit)]
+    selected_names = {item.contig for item in selected}
+    while len(selected) < min(limit, len(ordered)):
+        remaining = [item for item in ordered if item.contig not in selected_names]
+        best = min(
+            remaining,
+            key=lambda item: (
+                max(cheap_similarity(item, anchor) for anchor in selected),
+                -item.length,
+                item.contig,
+            ),
+        )
+        selected.append(best)
+        selected_names.add(best.contig)
+    return selected
 
 
-def component_sim(left: Feature, right: Feature) -> Tuple[Optional[float], float, float]:
-    composition = math.exp(-hellinger(left.composition, right.composition) / 0.30)
-    gc = math.exp(-abs(left.gc - right.gc) / 0.08)
-    coverage: Optional[float] = None
-    if left.coverage and len(left.coverage) == len(right.coverage):
-        distance = sum(
-            abs(math.log((a + 0.5) / (b + 0.5)))
-            for a, b in zip(left.coverage, right.coverage)
-        ) / len(left.coverage)
-        coverage = math.exp(-distance / 0.85)
-    return coverage, composition, gc
+def nearest(items: Sequence[Tuple[float, str]], limit: int, reverse: bool = True) -> List[str]:
+    if limit <= 0:
+        return []
+    ordered = sorted(items, key=lambda item: (item[0], item[1]), reverse=reverse)
+    return [name for _, name in ordered[:limit]]
 
 
-def cheap_similarity(left: Feature, right: Feature) -> float:
-    coverage, composition, gc = component_sim(left, right)
-    values = [composition, gc]
-    weights = [0.45, 0.15]
-    if coverage is not None:
-        values.append(coverage)
-        weights.append(0.40)
-    return sum(value * weight for value, weight in zip(values, weights)) / sum(weights)
-
-
-def centroid(members: Sequence[Feature], name: str) -> Feature:
-    total_bp = sum(member.length for member in members)
-    if total_bp <= 0:
-        raise ValueError("cannot build centroid of empty bin")
-    gc = sum(member.gc * member.length for member in members) / total_bp
-    composition = [0.0] * 256
-    for member in members:
-        weight = member.length / total_bp
-        for index, value in enumerate(member.composition):
-            composition[index] += value * weight
-    coverage: List[float] = []
-    widths = {len(member.coverage) for member in members if member.coverage}
-    if len(widths) == 1:
-        width = next(iter(widths))
-        coverage = [0.0] * width
-        covered_bp = sum(member.length for member in members if len(member.coverage) == width)
-        if covered_bp > 0:
-            for member in members:
-                if len(member.coverage) != width:
-                    continue
-                weight = member.length / covered_bp
-                for index, value in enumerate(member.coverage):
-                    coverage[index] += value * weight
-    return Feature(name, total_bp, gc, composition, coverage)
-
-
-def ordered_pair(left: str, right: str) -> Tuple[str, str]:
-    return (left, right) if left <= right else (right, left)
-
-
-def add_pair(
+def add_record(
     records: Dict[Tuple[str, str], PairRecord],
     left: Feature,
     right: Feature,
     candidate_class: str,
 ) -> None:
-    if left.contig == right.contig:
+    a, b = sorted((left.contig, right.contig))
+    if a == b:
         return
-    a, b = (left, right) if left.contig <= right.contig else (right, left)
-    key = (a.contig, b.contig)
-    coverage, composition, gc = component_sim(a, b)
-    existing = records.get(key)
-    if existing is None:
-        records[key] = PairRecord(
-            left=a.contig,
-            right=b.contig,
-            coverage_similarity=coverage,
-            composition_similarity=composition,
-            gc_similarity=gc,
-            classes={candidate_class},
+    key = (a, b)
+    record = records.get(key)
+    if record is None:
+        record = PairRecord(
+            left=a,
+            right=b,
+            coverage_similarity=log_coverage_similarity(left.coverage, right.coverage),
+            composition_similarity=max(0.0, cosine(left.composition, right.composition)),
+            gc_similarity=math.exp(-abs(left.gc - right.gc) / 0.08),
+            classes=set(),
         )
-    else:
-        existing.classes.add(candidate_class)
+        records[key] = record
+    record.classes.add(candidate_class)
 
 
-def select_anchors(
-    members: Sequence[Feature], count: int, strategy: str
+def choose_anchors(
+    features: Dict[str, Feature],
+    members: Sequence[str],
+    limit: int,
+    strategy: str,
 ) -> List[Feature]:
-    if count <= 0 or not members:
-        return []
-    count = min(count, len(members))
-    if strategy == "longest":
-        return list(members[:count])
-    if strategy != "diverse":
-        raise ValueError(f"unknown anchor strategy: {strategy}")
-
-    # Preserve a small long-contig core for representation quality, then deliberately
-    # explore cheap-feature space. The length factor prevents a tiny composition outlier
-    # from winning solely because it is noisy, while still allowing minority components
-    # to beat another nearly identical long contig.
-    seed_count = min(2, count)
-    selected = list(members[:seed_count])
-    selected_ids = {feature.contig for feature in selected}
-    max_length = max(feature.length for feature in members)
-    while len(selected) < count:
-        best = None
-        best_key = None
-        for candidate in members:
-            if candidate.contig in selected_ids:
-                continue
-            min_distance = min(
-                1.0 - cheap_similarity(candidate, anchor) for anchor in selected
-            )
-            length_fraction = candidate.length / max(1, max_length)
-            score = min_distance * (0.65 + 0.35 * math.sqrt(length_fraction))
-            key = (score, min_distance, candidate.length, candidate.contig)
-            if best_key is None or key > best_key:
-                best_key = key
-                best = candidate
-        if best is None:
-            break
-        selected.append(best)
-        selected_ids.add(best.contig)
-    return selected
-
-
-def ranked_anchors(member: Feature, anchors: Sequence[Feature]) -> List[Tuple[float, Feature]]:
-    ranked = [
-        (cheap_similarity(member, anchor), anchor)
-        for anchor in anchors
-        if anchor.contig != member.contig
-    ]
-    ranked.sort(key=lambda item: (-item[0], -item[1].length, item[1].contig))
-    return ranked
+    candidates = [features[name] for name in members if name in features]
+    if strategy == "diverse":
+        return farthest_anchor_selection(candidates, limit)
+    return sorted(candidates, key=lambda item: (-item.length, item.contig))[:limit]
 
 
 def mine(
-    features: Dict[str, Feature],
-    assignments: Dict[str, Optional[str]],
-    args: argparse.Namespace,
-) -> Dict[Tuple[str, str], PairRecord]:
-    bins: Dict[str, List[Feature]] = defaultdict(list)
-    residuals: List[Feature] = []
-    for contig, feature in features.items():
-        bin_name = assignments.get(contig)
+    features: Dict[str, Feature], assignments: Dict[str, Optional[str]], args: argparse.Namespace
+) -> List[PairRecord]:
+    bins: Dict[str, List[str]] = defaultdict(list)
+    residuals: List[str] = []
+    for contig, bin_name in assignments.items():
+        if contig not in features:
+            continue
         if bin_name is None:
-            residuals.append(feature)
+            residuals.append(contig)
         else:
-            bins[bin_name].append(feature)
-    for members in bins.values():
-        members.sort(key=lambda feature: (-feature.length, feature.contig))
+            bins[bin_name].append(contig)
 
     anchors: Dict[str, List[Feature]] = {
-        bin_name: select_anchors(members, args.anchors_per_bin, args.anchor_strategy)
+        bin_name: choose_anchors(features, members, args.anchors_per_bin, args.anchor_strategy)
         for bin_name, members in bins.items()
-        if members
     }
     records: Dict[Tuple[str, str], PairRecord] = {}
-    focus_bins = read_focus_bins(args.focus_bins)
 
-    # Probe every current bin for hidden mixtures. Anchor all-vs-all ensures a mixed bin
-    # with two long genome components presents cross-component examples to the model.
     for bin_name, members in bins.items():
-        bin_anchors = anchors.get(bin_name, [])
-        for left_index in range(len(bin_anchors)):
-            for right_index in range(left_index + 1, len(bin_anchors)):
-                add_pair(records, bin_anchors[left_index], bin_anchors[right_index], "within_bin_anchor")
-        if not args.probe_only and (focus_bins is None or bin_name in focus_bins):
-            for member in members:
-                ranked = ranked_anchors(member, bin_anchors)
-                for _score, anchor in ranked[: args.within_neighbors]:
-                    add_pair(records, member, anchor, "within_bin_neighbor")
-                if args.within_contrast > 0:
-                    for _score, anchor in ranked[-args.within_contrast :]:
-                        add_pair(records, member, anchor, "within_bin_contrast")
-
-    # Current bins that are close under cheap features are candidates for conservative
-    # biological re-merge. Select neighbors by bin centroid, then only score anchor pairs.
-    centroids: Dict[str, Feature] = {
-        name: centroid(members, f"__bin__{name}") for name, members in bins.items() if members
-    }
-    processed_bin_pairs: Set[Tuple[str, str]] = set()
-    for bin_name, center in centroids.items():
-        neighbors = [
-            (cheap_similarity(center, other), other_name)
-            for other_name, other in centroids.items()
-            if other_name != bin_name
-        ]
-        neighbors.sort(key=lambda item: (-item[0], item[1]))
-        for _score, other_name in neighbors[: args.merge_bin_neighbors]:
-            bin_pair = ordered_pair(bin_name, other_name)
-            if bin_pair in processed_bin_pairs:
+        current_anchors = anchors[bin_name]
+        if len(current_anchors) < 2:
+            continue
+        for left_index, left in enumerate(current_anchors):
+            for right in current_anchors[left_index + 1 :]:
+                add_record(records, left, right, "within_bin_anchor")
+        if args.probe_only:
+            continue
+        if args.focus_bins is not None and bin_name not in args.focus_bins:
+            continue
+        anchor_names = {anchor.contig for anchor in current_anchors}
+        for member_name in members:
+            if member_name in anchor_names:
                 continue
-            processed_bin_pairs.add(bin_pair)
-            possibilities = [
-                (cheap_similarity(left, right), left, right)
-                for left in anchors.get(bin_name, [])
-                for right in anchors.get(other_name, [])
+            member = features[member_name]
+            similarities = [
+                (cheap_similarity(member, anchor), anchor.contig) for anchor in current_anchors
             ]
-            possibilities.sort(
-                key=lambda item: (-item[0], -item[1].length - item[2].length, item[1].contig, item[2].contig)
+            for anchor_name in nearest(similarities, args.within_neighbors, reverse=True):
+                add_record(records, member, features[anchor_name], "within_bin_member")
+            for anchor_name in nearest(similarities, args.within_contrast, reverse=False):
+                add_record(records, member, features[anchor_name], "within_bin_contrast")
+
+    bin_names = sorted(anchors)
+    if args.merge_bin_neighbors > 0 and args.cross_anchor_pairs > 0:
+        bin_centroids: Dict[str, Feature] = {}
+        for bin_name, current_anchors in anchors.items():
+            if not current_anchors:
+                continue
+            total_length = sum(anchor.length for anchor in current_anchors)
+            width = max((len(anchor.coverage) for anchor in current_anchors), default=0)
+            coverage_values = [0.0] * width
+            composition_values = [0.0] * 256
+            gc = 0.0
+            for anchor in current_anchors:
+                weight = anchor.length / max(1, total_length)
+                gc += anchor.gc * weight
+                for index, value in enumerate(anchor.composition):
+                    composition_values[index] += value * weight
+                if len(anchor.coverage) == width:
+                    for index, value in enumerate(anchor.coverage):
+                        coverage_values[index] += value * weight
+            bin_centroids[bin_name] = Feature(
+                contig=bin_name,
+                length=total_length,
+                gc=gc,
+                composition=composition_values,
+                coverage=coverage_values,
             )
-            for _pair_score, left, right in possibilities[: args.cross_anchor_pairs]:
-                add_pair(records, left, right, "cross_bin_merge")
 
-    # Residual rescue is deferred until after the anchor conflict probe.  This keeps the
-    # first-pass foundation-model endpoint set proportional to bin anchors, not all contigs.
-    if not args.probe_only and not args.skip_residual_rescue:
-        for residual in sorted(residuals, key=lambda feature: (-feature.length, feature.contig)):
-            neighbor_bins = [
-                (cheap_similarity(residual, center), bin_name)
-                for bin_name, center in centroids.items()
+        for bin_name in bin_names:
+            if bin_name not in bin_centroids:
+                continue
+            current = bin_centroids[bin_name]
+            others = [
+                (cheap_similarity(current, bin_centroids[other]), other)
+                for other in bin_names
+                if other != bin_name and other in bin_centroids
             ]
-            neighbor_bins.sort(key=lambda item: (-item[0], item[1]))
-            for _bin_score, bin_name in neighbor_bins[: args.rescue_bin_neighbors]:
-                ranked = ranked_anchors(residual, anchors.get(bin_name, []))
-                for _score, anchor in ranked[: args.rescue_anchor_pairs]:
-                    add_pair(records, residual, anchor, "residual_rescue")
+            for other in nearest(others, args.merge_bin_neighbors, reverse=True):
+                left_anchors = anchors.get(bin_name, [])
+                right_anchors = anchors.get(other, [])
+                cross = [
+                    (cheap_similarity(left, right), left, right)
+                    for left in left_anchors
+                    for right in right_anchors
+                ]
+                cross.sort(key=lambda item: (-item[0], item[1].contig, item[2].contig))
+                for _, left, right in cross[: args.cross_anchor_pairs]:
+                    add_record(records, left, right, "cross_bin_merge")
 
-    return records
+    if not args.probe_only and not args.skip_residual_rescue and args.rescue_bin_neighbors > 0 and args.rescue_anchor_pairs > 0:
+        centroids = {
+            bin_name: max(current_anchors, key=lambda item: item.length)
+            for bin_name, current_anchors in anchors.items()
+            if current_anchors
+        }
+        for residual_name in residuals:
+            residual = features[residual_name]
+            candidates = [
+                (cheap_similarity(residual, centroid), bin_name)
+                for bin_name, centroid in centroids.items()
+            ]
+            for bin_name in nearest(candidates, args.rescue_bin_neighbors, reverse=True):
+                scores = [
+                    (cheap_similarity(residual, anchor), anchor.contig)
+                    for anchor in anchors[bin_name]
+                ]
+                for anchor_name in nearest(scores, args.rescue_anchor_pairs, reverse=True):
+                    add_record(records, residual, features[anchor_name], "residual_rescue")
+    return list(records.values())
 
 
-def write_records(path: Path, records: Dict[Tuple[str, str], PairRecord], max_pairs: int) -> None:
+def write_records(path: Path, records: Sequence[PairRecord], max_pairs: int) -> None:
     ranked = sorted(
-        records.values(),
+        records,
         key=lambda record: (
-            -max(
-                record.composition_similarity,
-                record.coverage_similarity if record.coverage_similarity is not None else 0.0,
-            ),
+            -len(record.classes),
             record.left,
             record.right,
         ),
-    )
-    if max_pairs > 0:
-        ranked = ranked[:max_pairs]
+    )[:max_pairs]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
@@ -517,20 +497,22 @@ def write_records(path: Path, records: Dict[Tuple[str, str], PairRecord], max_pa
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.anchors_per_bin < 1 or args.min_length < 1:
+        raise SystemExit("--anchors-per-bin and --min-length must be positive")
     for name in (
-        "anchors_per_bin",
         "within_neighbors",
         "merge_bin_neighbors",
         "cross_anchor_pairs",
         "rescue_bin_neighbors",
         "rescue_anchor_pairs",
     ):
-        if getattr(args, name) < 1:
-            raise SystemExit(f"--{name.replace('_', '-')} must be positive")
-    if args.within_contrast < 0 or args.min_length < 1:
-        raise SystemExit("--within-contrast must be >=0 and --min-length must be positive")
+        if getattr(args, name) < 0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be >=0")
+    if args.within_contrast < 0:
+        raise SystemExit("--within-contrast must be >=0")
     coverage = read_coverage(args.coverage)
     assignments = read_assignments(args.assignments)
+    args.focus_bins = read_focus_bins(args.focus_bins)
     features = build_features(args.contigs, coverage, args.min_length)
     records = mine(features, assignments, args)
     write_records(args.output, records, args.max_pairs)
