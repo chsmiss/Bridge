@@ -1,0 +1,25 @@
+name: Stage21 trusted-prior unit
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/stage21-trusted-prior-unit.yml
+      - scripts/make_trusted_prior_fragment.py
+      - scripts/test_make_trusted_prior_fragment.py
+      - scripts/low_abundance_rescue.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test trusted-prior fragment generator
+        run: |
+          python3 -m py_compile scripts/make_trusted_prior_fragment.py scripts/test_make_trusted_prior_fragment.py
+          PYTHONPATH=scripts python3 scripts/test_make_trusted_prior_fragment.py
