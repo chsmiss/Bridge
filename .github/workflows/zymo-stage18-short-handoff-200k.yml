@@ -31,7 +31,7 @@ jobs:
       - name: Install evaluation tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl unzip time
+          sudo apt-get install -y curl unzip minimap2 time
           curl -L --retry 3 -o /tmp/quast.tar.gz \
             https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
           tar -xzf /tmp/quast.tar.gz -C /tmp
