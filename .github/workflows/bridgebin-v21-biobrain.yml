@@ -6,6 +6,7 @@ on:
       - codex/bridgebin-v2-signed-evidence
     paths:
       - src/bridgebin_v21.rs
+      - src/bridgebin_v21_merge.rs
       - src/bin/bridgebin-v21.rs
       - src/lib.rs
       - scripts/bridgebin_pair_head.py
@@ -77,7 +78,7 @@ jobs:
             --output "$base/hard_negative_training_pairs.tsv" \
             --max-contigs-per-genome 250
 
-      - name: Compare signed baseline and v2.1 pair refinement
+      - name: Compare split and constrained merge stages
         run: |
           set -euo pipefail
           base='benchmark/bridgebin_v21'
@@ -95,14 +96,24 @@ jobs:
             --out-dir "$base/v21_no_pair" \
             >"$base/v21_no_pair.log" 2>&1
 
+          # Disable cross-bin merging to preserve the previous oracle-interface result.
           target/release/bridgebin-v21 \
             --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
             --pair-scores "$base/oracle_pair_scores.tsv" \
-            --out-dir "$base/v21_oracle_interface" \
+            --out-dir "$base/v21_oracle_no_merge" \
             --v21-min-subbin-bp 10000 \
-            >"$base/v21_oracle_interface.log" 2>&1
+            --v21-bin-merge-min-support 1000000 \
+            >"$base/v21_oracle_no_merge.log" 2>&1
 
-          for tag in v2_balanced v21_no_pair v21_oracle_interface; do
+          # Same pair evidence, now allowing only multi-supported, veto-aware bin merges.
+          target/release/bridgebin-v21 \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --pair-scores "$base/oracle_pair_scores.tsv" \
+            --out-dir "$base/v21_oracle_merge" \
+            --v21-min-subbin-bp 10000 \
+            >"$base/v21_oracle_merge.log" 2>&1
+
+          for tag in v2_balanced v21_no_pair v21_oracle_no_merge v21_oracle_merge; do
             python3 scripts/bridgebin_benchmark.py evaluate \
               --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
               --assignments "$base/$tag/assignments.tsv" \
@@ -114,23 +125,27 @@ jobs:
           import json
           from pathlib import Path
           root = Path('benchmark/bridgebin_v21')
-          metrics = {
-              name: json.loads((root / f'{name}.metrics.json').read_text())
-              for name in ('v2_balanced', 'v21_no_pair', 'v21_oracle_interface')
-          }
+          names = ('v2_balanced', 'v21_no_pair', 'v21_oracle_no_merge', 'v21_oracle_merge')
+          metrics = {name: json.loads((root / f'{name}.metrics.json').read_text()) for name in names}
           print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tbp_binned_fraction')
-          for name, m in metrics.items():
+          for name in names:
+              m = metrics[name]
               print(
                   f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t"
                   f"{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t"
                   f"{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t"
                   f"{m['bp_binned_fraction']:.6f}"
               )
-          # Empty pair evidence must be behaviorally neutral.
           a, b = metrics['v2_balanced'], metrics['v21_no_pair']
           for key in ('weighted_purity', 'bp_recall', 'f1', 'ari', 'bp_binned_fraction'):
               if abs(a[key] - b[key]) > 1e-9:
                   raise SystemExit(f'neutral v2.1 refiner changed {key}: {a[key]} vs {b[key]}')
+          # Cross-bin consolidation must never lower oracle purity/HQ in this plumbing test.
+          before, after = metrics['v21_oracle_no_merge'], metrics['v21_oracle_merge']
+          if after['weighted_purity'] + 1e-9 < before['weighted_purity']:
+              raise SystemExit('constrained bin merge reduced oracle purity')
+          if after['hq_like_genomes_90_95'] < before['hq_like_genomes_90_95']:
+              raise SystemExit('constrained bin merge reduced HQ-like genome count')
           PY
 
       - name: Upload benchmark artifact
