@@ -23,12 +23,11 @@ import argparse
 import json
 import resource
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 import graph_path_phaser as gp
-import low_abundance_rescue as lr
 import repeat_graph_optimizer as rg
 import stage14_amplified_methods as s14
 import stage16_root_cause as s16
@@ -38,7 +37,8 @@ import stage789_optimizer as s78
 
 @dataclass(frozen=True)
 class ExactAnchor:
-    pos: int
+    start_pos: int
+    end_pos: int
     uid: str
 
 
@@ -57,16 +57,17 @@ class GapResolution:
 
 
 def exact_anchor_runs(seq: str, index: gp.KmerIndex) -> list[ExactAnchor]:
-    """Return one terminal position for each consecutive unique-unitig run."""
+    """Return start/end positions for each consecutive unique-unitig run."""
     anchors: list[ExactAnchor] = []
     for pos, key in gp.rolling_keys(seq, index.k):
         uid = index.unique.get(key)
         if uid is None:
             continue
         if anchors and anchors[-1].uid == uid:
-            anchors[-1] = ExactAnchor(pos, uid)
+            old = anchors[-1]
+            anchors[-1] = ExactAnchor(old.start_pos, pos, uid)
         else:
-            anchors.append(ExactAnchor(pos, uid))
+            anchors.append(ExactAnchor(pos, pos, uid))
     return anchors
 
 
@@ -138,8 +139,10 @@ def choose_path_by_read(
 ) -> GapResolution | None:
     if len(paths) < 2:
         return None
-    start = max(0, left.pos - 8)
-    end = min(len(seq), right.pos + graph.k + 8)
+    # Constrain the scoring interval to the actual unresolved gap: the terminal
+    # exact k31 of the left run to the first exact k31 of the right run.
+    start = max(0, left.end_pos - 8)
+    end = min(len(seq), right.start_pos + graph.k + 8)
     if end <= start:
         return None
     segment = seq[start:end]
@@ -156,8 +159,6 @@ def choose_path_by_read(
         for path in paths:
             hits = len(discriminative & internal_path_keys(path, graph, k))
             physical, total = physical_edge_count(path, graph)
-            # Prefer read evidence first. Physical evidence breaks ties only;
-            # it cannot compensate for a read-incompatible internal branch.
             scores.append((hits, physical, -len(path), total, tuple(path), path))
         scores.sort(reverse=True)
         best = scores[0]
@@ -171,8 +172,8 @@ def choose_path_by_read(
         return GapResolution(
             left.uid,
             right.uid,
-            left.pos,
-            right.pos,
+            left.end_pos,
+            right.start_pos,
             tuple(best_path),
             k,
             best_hits,
@@ -193,15 +194,13 @@ def resolve_read_anchor_gaps(
     anchors = exact_anchor_runs(seq, exact_index)
     resolved: list[GapResolution] = []
     for left, right in zip(anchors, anchors[1:]):
-        if left.uid == right.uid or right.pos <= left.pos:
+        if left.uid == right.uid or right.start_pos <= left.end_pos:
             continue
-        # Direct and unique <=3-edge transitions are already handled by the
-        # ordinary exact threader. We only inspect an actual split/ambiguity.
         if right.uid in graph.out.get(left.uid, []):
             continue
         if gp.unique_short_bridge(graph, left.uid, right.uid, 3) is not None:
             continue
-        read_delta = right.pos - left.pos
+        read_delta = right.start_pos - left.end_pos
         paths = enumerate_bounded_paths(
             graph,
             left.uid,
@@ -430,13 +429,13 @@ def main() -> None:
     )
     root = args.pipeline_dir / "stage20_anchor_gap_thread"
     stats = {
-        "pipeline": "bridge-stage20-anchor-gap-thread-v1",
+        "pipeline": "bridge-stage20-anchor-gap-thread-v2",
         "baseline": str(strict_baseline),
         "policy": {
             "reference_free": True,
             "metric_targets": False,
-            "fixed_evidence": "unique exact k31 anchors",
-            "search_space": "bounded graph paths only between consecutive exact anchors",
+            "fixed_evidence": "unique exact k31 anchor runs",
+            "search_space": "bounded graph paths from left-run terminal anchor to right-run initial anchor",
             "branch_evidence": "flank-subtracted k19, k15 fallback",
             "graph_edges": "existing GFA edges only",
             "output": "add-only on Stage10 strict",
