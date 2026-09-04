@@ -131,7 +131,7 @@ jobs:
             --output "$base/dna_windows.tsv" \
             --model zhihan1996/DNABERT-S --device cpu \
             --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
-            --max-windows-per-contig 1 --max-tokens 384 --batch-size 4
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
           python scripts/bridgebin_bio_features.py \
             --dna-embeddings "$base/dna_windows.tsv" --output "$base/features.tsv"
 
@@ -155,6 +155,12 @@ jobs:
           PY
           join=$(sed -n '1p' /tmp/v22_thresholds)
           split=$(sed -n '2p' /tmp/v22_thresholds)
+          python scripts/bridgebin_eval_pair_scores.py \
+            --pairs "$base/candidates.tsv" --scores "$base/pair_scores.tsv" \
+            --truth "$base/truth.tsv" \
+            --join-threshold "$join" --split-threshold "$split" \
+            --focus Escherichia_coli,Salmonella_enterica \
+            --output "$base/pair_score.metrics.json"
           target/release/bridgebin-v21 \
             --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
             --pair-scores "$base/pair_scores.tsv" --out-dir "$base/v22" \
@@ -176,7 +182,9 @@ jobs:
           c=json.loads((base/'core.metrics.json').read_text())
           v=json.loads((base/'v22.metrics.json').read_text())
           q=json.loads((base/'candidate.metrics.json').read_text())
+          p=json.loads((base/'pair_score.metrics.json').read_text())
           print('candidate_metrics',json.dumps(q,sort_keys=True))
+          print('pair_score_metrics',json.dumps(p,sort_keys=True))
           print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tbinned')
           for name,m in [('core',c),('v22-real-dna',v)]:
               print(f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t{m['bp_binned_fraction']:.6f}")
