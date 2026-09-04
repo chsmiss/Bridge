@@ -24,128 +24,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import base64
           from pathlib import Path
           p=Path('src/bridgebin_v21.rs')
           s=p.read_text()
-          needle='''    let mut best: Option<CutCandidate> = None;\n    for seed in diff_edges.iter().take(8) {\n'''
-          replacement='''    if members.len() <= 18 {\n        return exact_binary_cut(\n            members,\n            model_hard,\n            marker_hard,\n            &diff_edges,\n            &same_edges,\n            contigs,\n        );\n    }\n\n    let mut best: Option<CutCandidate> = None;\n    for seed in diff_edges.iter().take(8) {\n'''
+          needle='    let mut best: Option<CutCandidate> = None;\n    for seed in diff_edges.iter().take(8) {\n'
+          replacement='    if members.len() <= 18 {\n        return exact_binary_cut(\n            members,\n            model_hard,\n            marker_hard,\n            &diff_edges,\n            &same_edges,\n            contigs,\n        );\n    }\n\n    let mut best: Option<CutCandidate> = None;\n    for seed in diff_edges.iter().take(8) {\n'
           if needle not in s:
               raise SystemExit('best_binary_cut insertion point not found')
           s=s.replace(needle,replacement,1)
-          marker='''fn greedy_signed_cut(\n'''
-          exact=r'''fn exact_binary_cut(
-    members: &[usize],
-    model_hard: &HashMap<(usize, usize), f64>,
-    marker_hard: &HashSet<(usize, usize)>,
-    diff_edges: &[WeightedEdge],
-    same_edges: &[WeightedEdge],
-    contigs: &[Contig],
-) -> Option<CutCandidate> {
-    if members.len() < 2 || members.len() > 18 {
-        return None;
-    }
-    let positions: HashMap<usize, usize> = members
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(position, member)| (member, position))
-        .collect();
-    let total_model_hard = model_hard
-        .keys()
-        .filter(|&&(left, right)| positions.contains_key(&left) && positions.contains_key(&right))
-        .count();
-    let mut best: Option<CutCandidate> = None;
-    let total_masks = 1usize << members.len();
-
-    // Fix members[0] on side zero to remove the left/right mirror symmetry.  Mask zero is
-    // excluded so both sides are non-empty.  For n <= 18 this is at most 131,071 cuts.
-    for mask in 1usize..total_masks {
-        if mask & 1 != 0 {
-            continue;
-        }
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        let mut left_bp = 0usize;
-        let mut right_bp = 0usize;
-        for (position, &member) in members.iter().enumerate() {
-            if (mask >> position) & 1 == 0 {
-                left.push(member);
-                left_bp += contigs[member].seq.len();
-            } else {
-                right.push(member);
-                right_bp += contigs[member].seq.len();
-            }
-        }
-        if left.is_empty() || right.is_empty() {
-            continue;
-        }
-
-        let mut objective = 0.0f64;
-        for edge in diff_edges {
-            let left_side = (mask >> positions[&edge.left]) & 1;
-            let right_side = (mask >> positions[&edge.right]) & 1;
-            if left_side != right_side {
-                objective += edge.weight;
-            }
-        }
-        for edge in same_edges {
-            let left_side = (mask >> positions[&edge.left]) & 1;
-            let right_side = (mask >> positions[&edge.right]) & 1;
-            if left_side == right_side {
-                objective += edge.weight;
-            }
-        }
-        let cut_model_hard = model_hard
-            .keys()
-            .filter(|&&(a, b)| {
-                let (Some(&a_pos), Some(&b_pos)) = (positions.get(&a), positions.get(&b)) else {
-                    return false;
-                };
-                ((mask >> a_pos) & 1) != ((mask >> b_pos) & 1)
-            })
-            .count();
-        let cut_marker_hard = marker_hard
-            .iter()
-            .filter(|&&(a, b)| {
-                let (Some(&a_pos), Some(&b_pos)) = (positions.get(&a), positions.get(&b)) else {
-                    return false;
-                };
-                ((mask >> a_pos) & 1) != ((mask >> b_pos) & 1)
-            })
-            .count();
-        let candidate = CutCandidate {
-            left,
-            right,
-            objective,
-            cut_model_hard,
-            cut_marker_hard,
-            total_model_hard,
-            min_side_bp: left_bp.min(right_bp),
-        };
-        let replace = match &best {
-            None => true,
-            Some(existing) => {
-                candidate.objective > existing.objective + 1e-9
-                    || ((candidate.objective - existing.objective).abs() <= 1e-9
-                        && (
-                            candidate.cut_marker_hard,
-                            candidate.cut_model_hard,
-                            candidate.min_side_bp,
-                        ) > (
-                            existing.cut_marker_hard,
-                            existing.cut_model_hard,
-                            existing.min_side_bp,
-                        ))
-            }
-        };
-        if replace {
-            best = Some(candidate);
-        }
-    }
-    best
-}
-
-'''
+          marker='fn greedy_signed_cut(\n'
+          exact=base64.b64decode('Zm4gZXhhY3RfYmluYXJ5X2N1dCgKICAgIG1lbWJlcnM6ICZbdXNpemVdLAogICAgbW9kZWxfaGFyZDogJkhhc2hNYXA8KHVzaXplLCB1c2l6ZSksIGY2ND4sCiAgICBtYXJrZXJfaGFyZDogJkhhc2hTZXQ8KHVzaXplLCB1c2l6ZSk+LAogICAgZGlmZl9lZGdlczogJltXZWlnaHRlZEVkZ2VdLAogICAgc2FtZV9lZGdlczogJltXZWlnaHRlZEVkZ2VdLAogICAgY29udGlnczogJltDb250aWddLAopIC0+IE9wdGlvbjxDdXRDYW5kaWRhdGU+IHsKICAgIGlmIG1lbWJlcnMubGVuKCkgPCAyIHx8IG1lbWJlcnMubGVuKCkgPiAxOCB7CiAgICAgICAgcmV0dXJuIE5vbmU7CiAgICB9CiAgICBsZXQgcG9zaXRpb25zOiBIYXNoTWFwPHVzaXplLCB1c2l6ZT4gPSBtZW1iZXJzCiAgICAgICAgLml0ZXIoKQogICAgICAgIC5jb3BpZWQoKQogICAgICAgIC5lbnVtZXJhdGUoKQogICAgICAgIC5tYXAofChwb3NpdGlvbiwgbWVtYmVyKXwgKG1lbWJlciwgcG9zaXRpb24pKQogICAgICAgIC5jb2xsZWN0KCk7CiAgICBsZXQgdG90YWxfbW9kZWxfaGFyZCA9IG1vZGVsX2hhcmQKICAgICAgICAua2V5cygpCiAgICAgICAgLmZpbHRlcih8JiYobGVmdCwgcmlnaHQpfCBwb3NpdGlvbnMuY29udGFpbnNfa2V5KCZsZWZ0KSAmJiBwb3NpdGlvbnMuY29udGFpbnNfa2V5KCZyaWdodCkpCiAgICAgICAgLmNvdW50KCk7CiAgICBsZXQgbXV0IGJlc3Q6IE9wdGlvbjxDdXRDYW5kaWRhdGU+ID0gTm9uZTsKICAgIGxldCB0b3RhbF9tYXNrcyA9IDF1c2l6ZSA8PCBtZW1iZXJzLmxlbigpOwoKICAgIC8vIEZpeCBtZW1iZXJzWzBdIG9uIHNpZGUgemVybyB0byByZW1vdmUgdGhlIGxlZnQvcmlnaHQgbWlycm9yIHN5bW1ldHJ5LiAgTWFzayB6ZXJvIGlzCiAgICAvLyBleGNsdWRlZCBzbyBib3RoIHNpZGVzIGFyZSBub24tZW1wdHkuICBGb3IgbiA8PSAxOCB0aGlzIGlzIGF0IG1vc3QgMTMxLDA3MSBjdXRzLgogICAgZm9yIG1hc2sgaW4gMXVzaXplLi50b3RhbF9tYXNrcyB7CiAgICAgICAgaWYgbWFzayAmIDEgIT0gMCB7CiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIH0KICAgICAgICBsZXQgbXV0IGxlZnQgPSBWZWM6Om5ldygpOwogICAgICAgIGxldCBtdXQgcmlnaHQgPSBWZWM6Om5ldygpOwogICAgICAgIGxldCBtdXQgbGVmdF9icCA9IDB1c2l6ZTsKICAgICAgICBsZXQgbXV0IHJpZ2h0X2JwID0gMHVzaXplOwogICAgICAgIGZvciAocG9zaXRpb24sICZtZW1iZXIpIGluIG1lbWJlcnMuaXRlcigpLmVudW1lcmF0ZSgpIHsKICAgICAgICAgICAgaWYgKG1hc2sgPj4gcG9zaXRpb24pICYgMSA9PSAwIHsKICAgICAgICAgICAgICAgIGxlZnQucHVzaChtZW1iZXIpOwogICAgICAgICAgICAgICAgbGVmdF9icCArPSBjb250aWdzW21lbWJlcl0uc2VxLmxlbigpOwogICAgICAgICAgICB9IGVsc2UgewogICAgICAgICAgICAgICAgcmlnaHQucHVzaChtZW1iZXIpOwogICAgICAgICAgICAgICAgcmlnaHRfYnAgKz0gY29udGlnc1ttZW1iZXJdLnNlcS5sZW4oKTsKICAgICAgICAgICAgfQogICAgICAgIH0KICAgICAgICBpZiBsZWZ0LmlzX2VtcHR5KCkgfHwgcmlnaHQuaXNfZW1wdHkoKSB7CiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIH0KCiAgICAgICAgbGV0IG11dCBvYmplY3RpdmUgPSAwLjBmNjQ7CiAgICAgICAgZm9yIGVkZ2UgaW4gZGlmZl9lZGdlcyB7CiAgICAgICAgICAgIGxldCBsZWZ0X3NpZGUgPSAobWFzayA+PiBwb3NpdGlvbnNbJmVkZ2UubGVmdF0pICYgMTsKICAgICAgICAgICAgbGV0IHJpZ2h0X3NpZGUgPSAobWFzayA+PiBwb3NpdGlvbnNbJmVkZ2UucmlnaHRdKSAmIDE7CiAgICAgICAgICAgIGlmIGxlZnRfc2lkZSAhPSByaWdodF9zaWRlIHsKICAgICAgICAgICAgICAgIG9iamVjdGl2ZSArPSBlZGdlLndlaWdodDsKICAgICAgICAgICAgfQogICAgICAgIH0KICAgICAgICBmb3IgZWRnZSBpbiBzYW1lX2VkZ2VzIHsKICAgICAgICAgICAgbGV0IGxlZnRfc2lkZSA9IChtYXNrID4+IHBvc2l0aW9uc1smZWRnZS5sZWZ0XSkgJiAxOwogICAgICAgICAgICBsZXQgcmlnaHRfc2lkZSA9IChtYXNrID4+IHBvc2l0aW9uc1smZWRnZS5yaWdodF0pICYgMTsKICAgICAgICAgICAgaWYgbGVmdF9zaWRlID09IHJpZ2h0X3NpZGUgewogICAgICAgICAgICAgICAgb2JqZWN0aXZlICs9IGVkZ2Uud2VpZ2h0OwogICAgICAgICAgICB9CiAgICAgICAgfQogICAgICAgIGxldCBjdXRfbW9kZWxfaGFyZCA9IG1vZGVsX2hhcmQKICAgICAgICAgICAgLmtleXMoKQogICAgICAgICAgICAuZmlsdGVyKHwmJihhLCBiKXwgewogICAgICAgICAgICAgICAgbGV0IChTb21lKCZhX3BvcyksIFNvbWUoJmJfcG9zKSkgPSAocG9zaXRpb25zLmdldCgmYSksIHBvc2l0aW9ucy5nZXQoJmIpKSBlbHNlIHsKICAgICAgICAgICAgICAgICAgICByZXR1cm4gZmFsc2U7CiAgICAgICAgICAgICAgICB9OwogICAgICAgICAgICAgICAgKChtYXNrID4+IGFfcG9zKSAmIDEpICE9ICgobWFzayA+PiBiX3BvcykgJiAxKQogICAgICAgICAgICB9KQogICAgICAgICAgICAuY291bnQoKTsKICAgICAgICBsZXQgY3V0X21hcmtlcl9oYXJkID0gbWFya2VyX2hhcmQKICAgICAgICAgICAgLml0ZXIoKQogICAgICAgICAgICAuZmlsdGVyKHwmJihhLCBiKXwgewogICAgICAgICAgICAgICAgbGV0IChTb21lKCZhX3BvcyksIFNvbWUoJmJfcG9zKSkgPSAocG9zaXRpb25zLmdldCgmYSksIHBvc2l0aW9ucy5nZXQoJmIpKSBlbHNlIHsKICAgICAgICAgICAgICAgICAgICByZXR1cm4gZmFsc2U7CiAgICAgICAgICAgICAgICB9OwogICAgICAgICAgICAgICAgKChtYXNrID4+IGFfcG9zKSAmIDEpICE9ICgobWFzayA+PiBiX3BvcykgJiAxKQogICAgICAgICAgICB9KQogICAgICAgICAgICAuY291bnQoKTsKICAgICAgICBsZXQgY2FuZGlkYXRlID0gQ3V0Q2FuZGlkYXRlIHsKICAgICAgICAgICAgbGVmdCwKICAgICAgICAgICAgcmlnaHQsCiAgICAgICAgICAgIG9iamVjdGl2ZSwKICAgICAgICAgICAgY3V0X21vZGVsX2hhcmQsCiAgICAgICAgICAgIGN1dF9tYXJrZXJfaGFyZCwKICAgICAgICAgICAgdG90YWxfbW9kZWxfaGFyZCwKICAgICAgICAgICAgbWluX3NpZGVfYnA6IGxlZnRfYnAubWluKHJpZ2h0X2JwKSwKICAgICAgICB9OwogICAgICAgIGxldCByZXBsYWNlID0gbWF0Y2ggJmJlc3QgewogICAgICAgICAgICBOb25lID0+IHRydWUsCiAgICAgICAgICAgIFNvbWUoZXhpc3RpbmcpID0+IHsKICAgICAgICAgICAgICAgIGNhbmRpZGF0ZS5vYmplY3RpdmUgPiBleGlzdGluZy5vYmplY3RpdmUgKyAxZS05CiAgICAgICAgICAgICAgICAgICAgfHwgKChjYW5kaWRhdGUub2JqZWN0aXZlIC0gZXhpc3Rpbmcub2JqZWN0aXZlKS5hYnMoKSA8PSAxZS05CiAgICAgICAgICAgICAgICAgICAgICAgICYmICgKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNhbmRpZGF0ZS5jdXRfbWFya2VyX2hhcmQsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBjYW5kaWRhdGUuY3V0X21vZGVsX2hhcmQsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBjYW5kaWRhdGUubWluX3NpZGVfYnAsCiAgICAgICAgICAgICAgICAgICAgICAgICkgPiAoCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBleGlzdGluZy5jdXRfbWFya2VyX2hhcmQsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBleGlzdGluZy5jdXRfbW9kZWxfaGFyZCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGV4aXN0aW5nLm1pbl9zaWRlX2JwLAogICAgICAgICAgICAgICAgICAgICAgICApKQogICAgICAgICAgICB9CiAgICAgICAgfTsKICAgICAgICBpZiByZXBsYWNlIHsKICAgICAgICAgICAgYmVzdCA9IFNvbWUoY2FuZGlkYXRlKTsKICAgICAgICB9CiAgICB9CiAgICBiZXN0Cn0KCg==').decode()
           if marker not in s:
               raise SystemExit('greedy_signed_cut marker not found')
           s=s.replace(marker, exact+marker,1)
