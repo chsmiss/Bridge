@@ -32,6 +32,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contigs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pairs",
+        type=Path,
+        help=(
+            "optional candidate-pair TSV; only contigs appearing in left/right (or source/target) "
+            "columns are embedded"
+        ),
+    )
     parser.add_argument("--model", default="zhihan1996/DNABERT-S")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--window-bp", type=int, default=2048)
@@ -72,6 +80,29 @@ def read_fasta(path: Path) -> Iterator[Tuple[str, str]]:
                 chunks.append(line)
     if name is not None:
         yield name, "".join(chunks).upper()
+
+
+def read_pair_endpoints(path: Optional[Path]) -> Optional[set[str]]:
+    if path is None:
+        return None
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not reader.fieldnames:
+            raise ValueError(f"{path}: missing header")
+        fields = {name.lower(): name for name in reader.fieldnames}
+        left_name = next((fields[name] for name in ("left", "source", "contig_a", "contig1") if name in fields), None)
+        right_name = next((fields[name] for name in ("right", "target", "contig_b", "contig2") if name in fields), None)
+        if left_name is None or right_name is None:
+            raise ValueError(f"{path}: pair table needs left/right or source/target columns")
+        endpoints: set[str] = set()
+        for row in reader:
+            left = (row.get(left_name) or "").strip()
+            right = (row.get(right_name) or "").strip()
+            if left:
+                endpoints.add(left)
+            if right:
+                endpoints.add(right)
+    return endpoints
 
 
 def reverse_complement(sequence: str) -> str:
@@ -210,10 +241,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.max_tokens < 4 or args.batch_size < 1:
         raise SystemExit("--max-tokens and --batch-size are too small")
 
+    endpoints = read_pair_endpoints(args.pairs)
     runtime = load_runtime(args.model, args.device, args.trust_remote_code)
     records = []
     full_window_count = 0
+    selected_contigs = 0
     for contig, sequence in read_fasta(args.contigs):
+        if endpoints is not None and contig not in endpoints:
+            continue
+        selected_contigs += 1
         candidates = list(
             windows(sequence, args.window_bp, args.stride_bp, args.min_window_bp)
         )
@@ -247,9 +283,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 written += 1
     backend = runtime[-1]
+    embedded_contigs = len({c for c, _, _ in records})
+    missing_endpoints = 0 if endpoints is None else max(0, len(endpoints) - selected_contigs)
     print(
         f"bridgebin-dna: windows={written}/{full_window_count} "
-        f"contigs={len({c for c, _, _ in records})} model={args.model} backend={backend}"
+        f"contigs={embedded_contigs} selected={selected_contigs} "
+        f"missing_pair_endpoints={missing_endpoints} model={args.model} backend={backend}"
     )
     return 0
 
