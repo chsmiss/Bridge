@@ -2,6 +2,7 @@ pub mod assembler;
 pub mod bridgebin;
 pub mod bridgebin_quant;
 pub mod bridgebin_reconcile;
+pub mod bridgebin_v2;
 pub mod dna;
 pub mod fastq;
 pub mod graph;
