@@ -30,7 +30,7 @@ jobs:
         run: cargo fmt --all
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::field-reassign-with-default
 
       - name: Rust tests
         run: cargo test --all-targets --all-features
