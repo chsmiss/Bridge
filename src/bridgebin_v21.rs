@@ -78,9 +78,9 @@ pub fn read_pair_score_table<P: AsRef<Path>>(path: P) -> io::Result<PairScoreTab
             .iter()
             .position(|column| names.iter().any(|name| column.eq_ignore_ascii_case(name)))
     };
-    let left_col = find(&["left", "source", "contig_a", "contig1"]) 
+    let left_col = find(&["left", "source", "contig_a", "contig1"])
         .ok_or_else(|| invalid("pair score table needs left/source column"))?;
-    let right_col = find(&["right", "target", "contig_b", "contig2"]) 
+    let right_col = find(&["right", "target", "contig_b", "contig2"])
         .ok_or_else(|| invalid("pair score table needs right/target column"))?;
     let same_col = find(&[
         "p_same",
@@ -93,7 +93,7 @@ pub fn read_pair_score_table<P: AsRef<Path>>(path: P) -> io::Result<PairScoreTab
     let confidence_col = find(&["confidence", "model_confidence", "pair_confidence"]);
     let source_col = find(&["model", "source_name", "evidence_source", "kind"]);
 
-    let mut values = HashMap::new();
+    let mut values: HashMap<(String, String), PairScore> = HashMap::new();
     for (row_index, line) in lines.enumerate() {
         let line = line?;
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
@@ -124,8 +124,6 @@ pub fn read_pair_score_table<P: AsRef<Path>>(path: P) -> io::Result<PairScoreTab
         let key = ordered_pair(left, right);
         match values.get_mut(&key) {
             Some(existing) => {
-                // Prefer the most confident calibrated prediction.  Ties prefer the
-                // more decisive probability, preserving conservative hard negatives.
                 let existing_decisiveness = (existing.same_probability - 0.5).abs();
                 let new_decisiveness = (same_probability - 0.5).abs();
                 if confidence > existing.confidence
@@ -218,24 +216,17 @@ pub fn refine_bins_v21(
         residuals.append(&mut dropped);
     }
 
-    // Pair-model rescue is intentionally conservative: a residual contig must have
-    // multiple independent high-confidence supports to the same bin and a clear
-    // margin over the runner-up.  Any marker or calibrated hard-negative conflict vetoes it.
     residuals.sort_unstable();
     residuals.dedup();
-    let mut still_unassigned = Vec::new();
     for contig_index in residuals {
         let mut candidates = Vec::new();
         for (bin_index, bin) in refined.iter().enumerate() {
             if marker_conflict_with_bin(contig_index, bin, &marker_sets) {
                 continue;
             }
-            if let Some((score, support)) = aggregate_to_bin(
-                contig_index,
-                bin,
-                &indexed_scores,
-                cfg,
-            ) {
+            if let Some((score, support)) =
+                aggregate_to_bin(contig_index, bin, &indexed_scores, cfg)
+            {
                 if support >= cfg.min_pair_support {
                     candidates.push((bin_index, score, support));
                 }
@@ -257,7 +248,6 @@ pub fn refine_bins_v21(
                 stats.rescued_contigs += 1;
             }
             _ => {
-                still_unassigned.push(contig_index);
                 stats.ambiguous_residuals += 1;
             }
         }
@@ -321,7 +311,10 @@ fn hard_conflicts(
     let mut marker_to_members: HashMap<&str, Vec<usize>> = HashMap::new();
     for &member in members {
         for marker in &marker_sets[member] {
-            marker_to_members.entry(marker.as_str()).or_default().push(member);
+            marker_to_members
+                .entry(marker.as_str())
+                .or_default()
+                .push(member);
         }
     }
     for marker_members in marker_to_members.values() {
@@ -352,7 +345,10 @@ fn split_group(
     stats: &mut BridgeBinV21Stats,
 ) -> (Vec<RefinedBin>, Vec<usize>) {
     let member_set: HashSet<usize> = members.iter().copied().collect();
-    let mut clusters: Vec<Option<Vec<usize>>> = members.iter().map(|member| Some(vec![*member])).collect();
+    let mut clusters: Vec<Option<Vec<usize>>> = members
+        .iter()
+        .map(|member| Some(vec![*member]))
+        .collect();
     let mut cluster_of: HashMap<usize, usize> = members
         .iter()
         .enumerate()
@@ -402,7 +398,10 @@ fn split_group(
     let mut bins = Vec::new();
     let mut dropped = Vec::new();
     for cluster in clusters.into_iter().flatten() {
-        let bp = cluster.iter().map(|index| contigs[*index].seq.len()).sum::<usize>();
+        let bp = cluster
+            .iter()
+            .map(|index| contigs[*index].seq.len())
+            .sum::<usize>();
         if bp >= cfg.min_subbin_bp {
             bins.push(make_bin(cluster, contigs, marker_sets));
         } else {
@@ -415,9 +414,10 @@ fn split_group(
 
 fn clusters_conflict(left: &[usize], right: &[usize], hard: &HashSet<(usize, usize)>) -> bool {
     left.iter().any(|a| {
-        right
-            .iter()
-            .any(|b| hard.contains(&(a.min(b).to_owned(), a.max(b).to_owned())))
+        right.iter().any(|b| {
+            let key = ((*a).min(*b), (*a).max(*b));
+            hard.contains(&key)
+        })
     })
 }
 
@@ -449,7 +449,10 @@ fn aggregate_to_bin(
     if support.is_empty() {
         return None;
     }
-    let total_weight = support.iter().map(|(_, confidence)| confidence).sum::<f64>();
+    let total_weight = support
+        .iter()
+        .map(|(_, confidence)| confidence)
+        .sum::<f64>();
     if total_weight <= 0.0 {
         return None;
     }
@@ -469,13 +472,24 @@ fn marker_conflict_with_bin(
     !marker_sets[contig_index].is_disjoint(&bin.markers)
 }
 
-fn make_bin(members: Vec<usize>, contigs: &[Contig], marker_sets: &[HashSet<String>]) -> RefinedBin {
-    let bp = members.iter().map(|index| contigs[*index].seq.len()).sum();
+fn make_bin(
+    members: Vec<usize>,
+    contigs: &[Contig],
+    marker_sets: &[HashSet<String>],
+) -> RefinedBin {
+    let bp = members
+        .iter()
+        .map(|index| contigs[*index].seq.len())
+        .sum();
     let mut markers = HashSet::new();
     for &member in &members {
         markers.extend(marker_sets[member].iter().cloned());
     }
-    RefinedBin { members, bp, markers }
+    RefinedBin {
+        members,
+        bp,
+        markers,
+    }
 }
 
 fn add_to_bin(
@@ -486,7 +500,8 @@ fn add_to_bin(
 ) {
     bin.bp += contigs[contig_index].seq.len();
     bin.members.push(contig_index);
-    bin.markers.extend(marker_sets[contig_index].iter().cloned());
+    bin.markers
+        .extend(marker_sets[contig_index].iter().cloned());
 }
 
 fn weighted_gc(bin: &RefinedBin, contigs: &[Contig]) -> f64 {
