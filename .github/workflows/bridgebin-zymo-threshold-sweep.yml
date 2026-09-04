@@ -1,0 +1,75 @@
+name: BridgeBin Zymo threshold sweep
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v0
+    paths:
+      - .github/workflows/bridgebin-zymo-threshold-sweep.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Build
+        run: |
+          cargo fmt --all
+          cargo build --release --bin bridgebin
+
+      - name: Prepare Zymo benchmark
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/bridgebin_zymo_sweep \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+
+      - name: Sweep join and rescue thresholds
+        run: |
+          set -euo pipefail
+          for spec in 0.55:0.50 0.60:0.55 0.65:0.60 0.70:0.65 0.76:0.70 0.82:0.76; do
+            join="${spec%%:*}"
+            rescue="${spec##*:}"
+            tag="j${join}_r${rescue}"
+            target/release/bridgebin \
+              --contigs benchmark/bridgebin_zymo_sweep/contigs.fa \
+              --coverage benchmark/bridgebin_zymo_sweep/coverage.tsv \
+              --out-dir "benchmark/bridgebin_zymo_sweep/$tag" \
+              --join-threshold "$join" \
+              --rescue-threshold "$rescue" \
+              >/dev/null 2>&1
+            python3 scripts/bridgebin_benchmark.py evaluate \
+              --truth benchmark/bridgebin_zymo_sweep/truth.tsv \
+              --truth-abundance benchmark/bridgebin_zymo_sweep/truth_abundance.tsv \
+              --assignments "benchmark/bridgebin_zymo_sweep/$tag/assignments.tsv" \
+              --abundance "benchmark/bridgebin_zymo_sweep/$tag/abundance.tsv" \
+              --output "benchmark/bridgebin_zymo_sweep/$tag.metrics.json" \
+              >/dev/null
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tdepth_mape\trel_abundance_mae')
+          rows=[]
+          for path in sorted(Path('benchmark/bridgebin_zymo_sweep').glob('j*.metrics.json')):
+              m=json.loads(path.read_text())
+              rows.append((m['f1'], path.stem, m))
+          for _, name, m in sorted(rows, reverse=True):
+              print(f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t{m['depth_mape']:.6f}\t{m['relative_abundance_mae']:.6f}")
+          PY
