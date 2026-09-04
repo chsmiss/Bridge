@@ -1,0 +1,197 @@
+name: BridgeBin v2.4 uniform DNA-window probe
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_dna_embed_uniform.py
+      - scripts/bridgebin_dna_identity_features.py
+      - scripts/bridgebin_pair_head_identity.py
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_reference_hardneg_panel.py
+      - scripts/bridgebin_eval_candidates.py
+      - scripts/bridgebin_eval_pair_scores.py
+      - src/bridgebin_v21.rs
+      - src/bridgebin_v21_merge.rs
+      - .github/workflows/bridgebin-v24-zymo-uniform-windows.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  uniform-window-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build and install CPU-safe DNA runtime
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin --bin bridgebin-v21
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
+          curl -L --retry 3 -o /usr/local/bin/datasets \
+            'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'
+          chmod +x /usr/local/bin/datasets
+
+      - name: Train reference-only mean identity with uniform windows
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/v24_uniform/reference_groups
+          mkdir -p "$root"
+          fetch_group () {
+            label="$1"; taxon="$2"
+            mkdir -p "$root/$label/raw"
+            datasets download genome taxon "$taxon" --reference --include genome \
+              --no-progressbar --filename "/tmp/${label}.zip"
+            unzip -q "/tmp/${label}.zip" -d "$root/$label/raw"
+          }
+          fetch_group Escherichia_coli 'Escherichia coli'
+          fetch_group Salmonella_enterica 'Salmonella enterica'
+          fetch_group Klebsiella_pneumoniae 'Klebsiella pneumoniae'
+          fetch_group Enterobacter_cloacae 'Enterobacter cloacae'
+          fetch_group Citrobacter_freundii 'Citrobacter freundii'
+          fetch_group Shigella_flexneri 'Shigella flexneri'
+          fetch_group Serratia_marcescens 'Serratia marcescens'
+
+          train=benchmark/v24_uniform/train
+          python scripts/bridgebin_reference_hardneg_panel.py \
+            --input-dir "$root" --output-dir "$train" \
+            --fragment-bp 6000 --fragments-per-group 6 --samples 4 --seed 43
+          python scripts/bridgebin_dna_embed_uniform.py \
+            --contigs "$train/contigs.fa" --output "$train/dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_dna_identity_features.py \
+            --dna-embeddings "$train/dna_windows.tsv" --output "$train/features.tsv"
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$train/truth.tsv" --output "$train/pairs.tsv" \
+            --anchors-per-genome 6 --positive-per-contig 4 \
+            --negative-genomes-per-contig 6 --negative-anchors-per-genome 2
+          python scripts/bridgebin_pair_head_identity.py train \
+            --features "$train/features.tsv" --pairs "$train/pairs.tsv" \
+            --model-out "$train/pair_head.json" \
+            --validation-fraction 0.28 --epochs 700 --negative-weight 5 \
+            --precision-target 0.99 --require-group-holdout
+
+      - name: Prepare independent full Zymo fixture and signed-v2 core
+        run: |
+          set -euo pipefail
+          base=benchmark/v24_uniform/zymo
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$base" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          target/release/bridgebin \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --out-dir "$base/core" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02
+          python scripts/bridgebin_benchmark.py evaluate \
+            --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+            --assignments "$base/core/assignments.tsv" --abundance "$base/core/abundance.tsv" \
+            --output "$base/core.metrics.json" >/dev/null
+
+      - name: Mine sparse candidates and embed uniform full-length windows
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          base=benchmark/v24_uniform/zymo
+          python scripts/bridgebin_candidate_pairs.py \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --assignments "$base/core/assignments.tsv" --output "$base/candidates.tsv" \
+            --min-length 1500 --anchors-per-bin 12 --anchor-strategy diverse \
+            --within-neighbors 4 --within-contrast 4 \
+            --merge-bin-neighbors 4 --cross-anchor-pairs 8 \
+            --max-pairs 5000 --probe-only
+          python scripts/bridgebin_eval_candidates.py \
+            --truth "$base/truth.tsv" --assignments "$base/core/assignments.tsv" \
+            --candidates "$base/candidates.tsv" --output "$base/candidate.metrics.json"
+          python scripts/bridgebin_dna_embed_uniform.py \
+            --contigs "$base/contigs.fa" --pairs "$base/candidates.tsv" \
+            --output "$base/dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_dna_identity_features.py \
+            --dna-embeddings "$base/dna_windows.tsv" --output "$base/features.tsv"
+
+      - name: Score identity pairs and run unchanged v2.1 consumer
+        run: |
+          set -euo pipefail
+          train=benchmark/v24_uniform/train
+          base=benchmark/v24_uniform/zymo
+          python scripts/bridgebin_pair_head_identity.py score \
+            --features "$base/features.tsv" --pairs "$base/candidates.tsv" \
+            --model "$train/pair_head.json" --output "$base/pair_scores.tsv" \
+            --model-name ref-hardneg-dnaberts-uniform-mean
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          m=json.loads(Path('benchmark/v24_uniform/train/pair_head.json').read_text())['training']
+          Path('/tmp/v24_thresholds').write_text(
+              f"{m['recommended_join_min_same']}\n{m['recommended_split_max_same']}\n"
+          )
+          print('thresholds',m['recommended_join_min_same'],m['recommended_split_max_same'])
+          PY
+          join=$(sed -n '1p' /tmp/v24_thresholds)
+          split=$(sed -n '2p' /tmp/v24_thresholds)
+          python scripts/bridgebin_eval_pair_scores.py \
+            --pairs "$base/candidates.tsv" --scores "$base/pair_scores.tsv" \
+            --truth "$base/truth.tsv" \
+            --join-threshold "$join" --split-threshold "$split" \
+            --focus Escherichia_coli,Salmonella_enterica \
+            --output "$base/pair_score.metrics.json"
+          target/release/bridgebin-v21 \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --pair-scores "$base/pair_scores.tsv" --out-dir "$base/v24" \
+            --v21-min-confidence 0 \
+            --v21-split-max-same "$split" --v21-join-min-same "$join" \
+            --v21-rescue-min-same "$join" --v21-min-subbin-bp 10000 \
+            --v21-bin-merge-min-same 0.92
+          python scripts/bridgebin_benchmark.py evaluate \
+            --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+            --assignments "$base/v24/assignments.tsv" --abundance "$base/v24/abundance.tsv" \
+            --output "$base/v24.metrics.json" >/dev/null
+
+      - name: Print uniform-window ablation result
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          base=Path('benchmark/v24_uniform/zymo')
+          c=json.loads((base/'core.metrics.json').read_text())
+          v=json.loads((base/'v24.metrics.json').read_text())
+          q=json.loads((base/'candidate.metrics.json').read_text())
+          p=json.loads((base/'pair_score.metrics.json').read_text())
+          print('candidate_metrics',json.dumps(q,sort_keys=True))
+          print('pair_score_metrics',json.dumps(p,sort_keys=True))
+          print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tbinned')
+          for name,m in [('core',c),('v24-uniform-mean',v)]:
+              print(f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t{m['bp_binned_fraction']:.6f}")
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v24-uniform-window-zymo
+          path: benchmark/v24_uniform
+          retention-days: 14
