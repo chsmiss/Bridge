@@ -7,11 +7,12 @@ bin it uses only the complete-ish ``within_bin_anchor`` score graph and asks whe
 anchor matrix contains a statistically coherent two-block structure: within-block scores
 must exceed cross-block scores by more than expected after edge-score permutation.
 
-When a bin passes that local test, biological anchors define two identity groups. All bin
-members are then assigned to the closer anchor group using the cheap coverage/composition/
-GC similarity already used by BridgeBin candidate mining. Biological evidence decides
-*which anchors should not live together*; cheap sample-specific evidence propagates that
-identity decision to the remaining contigs.
+A DNA-only block can reflect chromosome-region or strain-like representation structure
+inside one genome, so a split is accepted only when sample-specific coverage supports the
+same anchor partition. Biological evidence proposes the identity boundary; independent
+coverage evidence validates that it behaves like a genome boundary in this sample. The
+remaining contigs are propagated to the accepted anchor groups with the cheap
+coverage/composition/GC similarity already used by BridgeBin candidate mining.
 
 This script is intended as an experimental pre-refiner. It never uses benchmark truth.
 """
@@ -45,6 +46,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--min-edge-density", type=float, default=0.80)
     p.add_argument("--min-gap", type=float, default=0.035)
     p.add_argument("--max-permutation-p", type=float, default=0.05)
+    p.add_argument(
+        "--min-coverage-gap",
+        type=float,
+        default=0.0,
+        help=(
+            "require mean within-group coverage similarity minus cross-group coverage "
+            "similarity to be at least this value; 0 disables the extra consensus gate"
+        ),
+    )
     p.add_argument("--permutations", type=int, default=96)
     p.add_argument("--member-margin", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=43)
@@ -170,12 +180,33 @@ def permuted_p_value(
     return (exceed + 1.0) / (max(0, permutations) + 1.0)
 
 
+def coverage_partition_support(
+    left: List[cheap.Feature], right: List[cheap.Feature]
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    within: List[float] = []
+    cross: List[float] = []
+    for group in (left, right):
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                coverage, _composition, _gc = cheap.component_sim(group[i], group[j])
+                if coverage is not None:
+                    within.append(coverage)
+    for a in left:
+        for b in right:
+            coverage, _composition, _gc = cheap.component_sim(a, b)
+            if coverage is not None:
+                cross.append(coverage)
+    if not within or not cross:
+        return None, None, None
+    within_mean = mean(within)
+    cross_mean = mean(cross)
+    return within_mean - cross_mean, within_mean, cross_mean
+
+
 def group_similarity(member: cheap.Feature, anchors: List[cheap.Feature]) -> float:
     scores = sorted((cheap.cheap_similarity(member, anchor) for anchor in anchors), reverse=True)
     if not scores:
         return 0.0
-    # Top-three averaging is robust to a single atypical anchor while still allowing
-    # a minority genome to pull its own members away from the dominant bin centroid.
     keep = scores[: min(3, len(scores))]
     return sum(keep) / len(keep)
 
@@ -253,6 +284,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report_bins.append(entry)
             continue
 
+        coverage_gap, coverage_within, coverage_cross = coverage_partition_support(
+            left_features, right_features
+        )
+        entry.update(
+            {
+                "coverage_gap": coverage_gap,
+                "coverage_within_mean": coverage_within,
+                "coverage_cross_mean": coverage_cross,
+            }
+        )
+        if args.min_coverage_gap > 0.0 and (
+            coverage_gap is None or coverage_gap < args.min_coverage_gap
+        ):
+            report_bins.append(entry)
+            continue
+
         left_bin = f"{bin_name}__bioA"
         right_bin = f"{bin_name}__bioB"
         assigned_left = assigned_right = unassigned = 0
@@ -289,7 +336,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if contig not in rewrites:
             continue
         new_bin = rewrites[contig]
-        row["bin"] = "." if new_bin is None else new_bin
+        row["bin"] = "unbinned" if new_bin is None else new_bin
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="") as handle:
@@ -303,6 +350,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "ambiguous_unbinned": ambiguous,
         "min_gap": args.min_gap,
         "max_permutation_p": args.max_permutation_p,
+        "min_coverage_gap": args.min_coverage_gap,
         "permutations": args.permutations,
         "member_margin": args.member_margin,
         "bins": report_bins,
@@ -315,10 +363,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     for entry in report_bins:
         if entry.get("split"):
+            coverage_text = (
+                "." if entry.get("coverage_gap") is None else f"{entry['coverage_gap']:.6f}"
+            )
             print(
                 "  split "
                 f"{entry['bin']} anchors={entry['anchors']} gap={entry['gap']:.6f} "
-                f"p={entry['permutation_p']:.6f} "
+                f"p={entry['permutation_p']:.6f} coverage_gap={coverage_text} "
                 f"sizes={entry['assigned_left']}/{entry['assigned_right']}"
             )
     return 0
