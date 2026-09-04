@@ -1,0 +1,135 @@
+name: BridgeBin binner comparison
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v1-reconcile
+    paths:
+      - src/bridgebin.rs
+      - src/bridgebin_reconcile.rs
+      - src/bridgebin_quant.rs
+      - src/bin/bridgebin.rs
+      - scripts/bridgebin_benchmark.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - scripts/split_zymo_references.py
+      - scripts/external_binner_adapter.py
+      - .github/workflows/bridgebin-binner-comparison.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Build BridgeBin
+        run: |
+          cargo fmt --all
+          cargo build --release --bin bridgebin
+          python3 -m py_compile scripts/external_binner_adapter.py scripts/bridgebin_benchmark.py scripts/bridgebin_zymo_reference_benchmark.py scripts/split_zymo_references.py
+
+      - name: Prepare common Zymo benchmark and depth matrix
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/binner_compare \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          python3 scripts/external_binner_adapter.py metabat-depth \
+            --fasta benchmark/binner_compare/contigs.fa \
+            --coverage benchmark/binner_compare/coverage.tsv \
+            --output benchmark/binner_compare/metabat_depth.tsv
+
+      - name: Run BridgeBin v0 and v1
+        run: |
+          set -euo pipefail
+          b=benchmark/binner_compare
+          /usr/bin/time -v -o "$b/bridgebin_v0.runtime.txt" \
+            target/release/bridgebin -c "$b/contigs.fa" --coverage "$b/coverage.tsv" -o "$b/bridgebin_v0" --no-reconcile
+          /usr/bin/time -v -o "$b/bridgebin_v1.runtime.txt" \
+            target/release/bridgebin -c "$b/contigs.fa" --coverage "$b/coverage.tsv" -o "$b/bridgebin_v1"
+          for tag in bridgebin_v0 bridgebin_v1; do
+            python3 scripts/bridgebin_benchmark.py evaluate \
+              --truth "$b/truth.tsv" --truth-abundance "$b/truth_abundance.tsv" \
+              --assignments "$b/$tag/assignments.tsv" --abundance "$b/$tag/abundance.tsv" \
+              --output "$b/$tag.metrics.json" >/dev/null
+          done
+
+      - name: Run MetaBAT2 2.18
+        run: |
+          set -euo pipefail
+          b="$PWD/benchmark/binner_compare"
+          mkdir -p "$b/metabat2_bins"
+          docker pull quay.io/biocontainers/metabat2:2.18_23_gc869c52-0
+          /usr/bin/time -v -o "$b/metabat2.runtime.txt" \
+            docker run --rm -v "$PWD:/work" quay.io/biocontainers/metabat2:2.18_23_gc869c52-0 \
+              metabat2 -i /work/benchmark/binner_compare/contigs.fa \
+                -a /work/benchmark/binner_compare/metabat_depth.tsv \
+                -o /work/benchmark/binner_compare/metabat2_bins/bin \
+                -m 1500 -t 4
+          python3 scripts/external_binner_adapter.py bins-to-assignments \
+            --fasta "$b/contigs.fa" --bins "$b/metabat2_bins" --output "$b/metabat2.assignments.tsv"
+          python3 scripts/external_binner_adapter.py quantify \
+            --coverage "$b/coverage.tsv" --assignments "$b/metabat2.assignments.tsv" --output "$b/metabat2.abundance.tsv"
+          python3 scripts/bridgebin_benchmark.py evaluate \
+            --truth "$b/truth.tsv" --truth-abundance "$b/truth_abundance.tsv" \
+            --assignments "$b/metabat2.assignments.tsv" --abundance "$b/metabat2.abundance.tsv" \
+            --output "$b/metabat2.metrics.json" >/dev/null
+
+      - name: Run SemiBin2 2.4.1
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          b="$PWD/benchmark/binner_compare"
+          docker pull quay.io/biocontainers/semibin:2.4.1-0
+          /usr/bin/time -v -o "$b/semibin2.runtime.txt" \
+            docker run --rm -v "$PWD:/work" quay.io/biocontainers/semibin:2.4.1-0 \
+              SemiBin2 single_easy_bin \
+                --environment global \
+                --input-fasta /work/benchmark/binner_compare/contigs.fa \
+                --depth-metabat2 /work/benchmark/binner_compare/metabat_depth.tsv \
+                --output /work/benchmark/binner_compare/semibin2 \
+                --min-len 1500 --threads 4 --random-seed 43
+          python3 scripts/external_binner_adapter.py bins-to-assignments \
+            --fasta "$b/contigs.fa" --bins "$b/semibin2/output_bins" --output "$b/semibin2.assignments.tsv"
+          python3 scripts/external_binner_adapter.py quantify \
+            --coverage "$b/coverage.tsv" --assignments "$b/semibin2.assignments.tsv" --output "$b/semibin2.abundance.tsv"
+          python3 scripts/bridgebin_benchmark.py evaluate \
+            --truth "$b/truth.tsv" --truth-abundance "$b/truth_abundance.tsv" \
+            --assignments "$b/semibin2.assignments.tsv" --abundance "$b/semibin2.abundance.tsv" \
+            --output "$b/semibin2.metrics.json" >/dev/null
+
+      - name: Print comparison
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('benchmark/binner_compare')
+          print('tool\tbins\tbinned_bp\tpurity\trecall\tf1\tari\thq\tmq\tdepth_mape\trel_abundance_mae')
+          for name in ['bridgebin_v0','bridgebin_v1','metabat2','semibin2']:
+              p=root/f'{name}.metrics.json'
+              if not p.exists():
+                  print(f'{name}\tFAILED')
+                  continue
+              m=json.loads(p.read_text())
+              print(f"{name}\t{m['predicted_bins']}\t{m['bp_binned_fraction']:.6f}\t{m['weighted_purity']:.6f}\t{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t{m['depth_mape']:.6f}\t{m['relative_abundance_mae']:.6f}")
+          PY
+
+      - name: Upload comparison artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-binner-comparison
+          path: benchmark/binner_compare
+          retention-days: 14
