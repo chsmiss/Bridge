@@ -52,7 +52,7 @@ jobs:
             --out benchmark/bridgebin_v2 \
             --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
 
-      - name: Run v0 v1 and v2
+      - name: Run v0 v1 and v2 sensitivity panel
         run: |
           set -euo pipefail
           base='benchmark/bridgebin_v2'
@@ -78,6 +78,24 @@ jobs:
           run_one v2_recall --algorithm v2 \
             --v2-core-attraction 0.77 --v2-component-attraction 0.69 \
             --v2-rescue-attraction 0.73 --v2-rescue-margin 0.04
+
+          # Coarse sensitivity checks only. These presets are not selected using truth labels;
+          # they probe whether conservative signed constraints can regain utilization without
+          # reintroducing the v1 cross-genome merge failure.
+          run_one v2_balanced --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02
+          run_one v2_loose --algorithm v2 \
+            --v2-core-attraction 0.72 --v2-component-attraction 0.62 \
+            --v2-rescue-attraction 0.65 --v2-rescue-margin 0.015
+          run_one v2_dense --algorithm v2 \
+            --v2-max-neighbors 128 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.64 \
+            --v2-rescue-attraction 0.67 --v2-rescue-margin 0.02
+          run_one v2_small_core --algorithm v2 \
+            --v2-min-component-bp 10000 \
+            --v2-core-attraction 0.75 --v2-component-attraction 0.67 \
+            --v2-rescue-attraction 0.69 --v2-rescue-margin 0.025
 
           python3 - <<'PY'
           import json
