@@ -1,0 +1,76 @@
+name: BridgeBin v2.3 single-copy marker focus
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_marker_scan.py
+      - .github/workflows/bridgebin-v23-marker-focus.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  marker-focus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin
+          sudo apt-get update -qq
+          sudo apt-get install -y hmmer
+          python -m pip install pyrodigal
+          python -m py_compile scripts/bridgebin_marker_scan.py
+      - name: Build full Zymo signed-v2 core
+        run: |
+          set -euo pipefail
+          base=benchmark/v23_marker_focus
+          mkdir -p "$base"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip 'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py --reference-dir /tmp/zymo-species-refs --out "$base/zymo" --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          target/release/bridgebin --contigs "$base/zymo/contigs.fa" --coverage "$base/zymo/coverage.tsv" --out-dir "$base/core" --algorithm v2 --v2-core-attraction 0.74 --v2-component-attraction 0.66 --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02
+      - name: Scan 107 single-copy markers
+        run: |
+          set -euo pipefail
+          base=benchmark/v23_marker_focus
+          python scripts/bridgebin_marker_scan.py --contigs "$base/zymo/contigs.fa" --assignments "$base/core/assignments.tsv" --output-dir "$base/markers" --threads 4 --min-contig 1500 --focus-min-duplicate-markers 1 --focus-min-duplicate-fraction 0.025
+          cat "$base/markers/marker_report.json"
+      - name: Benchmark focus quality without feeding truth to scanner
+        run: |
+          python - <<'PY'
+          import csv,json
+          from collections import defaultdict,Counter
+          from pathlib import Path
+          b=Path('benchmark/v23_marker_focus')
+          truth={r['contig']:r['genome'] for r in csv.DictReader((b/'zymo/truth.tsv').open(),delimiter='\t') if int(r['eligible'])}
+          assignments={r['contig']:r['bin'] for r in csv.DictReader((b/'core/assignments.tsv').open(),delimiter='\t') if r['bin'] not in {'','.','NA','unbinned'}}
+          composition=defaultdict(Counter)
+          for c,bin_name in assignments.items():
+              if c in truth: composition[bin_name][truth[c]]+=1
+          mixed={bin_name for bin_name,count in composition.items() if len(count)>1}
+          report=json.loads((b/'markers/marker_report.json').read_text())
+          focused=set(report['focused_bins'])
+          tp=len(mixed&focused); fp=len(focused-mixed); fn=len(mixed-focused); pure=set(composition)-mixed; tn=len(pure-focused)
+          metrics={'truth_mixed_bins':sorted(mixed),'focused_bins':sorted(focused),'mixed_recall':tp/max(1,tp+fn),'focus_precision':tp/max(1,tp+fp),'tp':tp,'fp':fp,'fn':fn,'tn':tn}
+          (b/'marker_focus.metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(metrics,sort_keys=True))
+          for bin_name in sorted(mixed): print('mixed',bin_name,dict(composition[bin_name]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bridgebin-v23-marker-focus
+          path: benchmark/v23_marker_focus
+          retention-days: 14
