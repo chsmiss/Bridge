@@ -3,6 +3,7 @@
 
 Matches the Rust quantifier: contig-length weighted median depth (robust_depth),
 length-weighted mean depth, then sample-wise relative abundance from robust depths.
+This helper is also the stable metric boundary for target-local Biological Brain tests.
 """
 
 from __future__ import annotations
