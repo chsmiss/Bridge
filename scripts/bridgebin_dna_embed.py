@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Extract orientation-robust DNA foundation-model embeddings for BridgeBin.
 
-The default model is ``multimolecule/dnaberts``. MultiMolecule-hosted models are loaded
-through their native ``multimolecule.AutoModel/AutoTokenizer`` API; other models use the
-standard Transformers AutoModel interface. Long contigs are represented by overlapping
-windows; each window is encoded in both forward and reverse-complement orientation and the
-two pooled embeddings are averaged. The resulting per-window TSV is consumed by
-``bridgebin_bio_features.py --dna-embeddings``.
+The default is the DNABERT-S authors' public checkpoint ``zhihan1996/DNABERT-S``, loaded
+with Transformers custom code as documented by the model repository. MultiMolecule models
+remain supported explicitly when a ``multimolecule/*`` name is requested.
+
+Long contigs are represented by overlapping windows; each window is encoded in forward
+and reverse-complement orientation and the pooled representations are averaged. The
+resulting per-window TSV is consumed by ``bridgebin_bio_features.py --dna-embeddings``.
 
 Optional dependencies:
-  default DNABERT-S:  pip install torch multimolecule
-  generic HF model:  pip install torch transformers
+  default DNABERT-S:  pip install torch transformers einops
+  MultiMolecule:      pip install torch multimolecule
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contigs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model", default="multimolecule/dnaberts")
+    parser.add_argument("--model", default="zhihan1996/DNABERT-S")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--window-bp", type=int, default=2048)
     parser.add_argument("--stride-bp", type=int, default=1024)
@@ -38,7 +39,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
-        help="allow custom Transformers code for non-MultiMolecule model repositories",
+        help="allow custom Transformers code; automatically enabled for zhihan1996/DNABERT-S",
     )
     return parser.parse_args(argv)
 
@@ -105,7 +106,7 @@ def load_runtime(model_name: str, requested_device: str, trust_remote_code: bool
             from multimolecule import AutoModel, AutoTokenizer
         except ImportError as error:  # pragma: no cover - optional dependency
             raise RuntimeError(
-                "MultiMolecule DNABERT models require: pip install torch multimolecule"
+                "MultiMolecule DNA models require: pip install torch multimolecule"
             ) from error
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModel.from_pretrained(model_name)
@@ -117,11 +118,15 @@ def load_runtime(model_name: str, requested_device: str, trust_remote_code: bool
             raise RuntimeError(
                 "generic DNA models require: pip install torch transformers"
             ) from error
+        # The authors' DNABERT-S checkpoint ships its MosaicBERT/ALiBi implementation
+        # as repository custom code. Make that one well-known model work out of the box;
+        # other custom repositories still require an explicit opt-in.
+        allow_remote = trust_remote_code or model_name.lower() == "zhihan1996/dnabert-s"
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code
+            model_name, trust_remote_code=allow_remote
         )
         model = AutoModel.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code
+            model_name, trust_remote_code=allow_remote
         )
         backend = "transformers"
 
@@ -159,7 +164,7 @@ def encode_sequences(sequences: Sequence[str], runtime, max_tokens: int):
     encoded = {key: value.to(device) for key, value in encoded.items()}
     with torch.no_grad():
         output = model(**encoded)
-    hidden = output.last_hidden_state
+    hidden = output.last_hidden_state if hasattr(output, "last_hidden_state") else output[0]
     pooled = mean_pool(hidden, encoded["attention_mask"], torch)
     return pooled.detach().float().cpu()
 
