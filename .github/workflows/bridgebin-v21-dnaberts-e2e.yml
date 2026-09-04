@@ -1,0 +1,263 @@
+name: BridgeBin v2.1 DNABERT-S non-oracle e2e
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - src/bin/bridgebin-v21.rs
+      - src/bridgebin_v21.rs
+      - src/bridgebin_v21_merge.rs
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_eval_candidates.py
+      - scripts/bridgebin_pair_head.py
+      - scripts/bridgebin_dna_embed.py
+      - scripts/bridgebin_bio_features.py
+      - scripts/bridgebin_reference_hardneg_panel.py
+      - scripts/bridgebin_make_pair_dataset.py
+      - scripts/bridgebin_benchmark.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - .github/workflows/bridgebin-v21-dnaberts-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build BridgeBin and install CPU-safe DNABERT-S
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin --bin bridgebin-v21
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
+          curl -L --retry 3 -o /usr/local/bin/datasets \
+            'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'
+          chmod +x /usr/local/bin/datasets
+          python -m py_compile \
+            scripts/bridgebin_candidate_pairs.py \
+            scripts/bridgebin_eval_candidates.py \
+            scripts/bridgebin_pair_head.py \
+            scripts/bridgebin_dna_embed.py \
+            scripts/bridgebin_bio_features.py \
+            scripts/bridgebin_reference_hardneg_panel.py \
+            scripts/bridgebin_make_pair_dataset.py \
+            scripts/bridgebin_benchmark.py \
+            scripts/bridgebin_zymo_reference_benchmark.py \
+            scripts/split_zymo_references.py
+
+      - name: Train transferable DNA-only identity head on references
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/v21_dnaberts_e2e/reference_groups
+          train=benchmark/v21_dnaberts_e2e/train
+          mkdir -p "$root"
+          fetch_group () {
+            label="$1"; taxon="$2"
+            mkdir -p "$root/$label/raw"
+            datasets download genome taxon "$taxon" --reference --include genome \
+              --no-progressbar --filename "/tmp/${label}.zip"
+            unzip -q "/tmp/${label}.zip" -d "$root/$label/raw"
+          }
+          fetch_group Escherichia_coli 'Escherichia coli'
+          fetch_group Salmonella_enterica 'Salmonella enterica'
+          fetch_group Klebsiella_pneumoniae 'Klebsiella pneumoniae'
+          fetch_group Enterobacter_cloacae 'Enterobacter cloacae'
+          fetch_group Citrobacter_freundii 'Citrobacter freundii'
+          fetch_group Shigella_flexneri 'Shigella flexneri'
+          fetch_group Serratia_marcescens 'Serratia marcescens'
+
+          python scripts/bridgebin_reference_hardneg_panel.py \
+            --input-dir "$root" --output-dir "$train" \
+            --fragment-bp 6000 --fragments-per-group 6 --samples 4 --seed 43
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$train/contigs.fa" --output "$train/dnaberts_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$train/dnaberts_windows.tsv" --output "$train/features.tsv"
+          # Deliberately exclude sample-specific abundance/context from the transferable head.
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$train/truth.tsv" --output "$train/pairs.tsv" \
+            --anchors-per-genome 6 --positive-per-contig 4 \
+            --negative-genomes-per-contig 6 --negative-anchors-per-genome 2
+          python scripts/bridgebin_pair_head.py train \
+            --features "$train/features.tsv" --pairs "$train/pairs.tsv" \
+            --model-out "$train/pair_head.json" \
+            --validation-fraction 0.28 --epochs 700 --negative-weight 5 \
+            --precision-target 0.99 --require-group-holdout \
+            | tee "$train/pair_head.metrics.jsonl"
+
+      - name: Prepare independent 32-contig Zymo hard panel
+        run: |
+          set -euo pipefail
+          root=benchmark/v21_dnaberts_e2e
+          full="$root/zymo_full"
+          panel="$root/panel"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$full" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          python - <<'PY'
+          import csv, shutil
+          from collections import defaultdict
+          from pathlib import Path
+          src=Path('benchmark/v21_dnaberts_e2e/zymo_full')
+          out=Path('benchmark/v21_dnaberts_e2e/panel'); out.mkdir(parents=True,exist_ok=True)
+          truth=list(csv.DictReader((src/'truth.tsv').open(),delimiter='\t'))
+          groups=defaultdict(list)
+          for row in truth:
+              if int(row['eligible']): groups[row['genome']].append(row)
+          chosen=[]
+          for genome,rows in sorted(groups.items()):
+              rows.sort(key=lambda x:(-int(x['length']),x['contig']))
+              chosen.extend(rows[:4])
+          ids={x['contig'] for x in chosen}
+          seq={}; name=None; chunks=[]
+          for raw in (src/'contigs.fa').read_text().splitlines():
+              if raw.startswith('>'):
+                  if name is not None: seq[name]=''.join(chunks)
+                  name=raw[1:].split()[0]; chunks=[]
+              else: chunks.append(raw.strip())
+          if name is not None: seq[name]=''.join(chunks)
+          with (out/'contigs.fa').open('w') as h:
+              for cid in sorted(ids):
+                  h.write(f'>{cid}\n'); s=seq[cid]
+                  for i in range(0,len(s),80): h.write(s[i:i+80]+'\n')
+          fields=['contig','genome','length','eligible','record','start','end']
+          with (out/'truth.tsv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=fields,delimiter='\t'); w.writeheader()
+              w.writerows(sorted(chosen,key=lambda x:x['contig']))
+          with (src/'coverage.tsv').open() as a,(out/'coverage.tsv').open('w',newline='') as z:
+              r=csv.reader(a,delimiter='\t'); w=csv.writer(z,delimiter='\t',lineterminator='\n')
+              w.writerow(next(r))
+              for row in r:
+                  if row and row[0] in ids: w.writerow(row)
+          shutil.copyfile(src/'truth_abundance.tsv', out/'truth_abundance.tsv')
+          print('panel_contigs',len(ids),'genomes',len(groups))
+          PY
+
+      - name: Run truth-free v2 core and mine candidates
+        run: |
+          set -euo pipefail
+          b=benchmark/v21_dnaberts_e2e/panel
+          target/release/bridgebin \
+            --contigs "$b/contigs.fa" --coverage "$b/coverage.tsv" \
+            --out-dir "$b/v2" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
+            >"$b/v2.log" 2>&1
+          python scripts/bridgebin_candidate_pairs.py \
+            --contigs "$b/contigs.fa" --assignments "$b/v2/assignments.tsv" \
+            --coverage "$b/coverage.tsv" --output "$b/candidates.tsv" \
+            --min-length 1500 --anchors-per-bin 10 --max-pairs 250000
+          # Truth is used only for reporting candidate exposure, never for candidate mining.
+          python scripts/bridgebin_eval_candidates.py \
+            --truth "$b/truth.tsv" --assignments "$b/v2/assignments.tsv" \
+            --candidates "$b/candidates.tsv" --output "$b/candidates.metrics.json"
+          cat "$b/candidates.metrics.json"
+
+      - name: Score truth-free candidates with reference-trained DNABERT-S head
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/v21_dnaberts_e2e
+          b="$root/panel"
+          train="$root/train"
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$b/contigs.fa" --output "$b/dnaberts_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$b/dnaberts_windows.tsv" --output "$b/features.tsv"
+          python scripts/bridgebin_pair_head.py score \
+            --features "$b/features.tsv" --pairs "$b/candidates.tsv" \
+            --model "$train/pair_head.json" --output "$b/pair_scores.tsv" \
+            --model-name ref-hardneg-dnaberts-dna-only
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          model=json.loads(Path('benchmark/v21_dnaberts_e2e/train/pair_head.json').read_text())
+          tr=model['training']
+          Path('/tmp/v21_thresholds').write_text(
+              f"{tr['recommended_join_min_same']}\n{tr['recommended_split_max_same']}\n"
+          )
+          print('calibrated_thresholds', json.dumps({
+              'join': tr['recommended_join_min_same'],
+              'split': tr['recommended_split_max_same'],
+              'validation_groups': tr['validation_groups'],
+          }, sort_keys=True))
+          PY
+
+      - name: Run non-oracle v2.1 refinement and evaluate
+        run: |
+          set -euo pipefail
+          b=benchmark/v21_dnaberts_e2e/panel
+          join=$(sed -n '1p' /tmp/v21_thresholds)
+          split=$(sed -n '2p' /tmp/v21_thresholds)
+          target/release/bridgebin-v21 \
+            --contigs "$b/contigs.fa" --coverage "$b/coverage.tsv" \
+            --pair-scores "$b/pair_scores.tsv" --out-dir "$b/v21_dnaberts" \
+            --v21-min-confidence 0 \
+            --v21-split-max-same "$split" \
+            --v21-join-min-same "$join" \
+            --v21-rescue-min-same "$join" \
+            --v21-bin-merge-min-same 0.92 \
+            >"$b/v21_dnaberts.log" 2>&1
+          for tag in v2 v21_dnaberts; do
+            python scripts/bridgebin_benchmark.py evaluate \
+              --truth "$b/truth.tsv" --truth-abundance "$b/truth_abundance.tsv" \
+              --assignments "$b/$tag/assignments.tsv" --abundance "$b/$tag/abundance.tsv" \
+              --output "$b/$tag.metrics.json" >/dev/null
+          done
+          python - <<'PY'
+          import csv, json
+          from collections import defaultdict, Counter
+          from pathlib import Path
+          b=Path('benchmark/v21_dnaberts_e2e/panel')
+          truth={r['contig']:r['genome'] for r in csv.DictReader((b/'truth.tsv').open(),delimiter='\t') if int(r['eligible'])}
+          print('tool\tbins\tpurity\trecall\tf1\tari\thq\tmq')
+          for tag in ('v2','v21_dnaberts'):
+              m=json.loads((b/f'{tag}.metrics.json').read_text())
+              print(f"{tag}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}")
+              bins=defaultdict(Counter)
+              for row in csv.DictReader((b/tag/'assignments.tsv').open(),delimiter='\t'):
+                  cid=row['contig']; bn=row['bin']
+                  if cid in truth and bn not in ('','.','NA','unbinned'):
+                      bins[bn][truth[cid]] += 1
+              focus=[]
+              for bn,c in bins.items():
+                  if c['Escherichia_coli'] or c['Salmonella_enterica']:
+                      focus.append((bn,dict(c)))
+              print(tag,'focus_bins',json.dumps(focus,sort_keys=True))
+          print('v21_log')
+          print((b/'v21_dnaberts.log').read_text())
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v21-dnaberts-e2e
+          path: benchmark/v21_dnaberts_e2e
+          retention-days: 14
