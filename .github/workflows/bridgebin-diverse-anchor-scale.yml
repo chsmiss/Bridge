@@ -1,0 +1,97 @@
+name: BridgeBin diverse-anchor scale benchmark
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_eval_candidates.py
+      - .github/workflows/bridgebin-diverse-anchor-scale.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and validate
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin
+          python3 -m py_compile scripts/bridgebin_candidate_pairs.py scripts/bridgebin_eval_candidates.py
+
+      - name: Prepare full Zymo fixture and v2 assignments
+        run: |
+          set -euo pipefail
+          b=benchmark/diverse_anchor_scale
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$b" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          target/release/bridgebin \
+            --contigs "$b/contigs.fa" --coverage "$b/coverage.tsv" \
+            --out-dir "$b/v2" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
+            >"$b/v2.log" 2>&1
+
+      - name: Sweep diversity-aware anchor budgets
+        run: |
+          set -euo pipefail
+          b=benchmark/diverse_anchor_scale
+          for a in 4 6 8 10; do
+            python3 scripts/bridgebin_candidate_pairs.py \
+              --contigs "$b/contigs.fa" --assignments "$b/v2/assignments.tsv" \
+              --coverage "$b/coverage.tsv" --output "$b/diverse_a${a}.tsv" \
+              --min-length 1500 --anchors-per-bin "$a" --anchor-strategy diverse \
+              --probe-only --max-pairs 250000
+            python3 scripts/bridgebin_eval_candidates.py \
+              --truth "$b/truth.tsv" --assignments "$b/v2/assignments.tsv" \
+              --candidates "$b/diverse_a${a}.tsv" \
+              --output "$b/diverse_a${a}.metrics.json" >/dev/null
+          done
+
+      - name: Summarize diversity probe
+        run: |
+          python3 - <<'PY'
+          import csv, json
+          from pathlib import Path
+          b=Path('benchmark/diverse_anchor_scale')
+          eligible={r['contig'] for r in csv.DictReader((b/'truth.tsv').open(),delimiter='\t') if int(r.get('eligible','1'))}
+          rows=[]
+          print('strategy\tanchors\tpairs\tendpoints\tendpoint_fraction\tmixed_exposure\tfragmented_exposure')
+          for a in (4,6,8,10):
+              m=json.loads((b/f'diverse_a{a}.metrics.json').read_text())
+              endpoints=set(); pairs=0
+              with (b/f'diverse_a{a}.tsv').open() as h:
+                  for r in csv.DictReader(h,delimiter='\t'):
+                      endpoints.update((r['left'],r['right'])); pairs+=1
+              row={
+                  'strategy':'diverse','anchors':a,'pairs':pairs,'endpoints':len(endpoints),
+                  'endpoint_fraction':len(endpoints)/max(1,len(eligible)),
+                  'mixed_exposure':m['mixed_bin_exposure_recall'],
+                  'fragmented_exposure':m['fragmented_genome_exposure_recall'],
+              }
+              rows.append(row)
+              print(f"diverse\t{a}\t{pairs}\t{len(endpoints)}\t{row['endpoint_fraction']:.6f}\t{row['mixed_exposure']}\t{row['fragmented_exposure']}")
+          (b/'summary.json').write_text(json.dumps(rows,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-diverse-anchor-scale
+          path: benchmark/diverse_anchor_scale
+          retention-days: 14
