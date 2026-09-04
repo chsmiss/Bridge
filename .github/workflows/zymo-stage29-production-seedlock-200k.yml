@@ -1,0 +1,265 @@
+name: Zymo 200k Stage29 production seed-lock carry-forward
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - scripts/stage26_stage24_carry_forward.py
+      - scripts/test_stage26_stage24_carry_forward.py
+      - scripts/seed_locked_extensions.py
+      - scripts/test_seed_locked_extensions.py
+      - .github/workflows/zymo-stage29-production-seedlock-200k.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zymo-stage29-production-seedlock-200k
+  cancel-in-progress: true
+
+env:
+  PAIRS: '200000'
+  THREADS: '2'
+  STAGE24_RUN_ID: '33838098251'
+  STAGE24_ARTIFACT: zymo-stage24-single-fragment-ab-200k
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          for attempt in 1 2 3; do
+            rm -rf /tmp/zymo-log
+            if python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "ENA subset download failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+
+      - name: Reuse verified Stage24 pair2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.STAGE24_ARTIFACT }}
+          path: /tmp/stage24
+          github-token: ${{ github.token }}
+          repository: chsmiss/Bridge
+          run-id: ${{ env.STAGE24_RUN_ID }}
+
+      - name: Verify seed, unit tests, and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          seed=/tmp/stage24/assemblies/bridge_pair2_final.fasta
+          test -s "$seed"
+          cp "$seed" benchmark/assemblies/stage24_pair2.fasta
+          python3 scripts/fasta_stats.py "$seed" --json benchmark/stage24_pair2.stats.json \
+            > benchmark/stage24_pair2.stats.tsv
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('benchmark/stage24_pair2.stats.json').read_text())
+          expected={'sequences':1469,'total_bp':3216914,'n50':10181}
+          got={k:s[k] for k in expected}
+          if got != expected:
+              raise SystemExit(f'wrong Stage24 pair2 seed: expected {expected}, got {got}')
+          print('verified Stage24 pair2 seed:', got)
+          PY
+          python3 -m py_compile scripts/stage26_stage24_carry_forward.py scripts/seed_locked_extensions.py
+          PYTHONPATH=scripts python3 scripts/test_stage26_stage24_carry_forward.py
+          PYTHONPATH=scripts python3 scripts/test_seed_locked_extensions.py
+          cargo fmt --all -- --check
+          cargo test --all-targets
+          cargo build --release
+
+      - name: Run production-default carry-forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage29.time.txt \
+            python3 scripts/stage26_stage24_carry_forward.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --seed-fasta benchmark/assemblies/stage24_pair2.fasta \
+              --output benchmark/stage29_production \
+              --threads "$THREADS" \
+              --prior-min-length 200 \
+              2>&1 | tee benchmark/stage29.log
+          cp benchmark/stage29_production/primary_contigs.fasta \
+            benchmark/assemblies/stage29_seedlock500.fasta
+
+      - name: Verify production mode and absence of legacy replacement stages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('benchmark/stage29_production')
+          m=json.loads((root/'pipeline_manifest.json').read_text())
+          assert m['pipeline'] == 'stage26-stage24-pair2-carry-forward-v2', m
+          assert m['mode'] == 'seed-lock-k31', m
+          assert m['stages'] == [31], m
+          assert m['seed_lock_min_overlap'] == 500, m
+          assert m['seed_lock_overlap_margin'] == 30, m
+          assert m['seed_lock_min_extension'] == 20, m
+          assert (root/'k31'/'primary_contigs.fasta').is_file()
+          assert not (root/'k41').exists()
+          assert not (root/'k55').exists()
+          assert not (root/'cross_k_exact_union.fasta').exists()
+          assert not (root/'cross_k_noncontained.fasta').exists()
+          assert (root/'seed_lock_stats.json').is_file()
+          stats=json.loads((root/'seed_lock_stats.json').read_text())
+          assert stats['accepted_extensions'] > 0, stats
+          assert stats['added_bp'] > 0, stats
+          print(json.dumps(m, indent=2, sort_keys=True))
+          PY
+
+      - name: FASTA stats and hard Stage24 k21 retention gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/fasta_stats.py benchmark/assemblies/stage29_seedlock500.fasta \
+            --json benchmark/stage29_seedlock500.stats.json \
+            > benchmark/stage29_seedlock500.stats.tsv
+          PYTHONPATH=scripts python3 - <<'PY'
+          from pathlib import Path
+          import stage23_guided_singleton_rescue as s23
+          seed=s23.fasta_keyset(Path('benchmark/assemblies/stage24_pair2.fasta'),21)
+          final=s23.fasta_keyset(Path('benchmark/assemblies/stage29_seedlock500.fasta'),21)
+          retained=len(seed & final)
+          lost=len(seed-final)
+          new=len(final-seed)
+          pct=100.0*retained/len(seed)
+          text=(
+              'assembly\tseed_k21\tretained\tlost\tretained_pct\tnew_k21\ttotal_k21\n'
+              f'stage29_seedlock500\t{len(seed)}\t{retained}\t{lost}\t{pct:.6f}\t{new}\t{len(final)}\n'
+          )
+          Path('benchmark/stage29_k21_retention.tsv').write_text(text)
+          print(text)
+          if lost:
+              raise SystemExit(f'production seed-lock lost {lost} Stage24 k21 keys')
+          PY
+
+      - name: MetaQUAST baseline versus production
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/stage24_pair2.fasta \
+            benchmark/assemblies/stage29_seedlock500.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Summarize and enforce conservative quality gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv,json
+          from pathlib import Path
+
+          with Path('benchmark/metaquast_summary.tsv').open() as h:
+              meta={r['Assembly']:r for r in csv.DictReader(h,delimiter='\t')}
+          seed_stats=json.loads(Path('benchmark/stage24_pair2.stats.json').read_text())
+          final_stats=json.loads(Path('benchmark/stage29_seedlock500.stats.json').read_text())
+          seed=meta['stage24_pair2']
+          final=meta['stage29_seedlock500']
+          extension=json.loads(Path('benchmark/stage29_production/seed_lock_stats.json').read_text())
+
+          row={
+              'seed_n50': seed_stats['n50'],
+              'final_n50': final_stats['n50'],
+              'n50_delta': final_stats['n50']-seed_stats['n50'],
+              'seed_total_bp': seed_stats['total_bp'],
+              'final_total_bp': final_stats['total_bp'],
+              'added_bp': final_stats['total_bp']-seed_stats['total_bp'],
+              'seed_gf': float(seed['Genome fraction (%)']),
+              'final_gf': float(final['Genome fraction (%)']),
+              'gf_delta': float(final['Genome fraction (%)'])-float(seed['Genome fraction (%)']),
+              'seed_na50': float(seed['NA50']),
+              'final_na50': float(final['NA50']),
+              'seed_dup': float(seed['Duplication ratio']),
+              'final_dup': float(final['Duplication ratio']),
+              'seed_misassemblies': int(float(seed['# misassemblies'])),
+              'final_misassemblies': int(float(final['# misassemblies'])),
+              'seed_local_misassemblies': int(float(seed['# local misassemblies'])),
+              'final_local_misassemblies': int(float(final['# local misassemblies'])),
+              'accepted_extensions': int(extension['accepted_extensions']),
+              'rejected_multiseed_candidates': int(extension['ambiguous_bridge_candidates_rejected']),
+          }
+          Path('benchmark/stage29_summary.json').write_text(json.dumps(row,indent=2,sort_keys=True)+'\n')
+          Path('benchmark/stage29_summary.tsv').write_text(
+              '\t'.join(row.keys())+'\n'+'\t'.join(str(v) for v in row.values())+'\n'
+          )
+          print(json.dumps(row,indent=2,sort_keys=True))
+
+          failures=[]
+          if row['final_n50'] < row['seed_n50']:
+              failures.append('N50 regressed')
+          if row['final_gf'] < row['seed_gf']:
+              failures.append('combined GF regressed')
+          if row['final_misassemblies'] > row['seed_misassemblies'] + 2:
+              failures.append('misassemblies increased by more than 2')
+          if row['final_local_misassemblies'] > row['seed_local_misassemblies'] + 1:
+              failures.append('local misassemblies increased by more than 1')
+          if row['final_dup'] > row['seed_dup'] + 0.020:
+              failures.append('duplication ratio increased by more than 0.020')
+          if row['added_bp'] <= 0 or row['accepted_extensions'] <= 0:
+              failures.append('no sequence was conservatively extended')
+          if failures:
+              raise SystemExit('Stage29 quality gate failed: ' + '; '.join(failures))
+          PY
+
+      - name: Save provenance
+        shell: bash
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nseed_source_run\t%s\nseed_source_artifact\t%s\nmode\tseed-lock-k31\nseed_lock_min_overlap\t500\n' \
+            "$GITHUB_SHA" "$PAIRS" "$STAGE24_RUN_ID" "$STAGE24_ARTIFACT" > benchmark/benchmark_provenance.tsv
+
+      - name: Upload Stage29 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage29-production-seedlock-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.log
+            benchmark/*.time.txt
+            benchmark/stage29_production/pipeline_manifest.json
+            benchmark/stage29_production/seed_lock_stats.json
+          retention-days: 14
