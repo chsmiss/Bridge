@@ -1,4 +1,5 @@
 pub mod assembler;
+pub mod bridgebin;
 pub mod dna;
 pub mod fastq;
 pub mod graph;
