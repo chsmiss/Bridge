@@ -1,4 +1,7 @@
-use crate::bridgebin::{Assignment, BinSummary, BinningResult, BridgeBinConfig, Contig, CoverageTable};
+use crate::bridgebin::{
+    Assignment, BinSummary, BinningResult, BridgeBinConfig, Contig, CoverageTable,
+};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -54,14 +57,14 @@ struct BinNode {
     members: Vec<usize>,
     bp: usize,
     gc_sum: f64,
-    sig_sum: [f64; 1024],
-    sig_total: f64,
-    cov_sum: Vec<f64>,
+    kmer_counts: [f64; 1024],
+    kmer_total: f64,
+    coverage_sum: Vec<f64>,
     markers: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SimilarityParts {
+struct Similarity {
     combined: f64,
     composition: f64,
     coverage: Option<f64>,
@@ -70,29 +73,30 @@ struct SimilarityParts {
 pub fn read_marker_table<P: AsRef<Path>>(path: P) -> io::Result<MarkerTable> {
     let reader = BufReader::new(File::open(path)?);
     let mut values: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut saw_data = false;
+    let mut first_data_row = true;
+
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
-        let s = line.trim();
-        if s.is_empty() || s.starts_with('#') {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = s.split_whitespace().collect();
+        let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("marker row {} needs contig and marker columns", line_no + 1),
             ));
         }
-        if !saw_data
+        if first_data_row
             && fields[0].eq_ignore_ascii_case("contig")
             && fields[1].to_ascii_lowercase().starts_with("marker")
         {
-            saw_data = true;
+            first_data_row = false;
             continue;
         }
-        saw_data = true;
-        for marker in fields[1].split(',').filter(|x| !x.is_empty()) {
+        first_data_row = false;
+        for marker in fields[1].split(',').filter(|m| !m.is_empty()) {
             values
                 .entry(fields[0].to_string())
                 .or_default()
@@ -111,172 +115,169 @@ pub fn reconcile_bins(
     cfg: &ReconcileConfig,
 ) -> (BinningResult, ReconcileStats) {
     if !cfg.enabled || initial.bins.len() <= 1 {
-        let n = initial.bins.len();
+        let bins = initial.bins.len();
         return (
             initial,
             ReconcileStats {
-                initial_bins: n,
-                final_bins: n,
+                initial_bins: bins,
+                final_bins: bins,
                 ..Default::default()
             },
         );
     }
 
-    let by_id: HashMap<&str, usize> = contigs
+    let contig_index: HashMap<&str, usize> = contigs
         .iter()
         .enumerate()
-        .map(|(i, c)| (c.id.as_str(), i))
+        .map(|(index, contig)| (contig.id.as_str(), index))
         .collect();
-    let mut members: Vec<Vec<usize>> = vec![Vec::new(); initial.bins.len()];
-    for a in &initial.assignments {
-        if let (Some(bin), Some(&idx)) = (a.bin_index, by_id.get(a.contig_id.as_str())) {
-            if let Some(slot) = members.get_mut(bin) {
-                slot.push(idx);
+    let mut seed_members = vec![Vec::new(); initial.bins.len()];
+    for assignment in &initial.assignments {
+        if let (Some(bin), Some(&index)) = (
+            assignment.bin_index,
+            contig_index.get(assignment.contig_id.as_str()),
+        ) {
+            if let Some(members) = seed_members.get_mut(bin) {
+                members.push(index);
             }
         }
     }
 
-    let mut nodes: Vec<BinNode> = members
+    let mut nodes: Vec<BinNode> = seed_members
         .into_iter()
-        .filter(|m| !m.is_empty())
-        .map(|m| BinNode::from_members(m, contigs, coverage, markers))
+        .filter(|members| !members.is_empty())
+        .map(|members| BinNode::from_members(members, contigs, coverage, markers))
         .collect();
     let mut stats = ReconcileStats {
         initial_bins: nodes.len(),
         ..Default::default()
     };
 
-    while stats.merges < cfg.max_merges && nodes.len() > 1 {
-        let mut choices = Vec::with_capacity(nodes.len());
-        for i in 0..nodes.len() {
-            choices.push(best_two_nodes(i, &nodes, base_cfg, cfg, &mut stats));
-        }
+    while nodes.len() > 1 && stats.merges < cfg.max_merges {
+        let choices: Vec<Option<(usize, f64, f64)>> = (0..nodes.len())
+            .map(|index| best_two(index, &nodes, base_cfg, cfg, &mut stats))
+            .collect();
+        let mut selected: Option<(usize, usize, f64)> = None;
 
-        let mut best_pair: Option<(usize, usize, f64)> = None;
-        for i in 0..nodes.len() {
-            let Some((j, score, second)) = choices[i] else {
+        for left in 0..nodes.len() {
+            let Some((right, score, second)) = choices[left] else {
                 continue;
             };
-            if j <= i || score < cfg.merge_threshold || score - second < cfg.merge_margin {
+            if right <= left
+                || score < cfg.merge_threshold
+                || score - second < cfg.merge_margin
+            {
                 continue;
             }
-            let Some((back, back_score, back_second)) = choices[j] else {
+            let Some((back, back_score, back_second)) = choices[right] else {
                 continue;
             };
-            if back != i || back_score - back_second < cfg.merge_margin {
+            if back != left || back_score - back_second < cfg.merge_margin {
                 continue;
             }
-            let pair_score = score.min(back_score);
-            if best_pair.map(|(_, _, s)| pair_score > s).unwrap_or(true) {
-                best_pair = Some((i, j, pair_score));
+            let reciprocal_score = score.min(back_score);
+            if selected
+                .map(|(_, _, previous)| reciprocal_score > previous)
+                .unwrap_or(true)
+            {
+                selected = Some((left, right, reciprocal_score));
             }
         }
 
-        let Some((i, j, _)) = best_pair else {
+        let Some((left, right, _)) = selected else {
             break;
         };
-        let other = nodes.remove(j);
-        nodes[i].absorb(other);
+        let other = nodes.remove(right);
+        nodes[left].absorb(other);
         stats.merges += 1;
     }
 
-    nodes.sort_by(|a, b| b.bp.cmp(&a.bp));
-    let mut contig_to_bin = vec![None; contigs.len()];
-    for (bin, node) in nodes.iter().enumerate() {
-        for &idx in &node.members {
-            contig_to_bin[idx] = Some(bin);
-        }
-    }
-
+    nodes.sort_by_key(|node| Reverse(node.bp));
+    let mut rescued_scores = HashMap::new();
     let mut unbinned: Vec<usize> = initial
         .assignments
         .iter()
-        .filter(|a| a.bin_index.is_none())
-        .filter_map(|a| by_id.get(a.contig_id.as_str()).copied())
-        .filter(|&idx| contigs[idx].seq.len() >= base_cfg.min_contig_len)
+        .filter(|assignment| assignment.bin_index.is_none())
+        .filter_map(|assignment| contig_index.get(assignment.contig_id.as_str()).copied())
+        .filter(|&index| contigs[index].seq.len() >= base_cfg.min_contig_len)
         .collect();
-    unbinned.sort_by(|&a, &b| contigs[b].seq.len().cmp(&contigs[a].seq.len()));
-    let mut rescued_scores: HashMap<usize, f64> = HashMap::new();
-    for idx in unbinned {
-        if nodes.is_empty() {
-            break;
-        }
-        let probe = BinNode::from_members(vec![idx], contigs, coverage, markers);
+    unbinned.sort_by_key(|&index| Reverse(contigs[index].seq.len()));
+
+    for index in unbinned {
+        let probe = BinNode::from_members(vec![index], contigs, coverage, markers);
         let mut best: Option<(usize, f64)> = None;
         let mut second = 0.0;
         for (bin, node) in nodes.iter().enumerate() {
             if marker_conflict(&probe, node) {
                 continue;
             }
-            let parts = node_similarity(&probe, node, base_cfg);
-            if !hard_compatible(&probe, node, parts, cfg) {
+            let similarity = node_similarity(&probe, node, base_cfg);
+            if !compatible(&probe, node, similarity, cfg) {
                 continue;
             }
-            if best.map(|(_, s)| parts.combined > s).unwrap_or(true) {
-                second = best.map(|(_, s)| s).unwrap_or(0.0);
-                best = Some((bin, parts.combined));
-            } else if parts.combined > second {
-                second = parts.combined;
+            if best
+                .map(|(_, score)| similarity.combined > score)
+                .unwrap_or(true)
+            {
+                second = best.map(|(_, score)| score).unwrap_or(0.0);
+                best = Some((bin, similarity.combined));
+            } else if similarity.combined > second {
+                second = similarity.combined;
             }
         }
         if let Some((bin, score)) = best {
             if score >= cfg.post_rescue_threshold && score - second >= cfg.post_rescue_margin {
-                nodes[bin].add_contig(idx, &contigs[idx], coverage, markers);
-                contig_to_bin[idx] = Some(bin);
-                rescued_scores.insert(idx, score);
+                nodes[bin].add_contig(index, &contigs[index], coverage, markers);
+                rescued_scores.insert(index, score);
                 stats.rescued_contigs += 1;
             }
         }
     }
 
-    nodes.sort_by(|a, b| b.bp.cmp(&a.bp));
-    contig_to_bin.fill(None);
+    nodes.sort_by_key(|node| Reverse(node.bp));
+    let mut contig_to_bin = vec![None; contigs.len()];
     for (bin, node) in nodes.iter().enumerate() {
-        for &idx in &node.members {
-            contig_to_bin[idx] = Some(bin);
+        for &index in &node.members {
+            contig_to_bin[index] = Some(bin);
         }
     }
 
-    let initial_score: HashMap<&str, f64> = initial
+    let initial_scores: HashMap<&str, f64> = initial
         .assignments
         .iter()
-        .map(|a| (a.contig_id.as_str(), a.score))
+        .map(|assignment| (assignment.contig_id.as_str(), assignment.score))
         .collect();
-    let assignments: Vec<Assignment> = contigs
+    let assignments = contigs
         .iter()
         .enumerate()
-        .map(|(idx, c)| Assignment {
-            contig_id: c.id.clone(),
-            bin_index: contig_to_bin[idx],
+        .map(|(index, contig)| Assignment {
+            contig_id: contig.id.clone(),
+            bin_index: contig_to_bin[index],
             score: rescued_scores
-                .get(&idx)
+                .get(&index)
                 .copied()
-                .or_else(|| initial_score.get(c.id.as_str()).copied())
+                .or_else(|| initial_scores.get(contig.id.as_str()).copied())
                 .unwrap_or(0.0),
-            length: c.seq.len(),
+            length: contig.seq.len(),
         })
         .collect();
-
-    let bins: Vec<BinSummary> = nodes
+    let bins = nodes
         .iter()
         .enumerate()
         .map(|(bin_index, node)| BinSummary {
             bin_index,
             contig_count: node.members.len(),
             total_bp: node.bp,
-            mean_gc: if node.bp == 0 {
-                0.0
-            } else {
-                node.gc_sum / node.bp as f64
-            },
+            mean_gc: node.mean_gc(),
         })
         .collect();
-    stats.final_bins = bins.len();
+
+    stats.final_bins = nodes.len();
     (BinningResult { assignments, bins }, stats)
 }
 
-fn best_two_nodes(
-    i: usize,
+fn best_two(
+    index: usize,
     nodes: &[BinNode],
     base_cfg: &BridgeBinConfig,
     cfg: &ReconcileConfig,
@@ -284,50 +285,58 @@ fn best_two_nodes(
 ) -> Option<(usize, f64, f64)> {
     let mut best: Option<(usize, f64)> = None;
     let mut second = 0.0;
-    for j in 0..nodes.len() {
-        if i == j {
+    for other in 0..nodes.len() {
+        if other == index {
             continue;
         }
-        if marker_conflict(&nodes[i], &nodes[j]) {
+        if marker_conflict(&nodes[index], &nodes[other]) {
             stats.marker_blocked_pairs += 1;
             continue;
         }
-        let parts = node_similarity(&nodes[i], &nodes[j], base_cfg);
-        if !hard_compatible(&nodes[i], &nodes[j], parts, cfg) {
+        let similarity = node_similarity(&nodes[index], &nodes[other], base_cfg);
+        if !compatible(&nodes[index], &nodes[other], similarity, cfg) {
             continue;
         }
-        if best.map(|(_, s)| parts.combined > s).unwrap_or(true) {
-            second = best.map(|(_, s)| s).unwrap_or(0.0);
-            best = Some((j, parts.combined));
-        } else if parts.combined > second {
-            second = parts.combined;
+        if best
+            .map(|(_, score)| similarity.combined > score)
+            .unwrap_or(true)
+        {
+            second = best.map(|(_, score)| score).unwrap_or(0.0);
+            best = Some((other, similarity.combined));
+        } else if similarity.combined > second {
+            second = similarity.combined;
         }
     }
-    best.map(|(j, score)| (j, score, second))
+    best.map(|(other, score)| (other, score, second))
 }
 
-fn hard_compatible(a: &BinNode, b: &BinNode, s: SimilarityParts, cfg: &ReconcileConfig) -> bool {
-    let gc_a = a.gc_sum / a.bp.max(1) as f64;
-    let gc_b = b.gc_sum / b.bp.max(1) as f64;
-    if (gc_a - gc_b).abs() > cfg.max_gc_delta || s.composition < cfg.min_composition_score {
+fn compatible(left: &BinNode, right: &BinNode, score: Similarity, cfg: &ReconcileConfig) -> bool {
+    if (left.mean_gc() - right.mean_gc()).abs() > cfg.max_gc_delta
+        || score.composition < cfg.min_composition_score
+    {
         return false;
     }
-    if let Some(cov) = s.coverage {
-        if cov < cfg.min_coverage_score {
+    if let Some(coverage) = score.coverage {
+        if coverage < cfg.min_coverage_score {
             return false;
         }
-        if cov >= 0.97 && s.composition < cfg.same_coverage_min_composition {
+        if coverage >= 0.97 && score.composition < cfg.same_coverage_min_composition {
             return false;
         }
     }
     true
 }
 
-fn marker_conflict(a: &BinNode, b: &BinNode) -> bool {
-    if a.markers.len() < b.markers.len() {
-        a.markers.iter().any(|m| b.markers.contains(m))
+fn marker_conflict(left: &BinNode, right: &BinNode) -> bool {
+    if left.markers.len() <= right.markers.len() {
+        left.markers
+            .iter()
+            .any(|marker| right.markers.contains(marker))
     } else {
-        b.markers.iter().any(|m| a.markers.contains(m))
+        right
+            .markers
+            .iter()
+            .any(|marker| left.markers.contains(marker))
     }
 }
 
@@ -338,180 +347,203 @@ impl BinNode {
         coverage: Option<&CoverageTable>,
         markers: Option<&MarkerTable>,
     ) -> Self {
-        let mut out = Self {
+        let mut node = Self {
             members: Vec::new(),
             bp: 0,
             gc_sum: 0.0,
-            sig_sum: [0.0; 1024],
-            sig_total: 0.0,
-            cov_sum: Vec::new(),
+            kmer_counts: [0.0; 1024],
+            kmer_total: 0.0,
+            coverage_sum: Vec::new(),
             markers: HashSet::new(),
         };
-        for idx in members {
-            out.add_contig(idx, &contigs[idx], coverage, markers);
+        for index in members {
+            node.add_contig(index, &contigs[index], coverage, markers);
         }
-        out
+        node
     }
 
     fn add_contig(
         &mut self,
-        idx: usize,
+        index: usize,
         contig: &Contig,
         coverage: Option<&CoverageTable>,
         markers: Option<&MarkerTable>,
     ) {
-        let len = contig.seq.len();
-        let w = len as f64;
-        self.members.push(idx);
-        self.bp += len;
-        self.gc_sum += gc_fraction(&contig.seq) * w;
+        let length = contig.seq.len();
+        let weight = length as f64;
+        self.members.push(index);
+        self.bp += length;
+        self.gc_sum += gc_fraction(&contig.seq) * weight;
+
         let (counts, total) = canonical_5mer_counts(&contig.seq);
-        for (dst, src) in self.sig_sum.iter_mut().zip(counts.iter()) {
-            *dst += *src;
+        for (target, value) in self.kmer_counts.iter_mut().zip(counts.iter()) {
+            *target += *value;
         }
-        self.sig_total += total;
-        if let Some(row) = coverage.and_then(|t| t.values.get(&contig.id)) {
-            if self.cov_sum.is_empty() {
-                self.cov_sum.resize(row.len(), 0.0);
+        self.kmer_total += total;
+
+        if let Some(row) = coverage.and_then(|table| table.values.get(&contig.id)) {
+            if self.coverage_sum.is_empty() {
+                self.coverage_sum.resize(row.len(), 0.0);
             }
-            if self.cov_sum.len() == row.len() {
-                for (dst, src) in self.cov_sum.iter_mut().zip(row.iter()) {
-                    *dst += *src * w;
+            if self.coverage_sum.len() == row.len() {
+                for (target, depth) in self.coverage_sum.iter_mut().zip(row.iter()) {
+                    *target += *depth * weight;
                 }
             }
         }
-        if let Some(ms) = markers.and_then(|t| t.values.get(&contig.id)) {
-            self.markers.extend(ms.iter().cloned());
+        if let Some(hits) = markers.and_then(|table| table.values.get(&contig.id)) {
+            self.markers.extend(hits.iter().cloned());
         }
     }
 
-    fn absorb(&mut self, other: BinNode) {
+    fn absorb(&mut self, other: Self) {
         self.members.extend(other.members);
         self.bp += other.bp;
         self.gc_sum += other.gc_sum;
-        self.sig_total += other.sig_total;
-        for (dst, src) in self.sig_sum.iter_mut().zip(other.sig_sum.iter()) {
-            *dst += *src;
+        self.kmer_total += other.kmer_total;
+        for (target, value) in self.kmer_counts.iter_mut().zip(other.kmer_counts.iter()) {
+            *target += *value;
         }
-        if self.cov_sum.is_empty() && !other.cov_sum.is_empty() {
-            self.cov_sum.resize(other.cov_sum.len(), 0.0);
+        if self.coverage_sum.is_empty() && !other.coverage_sum.is_empty() {
+            self.coverage_sum.resize(other.coverage_sum.len(), 0.0);
         }
-        if self.cov_sum.len() == other.cov_sum.len() {
-            for (dst, src) in self.cov_sum.iter_mut().zip(other.cov_sum.iter()) {
-                *dst += *src;
+        if self.coverage_sum.len() == other.coverage_sum.len() {
+            for (target, value) in self.coverage_sum.iter_mut().zip(other.coverage_sum.iter()) {
+                *target += *value;
             }
         }
         self.markers.extend(other.markers);
     }
+
+    fn mean_gc(&self) -> f64 {
+        if self.bp == 0 {
+            0.0
+        } else {
+            self.gc_sum / self.bp as f64
+        }
+    }
 }
 
-fn node_similarity(a: &BinNode, b: &BinNode, cfg: &BridgeBinConfig) -> SimilarityParts {
-    let composition = (-hellinger_counts(a, b) / 0.24).exp();
-    let gc_a = a.gc_sum / a.bp.max(1) as f64;
-    let gc_b = b.gc_sum / b.bp.max(1) as f64;
-    let gc = (-(gc_a - gc_b).abs() / 0.065).exp();
-    let mut score = cfg.composition_weight * composition + cfg.gc_weight * gc;
-    let mut weight = cfg.composition_weight + cfg.gc_weight;
-    let coverage = if !a.cov_sum.is_empty() && a.cov_sum.len() == b.cov_sum.len() {
-        let da = a.bp.max(1) as f64;
-        let db = b.bp.max(1) as f64;
-        let d = a
-            .cov_sum
+fn node_similarity(left: &BinNode, right: &BinNode, cfg: &BridgeBinConfig) -> Similarity {
+    let composition = (-hellinger(left, right) / 0.24).exp();
+    let gc = (-(left.mean_gc() - right.mean_gc()).abs() / 0.065).exp();
+    let mut weighted = cfg.composition_weight * composition + cfg.gc_weight * gc;
+    let mut total_weight = cfg.composition_weight + cfg.gc_weight;
+
+    let coverage = if !left.coverage_sum.is_empty()
+        && left.coverage_sum.len() == right.coverage_sum.len()
+    {
+        let left_bp = left.bp.max(1) as f64;
+        let right_bp = right.bp.max(1) as f64;
+        let distance = left
+            .coverage_sum
             .iter()
-            .zip(b.cov_sum.iter())
-            .map(|(x, y)| (((x / da) + 0.5) / ((y / db) + 0.5)).ln().abs())
+            .zip(right.coverage_sum.iter())
+            .map(|(a, b)| (((a / left_bp) + 0.5) / ((b / right_bp) + 0.5)).ln().abs())
             .sum::<f64>()
-            / a.cov_sum.len() as f64;
-        let cov = (-d / 0.80).exp();
-        score += cfg.coverage_weight * cov;
-        weight += cfg.coverage_weight;
-        Some(cov)
+            / left.coverage_sum.len() as f64;
+        let similarity = (-distance / 0.80).exp();
+        weighted += cfg.coverage_weight * similarity;
+        total_weight += cfg.coverage_weight;
+        Some(similarity)
     } else {
         None
     };
-    SimilarityParts {
-        combined: if weight <= f64::EPSILON { 0.0 } else { score / weight },
+
+    Similarity {
+        combined: if total_weight <= f64::EPSILON {
+            0.0
+        } else {
+            weighted / total_weight
+        },
         composition,
         coverage,
     }
 }
 
-fn hellinger_counts(a: &BinNode, b: &BinNode) -> f64 {
-    if a.sig_total <= 0.0 || b.sig_total <= 0.0 {
+fn hellinger(left: &BinNode, right: &BinNode) -> f64 {
+    if left.kmer_total <= 0.0 || right.kmer_total <= 0.0 {
         return 1.0;
     }
-    let sum = a
-        .sig_sum
+    let distance = left
+        .kmer_counts
         .iter()
-        .zip(b.sig_sum.iter())
-        .map(|(x, y)| {
-            let px = *x / a.sig_total;
-            let py = *y / b.sig_total;
-            (px.sqrt() - py.sqrt()).powi(2)
+        .zip(right.kmer_counts.iter())
+        .map(|(a, b)| {
+            let pa = *a / left.kmer_total;
+            let pb = *b / right.kmer_total;
+            (pa.sqrt() - pb.sqrt()).powi(2)
         })
         .sum::<f64>();
-    (0.5 * sum).sqrt()
+    (0.5 * distance).sqrt()
 }
 
 fn gc_fraction(seq: &[u8]) -> f64 {
     let mut gc = 0usize;
-    let mut n = 0usize;
-    for &b in seq {
-        match b.to_ascii_uppercase() {
+    let mut valid = 0usize;
+    for &base in seq {
+        match base.to_ascii_uppercase() {
             b'G' | b'C' => {
                 gc += 1;
-                n += 1;
+                valid += 1;
             }
-            b'A' | b'T' => n += 1,
+            b'A' | b'T' => valid += 1,
             _ => {}
         }
     }
-    if n == 0 { 0.0 } else { gc as f64 / n as f64 }
+    if valid == 0 {
+        0.0
+    } else {
+        gc as f64 / valid as f64
+    }
 }
 
 fn canonical_5mer_counts(seq: &[u8]) -> ([f64; 1024], f64) {
     let mut counts = [0.0; 1024];
     let mut total = 0.0;
-    for w in seq.windows(5) {
-        if let (Some(fwd), Some(rc)) = (encode5(w, false), encode5(w, true)) {
-            counts[fwd.min(rc)] += 1.0;
+    for window in seq.windows(5) {
+        if let (Some(forward), Some(reverse)) = (encode_5mer(window, false), encode_5mer(window, true)) {
+            counts[forward.min(reverse)] += 1.0;
             total += 1.0;
         }
     }
     (counts, total)
 }
 
-fn encode5(w: &[u8], reverse_complement: bool) -> Option<usize> {
+fn encode_5mer(window: &[u8], reverse_complement: bool) -> Option<usize> {
     let mut code = 0usize;
     if reverse_complement {
-        for &b in w.iter().rev() {
-            code = (code << 2) | base_code(b, true)?;
+        for &base in window.iter().rev() {
+            code = (code << 2) | base_code(base, true)?;
         }
     } else {
-        for &b in w {
-            code = (code << 2) | base_code(b, false)?;
+        for &base in window {
+            code = (code << 2) | base_code(base, false)?;
         }
     }
     Some(code)
 }
 
-fn base_code(b: u8, complement: bool) -> Option<usize> {
-    let x = match b.to_ascii_uppercase() {
+fn base_code(base: u8, complement: bool) -> Option<usize> {
+    let code = match base.to_ascii_uppercase() {
         b'A' => 0,
         b'C' => 1,
         b'G' => 2,
         b'T' => 3,
         _ => return None,
     };
-    Some(if complement { 3 - x } else { x })
+    Some(if complement { 3 - code } else { code })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn c(id: &str, pattern: &str, n: usize) -> Contig {
-        Contig { id: id.into(), seq: pattern.repeat(n).into_bytes() }
+    fn contig(id: &str, pattern: &str, repeats: usize) -> Contig {
+        Contig {
+            id: id.to_string(),
+            seq: pattern.repeat(repeats).into_bytes(),
+        }
     }
 
     fn singleton_result(contigs: &[Contig]) -> BinningResult {
@@ -519,12 +551,22 @@ mod tests {
             assignments: contigs
                 .iter()
                 .enumerate()
-                .map(|(i, c)| Assignment { contig_id: c.id.clone(), bin_index: Some(i), score: 1.0, length: c.seq.len() })
+                .map(|(index, contig)| Assignment {
+                    contig_id: contig.id.clone(),
+                    bin_index: Some(index),
+                    score: 1.0,
+                    length: contig.seq.len(),
+                })
                 .collect(),
             bins: contigs
                 .iter()
                 .enumerate()
-                .map(|(i, c)| BinSummary { bin_index: i, contig_count: 1, total_bp: c.seq.len(), mean_gc: gc_fraction(&c.seq) })
+                .map(|(index, contig)| BinSummary {
+                    bin_index: index,
+                    contig_count: 1,
+                    total_bp: contig.seq.len(),
+                    mean_gc: gc_fraction(&contig.seq),
+                })
                 .collect(),
         }
     }
@@ -532,64 +574,90 @@ mod tests {
     #[test]
     fn reciprocal_reconciliation_merges_split_signatures() {
         let contigs = vec![
-            c("a1", "AAAACAAAAGAAAATAAAC", 220),
-            c("a2", "AAAGAAAACAAAATAAAA", 220),
-            c("b1", "GGGCGGCCGCGGCGCCGC", 220),
-            c("b2", "GCCGGCGCGGCCGGCGGC", 220),
+            contig("a1", "AAAACAAAAGAAAATAAAC", 220),
+            contig("a2", "AAAACAAAAGAAAATAAAT", 220),
+            contig("b1", "GGGCGGCCGCGGCGCCGC", 220),
+            contig("b2", "GGGCGGCCGCGGCGCCGA", 220),
         ];
         let coverage = CoverageTable {
-            sample_names: vec!["s1".into(), "s2".into()],
+            sample_names: vec!["s1".to_string(), "s2".to_string()],
             values: HashMap::from([
-                ("a1".into(), vec![20.0, 10.0]),
-                ("a2".into(), vec![20.5, 10.2]),
-                ("b1".into(), vec![20.0, 10.0]),
-                ("b2".into(), vec![19.8, 10.1]),
+                ("a1".to_string(), vec![20.0, 10.0]),
+                ("a2".to_string(), vec![20.5, 10.2]),
+                ("b1".to_string(), vec![20.0, 10.0]),
+                ("b2".to_string(), vec![19.8, 10.1]),
             ]),
         };
-        let mut cfg = ReconcileConfig::default();
-        cfg.merge_threshold = 0.55;
-        cfg.min_composition_score = 0.45;
-        cfg.same_coverage_min_composition = 0.70;
+        let config = ReconcileConfig {
+            merge_threshold: 0.50,
+            min_composition_score: 0.40,
+            same_coverage_min_composition: 0.65,
+            merge_margin: 0.0,
+            ..Default::default()
+        };
         let (result, stats) = reconcile_bins(
             &contigs,
             Some(&coverage),
             None,
             singleton_result(&contigs),
             &BridgeBinConfig::default(),
-            &cfg,
+            &config,
         );
         assert_eq!(stats.final_bins, 2);
-        let a = result.assignments.iter().find(|x| x.contig_id == "a1").unwrap().bin_index;
-        let a2 = result.assignments.iter().find(|x| x.contig_id == "a2").unwrap().bin_index;
-        let b = result.assignments.iter().find(|x| x.contig_id == "b1").unwrap().bin_index;
-        assert_eq!(a, a2);
-        assert_ne!(a, b);
+        let a1 = result
+            .assignments
+            .iter()
+            .find(|assignment| assignment.contig_id == "a1")
+            .unwrap()
+            .bin_index;
+        let a2 = result
+            .assignments
+            .iter()
+            .find(|assignment| assignment.contig_id == "a2")
+            .unwrap()
+            .bin_index;
+        let b1 = result
+            .assignments
+            .iter()
+            .find(|assignment| assignment.contig_id == "b1")
+            .unwrap()
+            .bin_index;
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b1);
     }
 
     #[test]
     fn shared_single_copy_marker_blocks_merge() {
         let contigs = vec![
-            c("x1", "ACGTACGTAAAACCCCGGGG", 220),
-            c("x2", "ACGTACGTAAAACCCCGGGA", 220),
+            contig("x1", "ACGTACGTAAAACCCCGGGG", 220),
+            contig("x2", "ACGTACGTAAAACCCCGGGA", 220),
         ];
         let markers = MarkerTable {
             values: HashMap::from([
-                ("x1".into(), HashSet::from(["SCG001".into()])),
-                ("x2".into(), HashSet::from(["SCG001".into()])),
+                (
+                    "x1".to_string(),
+                    HashSet::from(["SCG001".to_string()]),
+                ),
+                (
+                    "x2".to_string(),
+                    HashSet::from(["SCG001".to_string()]),
+                ),
             ]),
         };
-        let mut cfg = ReconcileConfig::default();
-        cfg.merge_threshold = 0.1;
-        cfg.min_composition_score = 0.0;
-        cfg.min_coverage_score = 0.0;
-        cfg.merge_margin = 0.0;
+        let config = ReconcileConfig {
+            merge_threshold: 0.1,
+            min_composition_score: 0.0,
+            min_coverage_score: 0.0,
+            merge_margin: 0.0,
+            ..Default::default()
+        };
         let (_, stats) = reconcile_bins(
             &contigs,
             None,
             Some(&markers),
             singleton_result(&contigs),
             &BridgeBinConfig::default(),
-            &cfg,
+            &config,
         );
         assert_eq!(stats.final_bins, 2);
         assert!(stats.marker_blocked_pairs > 0);
