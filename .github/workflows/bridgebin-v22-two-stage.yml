@@ -1,0 +1,239 @@
+name: BridgeBin v2.2 two-stage biological propagation
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_bio_focus_bins.py
+      - scripts/bridgebin_bio_anchor_propagate.py
+      - scripts/bridgebin_local_anchor_partition.py
+      - scripts/bridgebin_candidate_pairs.py
+      - scripts/bridgebin_dna_embed.py
+      - scripts/bridgebin_bio_features.py
+      - scripts/bridgebin_pair_head.py
+      - scripts/bridgebin_pair_head_bio.py
+      - scripts/bridgebin_reference_hardneg_panel.py
+      - .github/workflows/bridgebin-v22-two-stage.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  two-stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build and install CPU-safe DNA runtime
+        run: |
+          set -euo pipefail
+          cargo build --release --bin bridgebin
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
+          curl -L --retry 3 -o /usr/local/bin/datasets \
+            'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'
+          chmod +x /usr/local/bin/datasets
+          python -m py_compile \
+            scripts/bridgebin_bio_focus_bins.py \
+            scripts/bridgebin_bio_anchor_propagate.py \
+            scripts/bridgebin_local_anchor_partition.py
+
+      - name: Train reference-only biological identity head
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/v22_two_stage/reference_groups
+          mkdir -p "$root"
+          fetch_group () {
+            label="$1"; taxon="$2"
+            mkdir -p "$root/$label/raw"
+            datasets download genome taxon "$taxon" --reference --include genome \
+              --no-progressbar --filename "/tmp/${label}.zip"
+            unzip -q "/tmp/${label}.zip" -d "$root/$label/raw"
+          }
+          fetch_group Escherichia_coli 'Escherichia coli'
+          fetch_group Salmonella_enterica 'Salmonella enterica'
+          fetch_group Klebsiella_pneumoniae 'Klebsiella pneumoniae'
+          fetch_group Enterobacter_cloacae 'Enterobacter cloacae'
+          fetch_group Citrobacter_freundii 'Citrobacter freundii'
+          fetch_group Shigella_flexneri 'Shigella flexneri'
+          fetch_group Serratia_marcescens 'Serratia marcescens'
+
+          train=benchmark/v22_two_stage/train
+          python scripts/bridgebin_reference_hardneg_panel.py \
+            --input-dir "$root" --output-dir "$train" \
+            --fragment-bp 6000 --fragments-per-group 6 --samples 4 --seed 43
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$train/contigs.fa" --output "$train/dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$train/dna_windows.tsv" --output "$train/features.tsv"
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$train/truth.tsv" --output "$train/pairs.tsv" \
+            --anchors-per-genome 6 --positive-per-contig 4 \
+            --negative-genomes-per-contig 6 --negative-anchors-per-genome 2
+          python scripts/bridgebin_pair_head_bio.py train \
+            --features "$train/features.tsv" --pairs "$train/pairs.tsv" \
+            --model-out "$train/pair_head.json" \
+            --validation-fraction 0.28 --epochs 700 --negative-weight 5 \
+            --precision-target 0.99 --require-group-holdout
+
+      - name: Prepare Zymo core and stage-one anchor matrix
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          base=benchmark/v22_two_stage/zymo
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$base" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          target/release/bridgebin \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --out-dir "$base/core" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02
+          python scripts/bridgebin_benchmark.py evaluate \
+            --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+            --assignments "$base/core/assignments.tsv" --abundance "$base/core/abundance.tsv" \
+            --output "$base/core.metrics.json" >/dev/null
+
+          python scripts/bridgebin_candidate_pairs.py \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --assignments "$base/core/assignments.tsv" --output "$base/probe_candidates.tsv" \
+            --min-length 1500 --anchors-per-bin 12 --anchor-strategy diverse \
+            --within-neighbors 4 --within-contrast 4 \
+            --merge-bin-neighbors 4 --cross-anchor-pairs 8 \
+            --max-pairs 5000 --probe-only
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$base/contigs.fa" --pairs "$base/probe_candidates.tsv" \
+            --output "$base/probe_dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$base/probe_dna_windows.tsv" --output "$base/probe_features.tsv"
+          python scripts/bridgebin_pair_head_bio.py score \
+            --features "$base/probe_features.tsv" --pairs "$base/probe_candidates.tsv" \
+            --model benchmark/v22_two_stage/train/pair_head.json \
+            --output "$base/probe_pair_scores.tsv" --model-name ref-hardneg-dnaberts-bio
+
+          python scripts/bridgebin_local_anchor_partition.py \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --assignments "$base/core/assignments.tsv" \
+            --candidates "$base/probe_candidates.tsv" --scores "$base/probe_pair_scores.tsv" \
+            --output "$base/stage1_probe_assignments.tsv" --report "$base/stage1_report.json" \
+            --min-side-anchors 1 --min-gap 0.035 --max-permutation-p 0.05 \
+            --min-coverage-gap 0 --permutations 96 --seed 43
+          python scripts/bridgebin_bio_focus_bins.py \
+            --report "$base/stage1_report.json" --output "$base/focus_bins.tsv" \
+            --min-dna-gap 0.035 --max-permutation-p 0.05 \
+            --min-coverage-gap 0.03 --singleton-min-coverage-gap 0.05
+
+      - name: Expand only focused bins and score members biologically
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          base=benchmark/v22_two_stage/zymo
+          python scripts/bridgebin_candidate_pairs.py \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --assignments "$base/core/assignments.tsv" --output "$base/member_candidates.tsv" \
+            --min-length 1500 --anchors-per-bin 12 --anchor-strategy diverse \
+            --within-neighbors 12 --within-contrast 0 \
+            --merge-bin-neighbors 0 --cross-anchor-pairs 0 \
+            --focus-bins "$base/focus_bins.tsv" --skip-residual-rescue \
+            --max-pairs 20000
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$base/contigs.fa" --pairs "$base/member_candidates.tsv" \
+            --output "$base/member_dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$base/member_dna_windows.tsv" --output "$base/member_features.tsv"
+          python scripts/bridgebin_pair_head_bio.py score \
+            --features "$base/member_features.tsv" --pairs "$base/member_candidates.tsv" \
+            --model benchmark/v22_two_stage/train/pair_head.json \
+            --output "$base/member_pair_scores.tsv" --model-name ref-hardneg-dnaberts-bio
+
+      - name: Sweep relative biological propagation margin
+        run: |
+          set -euo pipefail
+          base=benchmark/v22_two_stage/zymo
+          run_prop () {
+            tag="$1"; margin="$2"
+            mkdir -p "$base/$tag"
+            python scripts/bridgebin_bio_anchor_propagate.py \
+              --assignments "$base/core/assignments.tsv" \
+              --stage1-report "$base/stage1_report.json" --focus-bins "$base/focus_bins.tsv" \
+              --scores "$base/member_pair_scores.tsv" \
+              --output "$base/$tag/assignments.tsv" --report "$base/$tag/propagate_report.json" \
+              --top-k 2 --min-group-links 1 --min-margin "$margin"
+            python scripts/bridgebin_benchmark.py evaluate \
+              --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+              --assignments "$base/$tag/assignments.tsv" --abundance "$base/core/abundance.tsv" \
+              --output "$base/$tag.metrics.json" >/dev/null
+          }
+          run_prop margin_000 0.000
+          run_prop margin_005 0.005
+          run_prop margin_010 0.010
+          run_prop margin_020 0.020
+
+      - name: Print two-stage comparison
+        run: |
+          python - <<'PY'
+          import csv, json
+          from collections import Counter, defaultdict
+          from pathlib import Path
+          base=Path('benchmark/v22_two_stage/zymo')
+          focus=list(csv.DictReader((base/'focus_bins.tsv').open(),delimiter='\t'))
+          print('focus_bins',json.dumps(focus,sort_keys=True))
+          names=['core','margin_000','margin_005','margin_010','margin_020']
+          print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tbinned')
+          for name in names:
+              m=json.loads((base/f'{name}.metrics.json').read_text())
+              print(
+                  f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t"
+                  f"{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t"
+                  f"{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t"
+                  f"{m['bp_binned_fraction']:.6f}"
+              )
+          truth={r['contig']:r['genome'] for r in csv.DictReader((base/'truth.tsv').open(),delimiter='\t')}
+          core={r['contig']:r['bin'] for r in csv.DictReader((base/'core/assignments.tsv').open(),delimiter='\t')}
+          for row in focus:
+              b=row['bin']; c=Counter(truth[x] for x,v in core.items() if v==b and x in truth)
+              print('focus_truth',b,dict(c))
+          for name in names[1:]:
+              report=json.loads((base/name/'propagate_report.json').read_text())
+              print(name+'_propagate',json.dumps({
+                  'assigned_nonanchors': report['assigned_nonanchors'],
+                  'ambiguous_nonanchors': report['ambiguous_nonanchors'],
+                  'missing_nonanchors': report['missing_nonanchors'],
+                  'bins': [{k:b[k] for k in ('bin','members','assigned_a','assigned_b','ambiguous','missing')} for b in report['bins']],
+              },sort_keys=True))
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v22-two-stage
+          path: benchmark/v22_two_stage
+          retention-days: 14
