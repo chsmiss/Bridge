@@ -1,0 +1,101 @@
+name: Zymo Stage25 one-fragment singleton oracle
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage25-single-fragment-oracle.yml
+      - scripts/stage25_single_fragment_oracle.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage25-single-fragment-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  oracle-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install minimap2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2
+
+      - name: Validate profiler
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/stage25_single_fragment_oracle.py
+          tmp="$(mktemp -d)"
+          cat > "$tmp/segments.fa" <<'EOF'
+          >guided_1 source=u:0-100 singleton_keys=5 singleton_fragments=1 solid_nodes=65
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          >guided_2 source=v:0-100 singleton_keys=20 singleton_fragments=2 solid_nodes=50
+          CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+          EOF
+          printf 'guided_1\t100\t0\t100\t+\tPseudomonas_aeruginosa|x\t1000\t100\t200\t99\t100\t60\n' > "$tmp/segments.paf"
+          python3 scripts/stage25_single_fragment_oracle.py analyze \
+            --segments "$tmp/segments.fa" --paf "$tmp/segments.paf" --output-dir "$tmp/out"
+          python3 - "$tmp/out/stage25_oracle_summary.json" <<'PY'
+          import json, sys
+          s=json.load(open(sys.argv[1]))
+          assert s['groups']['one_fragment']['reference_consistent'] == 1
+          assert s['groups']['multi_fragment']['reference_consistent'] == 0
+          assert s['one_fragment_species']['Pseudomonas_aeruginosa'] == 1
+          print('stage25 synthetic oracle test: passed')
+          PY
+
+      - name: Download Stage24 A-B artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zymo-stage24-single-fragment-ab-200k
+          path: benchmark/stage24
+          github-token: ${{ github.token }}
+          repository: chsmiss/Bridge
+          run-id: 33838098251
+
+      - name: Download and split Zymo references
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/stage25_reference_split.tsv
+          python3 scripts/stage25_single_fragment_oracle.py combine-refs \
+            --ref-dir /tmp/zymo-species-refs --output /tmp/zymo-bacteria.fasta
+
+      - name: Map all pair1 guided segments to bacterial references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/stage25
+          minimap2 -x sr -k15 -w5 -c --secondary=no -t 2 \
+            /tmp/zymo-bacteria.fasta \
+            benchmark/stage24/current/stage24_pair1/guided_segments.fasta \
+            > benchmark/stage25/pair1_segments.paf
+
+      - name: Profile one-fragment oracle truth and reference-free rules
+        run: |
+          set -euo pipefail
+          python3 scripts/stage25_single_fragment_oracle.py analyze \
+            --segments benchmark/stage24/current/stage24_pair1/guided_segments.fasta \
+            --paf benchmark/stage25/pair1_segments.paf \
+            --output-dir benchmark/stage25 \
+            | tee benchmark/stage25/stage25_stdout.txt
+          cp benchmark/stage24/stage24_gate_effect.tsv benchmark/stage25/
+          cp benchmark/stage24/stage24_comparison.tsv benchmark/stage25/
+          printf 'stage24_run\t33838098251\nstage24_commit\t48bc2770ad7567494191ba70d5d045f3e132e008\nstage25_commit\t%s\npolicy\tbenchmark_only_reference_oracle_never_used_in_production\n' \
+            "$GITHUB_SHA" > benchmark/stage25/provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage25-single-fragment-oracle
+          path: benchmark/stage25
