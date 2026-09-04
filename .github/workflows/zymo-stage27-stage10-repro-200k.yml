@@ -26,6 +26,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install minimap2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minimap2
+
       - name: Download deterministic Zymo 200k subset
         run: |
           set -euo pipefail
