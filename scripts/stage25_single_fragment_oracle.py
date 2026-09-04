@@ -165,19 +165,30 @@ def parse_paf(path: Path) -> Dict[str, Alignment]:
 
 def combine_refs(ref_dir: Path, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
+    records_written = 0
+    species_written = 0
     with output.open("w") as out:
         for species in BACTERIA:
             path = ref_dir / f"{species}.fasta"
             if not path.exists():
                 raise FileNotFoundError(path)
+            species_records = 0
             for name, _header, seq in read_fasta(path):
                 out.write(f">{species}|{name}\n")
                 for i in range(0, len(seq), 80):
                     out.write(seq[i : i + 80] + "\n")
-                written += 1
-    if written != len(BACTERIA):
-        raise RuntimeError(f"expected {len(BACTERIA)} bacterial references, wrote {written}")
+                species_records += 1
+                records_written += 1
+            if species_records == 0:
+                raise RuntimeError(f"no FASTA records found in {path}")
+            species_written += 1
+    if species_written != len(BACTERIA):
+        raise RuntimeError(
+            f"expected {len(BACTERIA)} bacterial species, wrote {species_written}"
+        )
+    print(
+        f"combined {species_written} bacterial species across {records_written} FASTA records",
+    )
 
 
 def quantile(values: Iterable[float], p: float) -> float:
