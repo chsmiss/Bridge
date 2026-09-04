@@ -29,17 +29,24 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install DNABERT-S runtime
+      - name: Install CPU-safe DNABERT-S runtime
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install 'torch>=2.0,<3' 'transformers==4.40.2' einops
+          # The authors' remote MosaicBERT code prefers Triton flash-attention whenever
+          # Triton is importable, but that implementation asserts CUDA tensors.  This
+          # probe intentionally runs on a CPU GitHub runner, so use the official PyTorch
+          # CPU wheel and remove Triton to force the portable attention fallback.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
           python - <<'PY'
-          import sys, torch, transformers, einops
+          import importlib.util, sys, torch, transformers, einops
           print('python', sys.version)
-          print('torch', torch.__version__)
+          print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())
           print('transformers', transformers.__version__)
           print('einops', einops.__version__)
+          print('triton_importable', importlib.util.find_spec('triton') is not None)
           PY
 
       - name: Prepare deterministic Zymo panel
@@ -145,11 +152,14 @@ jobs:
           {
             echo '=== runtime/model smoke ==='
             python - <<'PY'
+          import importlib.util
           import torch
           from transformers import AutoModel, AutoTokenizer
           name = 'zhihan1996/DNABERT-S'
+          print('triton_importable', importlib.util.find_spec('triton') is not None)
           tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
           model = AutoModel.from_pretrained(name, trust_remote_code=True)
+          model = model.cpu().eval()
           print('tokenizer', type(tokenizer).__name__)
           print('model', type(model).__name__)
           print('config_model_type', getattr(model.config, 'model_type', None))
@@ -175,7 +185,7 @@ jobs:
               --model zhihan1996/DNABERT-S \
               --device cpu \
               --window-bp 1200 --stride-bp 1200 --min-window-bp 512 \
-              --max-tokens 512 --batch-size 4
+              --max-tokens 512 --batch-size 2
             status=$?
             if [ "$status" -eq 0 ]; then
               python scripts/bridgebin_bio_features.py \
