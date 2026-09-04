@@ -60,13 +60,8 @@ pub fn refine_bins_v21(
 
     let (prepartitioned, filtered_scores, prep) =
         prepartition_initial(contigs, markers, initial, pair_scores, cfg);
-    let (result, mut stats) = legacy::refine_bins_v21(
-        contigs,
-        markers,
-        prepartitioned,
-        &filtered_scores,
-        cfg,
-    );
+    let (result, mut stats) =
+        legacy::refine_bins_v21(contigs, markers, prepartitioned, &filtered_scores, cfg);
 
     // The legacy kernel only sees already separated sub-bins.  Restore statistics to the
     // user's original v2 input so logs remain interpretable and comparable across versions.
@@ -222,7 +217,8 @@ fn prepartition_initial(
     // vetoes and the later cross-bin merge stage.
     let mut filtered_scores = pair_scores.clone();
     filtered_scores.values.retain(|(left, right), score| {
-        if score.confidence < cfg.min_pair_confidence || score.same_probability > cfg.split_max_same {
+        if score.confidence < cfg.min_pair_confidence || score.same_probability > cfg.split_max_same
+        {
             return true;
         }
         let (Some(&a), Some(&b)) = (by_id.get(left.as_str()), by_id.get(right.as_str())) else {
@@ -262,13 +258,8 @@ fn recursive_signed_partition(
         return vec![members.to_vec()];
     }
 
-    let Some(candidate) = best_binary_cut(
-        members,
-        model_hard,
-        marker_hard,
-        positive,
-        contigs,
-    ) else {
+    let Some(candidate) = best_binary_cut(members, model_hard, marker_hard, positive, contigs)
+    else {
         return vec![members.to_vec()];
     };
     if !accept_cut(&candidate, cfg) {
@@ -388,12 +379,15 @@ fn best_binary_cut(
             Some(existing) => {
                 candidate.objective > existing.objective + 1e-9
                     || ((candidate.objective - existing.objective).abs() <= 1e-9
-                        && (candidate.cut_marker_hard,
+                        && (
+                            candidate.cut_marker_hard,
                             candidate.cut_model_hard,
-                            candidate.min_side_bp)
-                            > (existing.cut_marker_hard,
-                                existing.cut_model_hard,
-                                existing.min_side_bp))
+                            candidate.min_side_bp,
+                        ) > (
+                            existing.cut_marker_hard,
+                            existing.cut_model_hard,
+                            existing.min_side_bp,
+                        ))
             }
         };
         if replace {
@@ -416,7 +410,7 @@ fn greedy_signed_cut(
     unassigned.remove(&seed.right);
 
     while !unassigned.is_empty() {
-        let mut best_member = None;
+        let mut best_member: Option<usize> = None;
         let mut best_evidence = -1.0f64;
         let mut best_margin = -1.0f64;
         let mut best_scores = [0.0f64; 2];
@@ -589,7 +583,10 @@ fn labeled_bp(labels: &HashMap<usize, u8>, side: u8, contigs: &[Contig]) -> usiz
 }
 
 fn piece_bp(members: &[usize], contigs: &[Contig]) -> usize {
-    members.iter().map(|&member| contigs[member].seq.len()).sum()
+    members
+        .iter()
+        .map(|&member| contigs[member].seq.len())
+        .sum()
 }
 
 fn hard_weight(score: &PairScore, cfg: &BridgeBinV21Config) -> f64 {
@@ -686,8 +683,7 @@ mod tests {
             min_subbin_bp: 20_000,
             ..Default::default()
         };
-        let (result, stats) =
-            refine_bins_v21(&contigs, None, one_bin(&contigs), &scores, &cfg);
+        let (result, stats) = refine_bins_v21(&contigs, None, one_bin(&contigs), &scores, &cfg);
         let bins: HashMap<&str, Option<usize>> = result
             .assignments
             .iter()
