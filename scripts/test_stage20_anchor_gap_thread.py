@@ -24,6 +24,10 @@ def bubble_graph() -> gp.Graph:
     return g
 
 
+def anchor(start: int, end: int, uid: str) -> s20.ExactAnchor:
+    return s20.ExactAnchor(start,end,uid)
+
+
 def test_enumerates_two_bubble_paths() -> None:
     g=bubble_graph()
     paths=s20.enumerate_bounded_paths(g,'A','D',max_edges=3,max_internal_bp=100)
@@ -33,12 +37,11 @@ def test_enumerates_two_bubble_paths() -> None:
 def test_k19_internal_evidence_selects_branch() -> None:
     g=bubble_graph()
     paths=s20.enumerate_bounded_paths(g,'A','D',max_edges=3,max_internal_bp=100)
-    # The read interval contains many B-specific 19-mers and no C-specific ones.
     seq=g.seqs['B']
     choice=s20.choose_path_by_read(
         seq,
-        s20.ExactAnchor(0,'A'),
-        s20.ExactAnchor(35,'D'),
+        anchor(0,0,'A'),
+        anchor(35,35,'D'),
         paths,
         g,
     )
@@ -46,6 +49,7 @@ def test_k19_internal_evidence_selects_branch() -> None:
     assert choice.path==('A','B','D')
     assert choice.evidence_k==19
     assert choice.best_hits >= choice.second_hits + 2
+    assert choice.source_pos==0 and choice.target_pos==35
 
 
 def test_flank_only_evidence_does_not_choose_branch() -> None:
@@ -54,8 +58,8 @@ def test_flank_only_evidence_does_not_choose_branch() -> None:
     seq=g.seqs['A'][-35:]+g.seqs['D'][:35]
     choice=s20.choose_path_by_read(
         seq,
-        s20.ExactAnchor(0,'A'),
-        s20.ExactAnchor(35,'D'),
+        anchor(0,0,'A'),
+        anchor(35,35,'D'),
         paths,
         g,
     )
@@ -68,12 +72,28 @@ def test_missing_physical_edge_blocks_choice() -> None:
     paths=s20.enumerate_bounded_paths(g,'A','D',max_edges=3,max_internal_bp=100)
     choice=s20.choose_path_by_read(
         g.seqs['B'],
-        s20.ExactAnchor(0,'A'),
-        s20.ExactAnchor(35,'D'),
+        anchor(0,0,'A'),
+        anchor(35,35,'D'),
         paths,
         g,
     )
     assert choice is None
+
+
+def test_gap_uses_left_end_and_right_start() -> None:
+    g=bubble_graph()
+    paths=s20.enumerate_bounded_paths(g,'A','D',max_edges=3,max_internal_bp=100)
+    seq=g.seqs['B']
+    choice=s20.choose_path_by_read(
+        seq,
+        anchor(0,5,'A'),
+        anchor(35,50,'D'),
+        paths,
+        g,
+    )
+    assert choice is not None
+    assert choice.source_pos==5
+    assert choice.target_pos==35
 
 
 def main() -> None:
@@ -82,6 +102,7 @@ def main() -> None:
         test_k19_internal_evidence_selects_branch,
         test_flank_only_evidence_does_not_choose_branch,
         test_missing_physical_edge_blocks_choice,
+        test_gap_uses_left_end_and_right_start,
     ]
     for test in tests:
         test(); print('PASS',test.__name__)
