@@ -1,0 +1,131 @@
+name: BridgeBin v2.1 Biological Brain interface
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - src/bridgebin_v21.rs
+      - src/bin/bridgebin-v21.rs
+      - src/lib.rs
+      - scripts/bridgebin_pair_head.py
+      - scripts/bridgebin_pair_oracle_fixture.py
+      - scripts/bridgebin_bio_features.py
+      - scripts/bridgebin_esmc_embed.py
+      - scripts/bridgebin_benchmark.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - scripts/split_zymo_references.py
+      - .github/workflows/bridgebin-v21-biobrain.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate implementation
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo clippy --all-targets --all-features -- -D warnings -A clippy::field-reassign-with-default -A clippy::unnecessary-sort-by
+          cargo test --all-targets --all-features
+          cargo build --release --bin bridgebin --bin bridgebin-v21
+          python3 -m py_compile \
+            scripts/bridgebin_pair_head.py \
+            scripts/bridgebin_pair_oracle_fixture.py \
+            scripts/bridgebin_bio_features.py \
+            scripts/bridgebin_esmc_embed.py
+
+      - name: Prepare real Zymo reference-fragment fixture
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/bridgebin_v21 \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+
+      - name: Build explicit oracle plumbing fixture
+        run: |
+          set -euo pipefail
+          base='benchmark/bridgebin_v21'
+          printf 'left\tright\tp_same\tconfidence\tmodel\n' > "$base/no_pair_scores.tsv"
+          python3 scripts/bridgebin_pair_oracle_fixture.py \
+            --truth "$base/truth.tsv" \
+            --output "$base/oracle_pair_scores.tsv" \
+            --anchors-per-genome 4 --negative-anchors-per-genome 2
+
+      - name: Compare signed baseline and v2.1 pair refinement
+        run: |
+          set -euo pipefail
+          base='benchmark/bridgebin_v21'
+
+          target/release/bridgebin \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --out-dir "$base/v2_balanced" --algorithm v2 \
+            --v2-core-attraction 0.74 --v2-component-attraction 0.66 \
+            --v2-rescue-attraction 0.68 --v2-rescue-margin 0.02 \
+            >"$base/v2_balanced.log" 2>&1
+
+          target/release/bridgebin-v21 \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --pair-scores "$base/no_pair_scores.tsv" \
+            --out-dir "$base/v21_no_pair" \
+            >"$base/v21_no_pair.log" 2>&1
+
+          target/release/bridgebin-v21 \
+            --contigs "$base/contigs.fa" --coverage "$base/coverage.tsv" \
+            --pair-scores "$base/oracle_pair_scores.tsv" \
+            --out-dir "$base/v21_oracle_interface" \
+            --v21-min-subbin-bp 10000 \
+            >"$base/v21_oracle_interface.log" 2>&1
+
+          for tag in v2_balanced v21_no_pair v21_oracle_interface; do
+            python3 scripts/bridgebin_benchmark.py evaluate \
+              --truth "$base/truth.tsv" --truth-abundance "$base/truth_abundance.tsv" \
+              --assignments "$base/$tag/assignments.tsv" \
+              --abundance "$base/$tag/abundance.tsv" \
+              --output "$base/$tag.metrics.json" >/dev/null
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('benchmark/bridgebin_v21')
+          metrics = {
+              name: json.loads((root / f'{name}.metrics.json').read_text())
+              for name in ('v2_balanced', 'v21_no_pair', 'v21_oracle_interface')
+          }
+          print('setting\tbins\tpurity\trecall\tf1\tari\thq\tmq\tbinned_bp_fraction')
+          for name, m in metrics.items():
+              print(
+                  f"{name}\t{m['predicted_bins']}\t{m['weighted_purity']:.6f}\t"
+                  f"{m['bp_recall']:.6f}\t{m['f1']:.6f}\t{m['ari']:.6f}\t"
+                  f"{m['hq_like_genomes_90_95']}\t{m['mq_like_genomes_50_90']}\t"
+                  f"{m['binned_bp_fraction']:.6f}"
+              )
+          # With an empty pair table the refinement layer must be behaviorally neutral.
+          a, b = metrics['v2_balanced'], metrics['v21_no_pair']
+          for key in ('weighted_purity', 'bp_recall', 'f1', 'ari', 'binned_bp_fraction'):
+              if abs(a[key] - b[key]) > 1e-9:
+                  raise SystemExit(f'neutral v2.1 refiner changed {key}: {a[key]} vs {b[key]}')
+          PY
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v21-biobrain-interface
+          path: benchmark/bridgebin_v21
+          retention-days: 14
