@@ -1,6 +1,6 @@
 use crate::bridgebin::{Assignment, BinSummary, BinningResult, Contig};
 use crate::bridgebin_reconcile::MarkerTable;
-use crate::bridgebin_v21::{BridgeBinV21Config, PairScore, PairScoreTable};
+use crate::bridgebin_v21::{BridgeBinV21Config, PairScoreTable};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -345,6 +345,7 @@ fn mean_gc(node: &Node, contigs: &[Contig]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridgebin_v21::PairScore;
 
     fn contig(id: &str) -> Contig {
         Contig {
