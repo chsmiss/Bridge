@@ -8,6 +8,7 @@ on:
       - scripts/bridgebin_dna_embed.py
       - scripts/bridgebin_bio_features.py
       - scripts/bridgebin_eval_embeddings.py
+      - scripts/bridgebin_sequence_baseline_features.py
       - scripts/bridgebin_make_pair_dataset.py
       - scripts/bridgebin_pair_head.py
       - scripts/bridgebin_zymo_reference_benchmark.py
@@ -30,20 +31,21 @@ jobs:
 
       - name: Install DNABERT-S runtime
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install 'multimolecule==0.2.1'
+          python -m pip install 'torch>=2.0,<3' 'transformers==4.40.2' einops
           python - <<'PY'
-          import sys
-          import torch
-          import multimolecule
+          import sys, torch, transformers, einops
           print('python', sys.version)
           print('torch', torch.__version__)
-          print('multimolecule', getattr(multimolecule, '__version__', 'unknown'))
+          print('transformers', transformers.__version__)
+          print('einops', einops.__version__)
           PY
 
       - name: Prepare deterministic Zymo panel
         run: |
           set -euo pipefail
+          mkdir -p benchmark/dnaberts_zymo
           curl -L --retry 3 -o /tmp/zymo-refs.zip \
             'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
           mkdir -p /tmp/zymo-refs
@@ -111,13 +113,28 @@ jobs:
           with (root / 'coverage.tsv').open() as source, (root / 'panel_coverage.tsv').open('w') as target:
               reader = csv.reader(source, delimiter='\t')
               writer = csv.writer(target, delimiter='\t', lineterminator='\n')
-              header = next(reader)
-              writer.writerow(header)
+              writer.writerow(next(reader))
               for row in reader:
                   if row and row[0] in selected:
                       writer.writerow(row)
           print('panel_genomes', len(grouped), 'panel_contigs', len(selected))
           PY
+
+      - name: Measure canonical 5-mer baseline
+        run: |
+          set -euo pipefail
+          python scripts/bridgebin_sequence_baseline_features.py \
+            --contigs benchmark/dnaberts_zymo/panel.fa \
+            --output benchmark/dnaberts_zymo/kmer5_features.tsv -k 5
+          python scripts/bridgebin_eval_embeddings.py \
+            --features benchmark/dnaberts_zymo/kmer5_features.tsv \
+            --truth benchmark/dnaberts_zymo/panel_truth.tsv \
+            --column kmer_embedding \
+            --max-contigs-per-genome 8 \
+            --precision-target 0.99 \
+            --focus Escherichia_coli,Salmonella_enterica \
+            --output benchmark/dnaberts_zymo/kmer5_identity_metrics.json
+          cat benchmark/dnaberts_zymo/kmer5_identity_metrics.json
 
       - name: Extract real DNABERT-S embeddings
         env:
@@ -129,10 +146,10 @@ jobs:
             echo '=== runtime/model smoke ==='
             python - <<'PY'
           import torch
-          from multimolecule import AutoModel, AutoTokenizer
-          name = 'multimolecule/dnaberts'
-          tokenizer = AutoTokenizer.from_pretrained(name)
-          model = AutoModel.from_pretrained(name)
+          from transformers import AutoModel, AutoTokenizer
+          name = 'zhihan1996/DNABERT-S'
+          tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+          model = AutoModel.from_pretrained(name, trust_remote_code=True)
           print('tokenizer', type(tokenizer).__name__)
           print('model', type(model).__name__)
           print('config_model_type', getattr(model.config, 'model_type', None))
@@ -142,14 +159,20 @@ jobs:
           print('input_shape', tuple(encoded['input_ids'].shape))
           with torch.no_grad():
               output = model(**encoded)
+          hidden = output.last_hidden_state if hasattr(output, 'last_hidden_state') else output[0]
           print('output_type', type(output).__name__)
-          print('last_hidden_state', tuple(output.last_hidden_state.shape))
+          print('last_hidden_state', tuple(hidden.shape))
           PY
+            smoke_status=$?
+            echo "smoke_status=$smoke_status"
+            if [ "$smoke_status" -ne 0 ]; then
+              exit "$smoke_status"
+            fi
             echo '=== full adapter ==='
             python scripts/bridgebin_dna_embed.py \
               --contigs benchmark/dnaberts_zymo/panel.fa \
               --output benchmark/dnaberts_zymo/dnaberts_windows.tsv \
-              --model multimolecule/dnaberts \
+              --model zhihan1996/DNABERT-S \
               --device cpu \
               --window-bp 1200 --stride-bp 1200 --min-window-bp 512 \
               --max-tokens 512 --batch-size 4
@@ -167,7 +190,7 @@ jobs:
           cat "$log"
           exit "$status"
 
-      - name: Measure genome identity and hard-negative separation
+      - name: Measure DNABERT-S genome identity
         run: |
           set -euo pipefail
           python scripts/bridgebin_eval_embeddings.py \
@@ -179,6 +202,17 @@ jobs:
             --focus Escherichia_coli,Salmonella_enterica \
             --output benchmark/dnaberts_zymo/dnaberts_identity_metrics.json
           cat benchmark/dnaberts_zymo/dnaberts_identity_metrics.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('benchmark/dnaberts_zymo')
+          k=json.loads((root/'kmer5_identity_metrics.json').read_text())
+          d=json.loads((root/'dnaberts_identity_metrics.json').read_text())
+          print('representation\tauc\tnn_accuracy\tprecision99_recall\tEcoli_Salmonella_median')
+          for name,m in [('5mer',k),('DNABERT-S',d)]:
+              focus=m['focus_cross_genome_cosine'].get('Escherichia_coli vs Salmonella_enterica',{})
+              print(f"{name}\t{m['pair_auc']:.6f}\t{m['nearest_neighbor_genome_accuracy']:.6f}\t{m['high_precision_threshold']['recall']:.6f}\t{focus.get('median',float('nan')):.6f}")
+          PY
 
       - name: Whole-genome-holdout pair-head probe
         run: |
