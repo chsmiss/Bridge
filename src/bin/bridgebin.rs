@@ -5,6 +5,10 @@ use bridgeasm::bridgebin_quant::{quantify_bins, write_abundance_table};
 use bridgeasm::bridgebin_reconcile::{
     read_marker_table, reconcile_bins, MarkerTable, ReconcileConfig,
 };
+use bridgeasm::bridgebin_v2::{
+    bin_contigs_v2, read_bio_feature_table, read_link_table, BioFeatureTable, BridgeBinV2Config,
+    LinkTable,
+};
 use std::env;
 use std::io;
 use std::path::PathBuf;
@@ -15,9 +19,13 @@ struct Cli {
     contigs: PathBuf,
     coverage: Option<PathBuf>,
     markers: Option<PathBuf>,
+    bio_features: Option<PathBuf>,
+    links: Option<PathBuf>,
     out_dir: PathBuf,
+    algorithm: String,
     config: BridgeBinConfig,
     reconcile: ReconcileConfig,
+    v2: BridgeBinV2Config,
     emit_unbinned: bool,
 }
 
@@ -39,28 +47,64 @@ fn run() -> io::Result<()> {
         Some(path) => Some(read_marker_table(path)?),
         None => None,
     };
+    let bio: Option<BioFeatureTable> = match cli.bio_features.as_ref() {
+        Some(path) => Some(read_bio_feature_table(path)?),
+        None => None,
+    };
+    let links: Option<LinkTable> = match cli.links.as_ref() {
+        Some(path) => Some(read_link_table(path)?),
+        None => None,
+    };
 
-    let initial = bin_contigs(&contigs, coverage.as_ref(), &cli.config);
-    let (result, stats) = reconcile_bins(
-        &contigs,
-        coverage.as_ref(),
-        markers.as_ref(),
-        initial,
-        &cli.config,
-        &cli.reconcile,
-    );
+    let result = match cli.algorithm.as_str() {
+        "v0" => bin_contigs(&contigs, coverage.as_ref(), &cli.config),
+        "v1" => {
+            let initial = bin_contigs(&contigs, coverage.as_ref(), &cli.config);
+            let (result, stats) = reconcile_bins(
+                &contigs,
+                coverage.as_ref(),
+                markers.as_ref(),
+                initial,
+                &cli.config,
+                &cli.reconcile,
+            );
+            eprintln!(
+                "bridgebin: v1 reconciliation {} -> {} bins ({} merges, {} rescued contigs, {} marker-blocked comparisons)",
+                stats.initial_bins,
+                stats.final_bins,
+                stats.merges,
+                stats.rescued_contigs,
+                stats.marker_blocked_pairs
+            );
+            result
+        }
+        "v2" => {
+            let (result, stats) = bin_contigs_v2(
+                &contigs,
+                coverage.as_ref(),
+                markers.as_ref(),
+                bio.as_ref(),
+                links.as_ref(),
+                &cli.v2,
+            );
+            eprintln!(
+                "bridgebin: v2 signed graph eligible={} candidates={} accepted_edges={} core_bins={} rescued_components={} marker_blocks={} taxonomy_blocks={} external_blocks={} unbinned={}",
+                stats.eligible_contigs,
+                stats.candidate_edges,
+                stats.accepted_core_edges,
+                stats.core_bins,
+                stats.rescued_components,
+                stats.marker_blocked_edges,
+                stats.taxonomy_blocked_edges,
+                stats.external_blocked_edges,
+                stats.unbinned_contigs,
+            );
+            result
+        }
+        _ => unreachable!("algorithm validated by parse_args"),
+    };
+
     write_outputs(&contigs, &result, &cli.out_dir, cli.emit_unbinned)?;
-
-    if cli.reconcile.enabled {
-        eprintln!(
-            "bridgebin: reconciliation {} -> {} bins ({} merges, {} rescued contigs, {} marker-blocked comparisons)",
-            stats.initial_bins,
-            stats.final_bins,
-            stats.merges,
-            stats.rescued_contigs,
-            stats.marker_blocked_pairs
-        );
-    }
 
     if let Some(table) = coverage.as_ref() {
         let abundance = quantify_bins(&result, table);
@@ -85,7 +129,8 @@ fn run() -> io::Result<()> {
         .sum();
     let total_bp: usize = contigs.iter().map(|c| c.seq.len()).sum();
     eprintln!(
-        "bridgebin: {} contigs, {} bins, {} binned contigs, {:.2}% bp assigned",
+        "bridgebin: algorithm={} {} contigs, {} bins, {} binned contigs, {:.2}% bp assigned",
+        cli.algorithm,
         contigs.len(),
         result.bins.len(),
         binned,
@@ -105,16 +150,20 @@ fn parse_args() -> Result<Cli, String> {
         process::exit(0);
     }
     if args.iter().any(|a| a == "--version") {
-        println!("bridgebin 0.3.0");
+        println!("bridgebin 0.4.0-dev");
         process::exit(0);
     }
 
     let mut contigs: Option<PathBuf> = None;
     let mut coverage: Option<PathBuf> = None;
     let mut markers: Option<PathBuf> = None;
+    let mut bio_features: Option<PathBuf> = None;
+    let mut links: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
+    let mut algorithm = "v2".to_string();
     let mut config = BridgeBinConfig::default();
     let mut reconcile = ReconcileConfig::default();
+    let mut v2 = BridgeBinV2Config::default();
     let mut emit_unbinned = true;
 
     let mut i = 0usize;
@@ -124,8 +173,15 @@ fn parse_args() -> Result<Cli, String> {
             "--contigs" | "-c" => contigs = Some(PathBuf::from(value(&args, &mut i, key)?)),
             "--coverage" => coverage = Some(PathBuf::from(value(&args, &mut i, key)?)),
             "--markers" => markers = Some(PathBuf::from(value(&args, &mut i, key)?)),
+            "--bio-features" => bio_features = Some(PathBuf::from(value(&args, &mut i, key)?)),
+            "--links" => links = Some(PathBuf::from(value(&args, &mut i, key)?)),
             "--out-dir" | "-o" => out_dir = Some(PathBuf::from(value(&args, &mut i, key)?)),
-            "--min-contig" => config.min_contig_len = parse_usize(value(&args, &mut i, key)?, key)?,
+            "--algorithm" => algorithm = value(&args, &mut i, key)?.to_ascii_lowercase(),
+            "--min-contig" => {
+                let parsed = parse_usize(value(&args, &mut i, key)?, key)?;
+                config.min_contig_len = parsed;
+                v2.min_contig_len = parsed;
+            }
             "--seed-min-contig" => {
                 config.seed_min_len = parse_usize(value(&args, &mut i, key)?, key)?
             }
@@ -173,6 +229,40 @@ fn parse_args() -> Result<Cli, String> {
             "--reconcile-max-merges" => {
                 reconcile.max_merges = parse_usize(value(&args, &mut i, key)?, key)?
             }
+            "--v2-max-neighbors" => {
+                v2.max_neighbors = parse_usize(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-min-component-bp" => {
+                v2.min_component_bp = parse_usize(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-core-attraction" => {
+                v2.core_min_attraction = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-max-repulsion" => {
+                v2.core_max_repulsion = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-component-attraction" => {
+                v2.component_min_attraction = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-rescue-attraction" => {
+                v2.rescue_min_attraction = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-rescue-margin" => {
+                v2.rescue_margin = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-max-gc-delta" => {
+                v2.max_gc_delta = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-min-composition" => {
+                v2.min_component_composition = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-min-coverage" => {
+                v2.min_component_coverage = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-taxonomy-confidence" => {
+                v2.taxonomy_confidence = parse_unit(value(&args, &mut i, key)?, key)?
+            }
+            "--v2-soft-markers" => v2.hard_marker_veto = false,
             "--no-unbinned" => emit_unbinned = false,
             unknown => {
                 return Err(format!(
@@ -185,20 +275,30 @@ fn parse_args() -> Result<Cli, String> {
 
     let contigs = contigs.ok_or_else(|| "missing required --contigs <FASTA>".to_string())?;
     let out_dir = out_dir.ok_or_else(|| "missing required --out-dir <DIR>".to_string())?;
+    if !matches!(algorithm.as_str(), "v0" | "v1" | "v2") {
+        return Err("--algorithm must be one of v0, v1, v2".to_string());
+    }
     if config.seed_min_len < config.min_contig_len {
         return Err("--seed-min-contig must be >= --min-contig".to_string());
     }
     if config.composition_weight + config.coverage_weight + config.gc_weight <= f64::EPSILON {
-        return Err("at least one feature weight must be > 0".to_string());
+        return Err("at least one v0/v1 feature weight must be > 0".to_string());
+    }
+    if v2.max_neighbors == 0 {
+        return Err("--v2-max-neighbors must be > 0".to_string());
     }
 
     Ok(Cli {
         contigs,
         coverage,
         markers,
+        bio_features,
+        links,
         out_dir,
+        algorithm,
         config,
         reconcile,
+        v2,
         emit_unbinned,
     })
 }
@@ -237,13 +337,13 @@ fn parse_nonnegative(raw: String, key: &str) -> Result<f64, String> {
 
 fn print_help() {
     println!(
-        "bridgebin 0.3.0 - evidence-aware metagenomic binning and quantification\n\n\
+        "bridgebin 0.4.0-dev - signed multimodal metagenomic binning\n\n\
 USAGE:\n  bridgebin --contigs <FASTA> --out-dir <DIR> [OPTIONS]\n\n\
-INPUT:\n  -c, --contigs <FASTA>          Assembled contigs\n      --coverage <TSV>           Coverage matrix: contig sample1 [sample2 ...]\n      --markers <TSV>            Optional single-copy markers: contig marker (one hit/row)\n  -o, --out-dir <DIR>            Output directory\n\n\
-INITIAL BINNING:\n      --min-contig <BP>          Minimum contig length [default: 1500]\n      --seed-min-contig <BP>     Minimum length for seed contigs [default: 2500]\n      --join-threshold <0..1>    Seed-to-bin similarity threshold [default: 0.76]\n      --rescue-threshold <0..1>  First-pass rescue threshold [default: 0.70]\n      --rescue-margin <0..1>     Required best-vs-second margin [default: 0.025]\n      --composition-weight <N>   Composition weight [default: 0.45]\n      --coverage-weight <N>      Multi-sample coverage weight [default: 0.50]\n      --gc-weight <N>            GC-content weight [default: 0.05]\n\n\
-BIN RECONCILIATION:\n      --no-reconcile                     Disable v1 bin-bin reconciliation\n      --reconcile-threshold <0..1>       Reciprocal bin merge threshold [default: 0.72]\n      --reconcile-margin <0..1>          Best-vs-second merge margin [default: 0.015]\n      --reconcile-min-composition <0..1> Hard 5-mer composition floor [default: 0.58]\n      --reconcile-min-coverage <0..1>    Hard coverage-consistency floor [default: 0.62]\n      --same-coverage-min-composition <0..1> Composition floor when coverage is nearly identical [default: 0.82]\n      --reconcile-max-gc-delta <0..1>    Hard GC delta [default: 0.055]\n      --post-rescue-threshold <0..1>     Rescue after bin merges [default: 0.72]\n      --post-rescue-margin <0..1>        Post-merge rescue margin [default: 0.03]\n      --reconcile-max-merges <N>         Safety cap [default: 256]\n\n\
-QUANTIFICATION:\n  With --coverage, BridgeBin writes abundance.tsv containing length-weighted\n  median depth, length-weighted mean depth, and relative abundance per bin/sample.\n\n\
-OUTPUT:\n  assignments.tsv, bins.tsv, bins/bin_XXXX.fa, abundance.tsv (with coverage),\n  and optionally unbinned.fa.\n\n\
-BridgeBin v1 uses conservative seed bins followed by reciprocal bin-bin\nreconciliation. Optional single-copy marker conflicts are hard negative evidence."
+CORE:\n      --algorithm <v0|v1|v2>     Binning engine [default: v2]\n  -c, --contigs <FASTA>          Assembled contigs\n      --coverage <TSV>           Coverage matrix: contig sample1 [sample2 ...]\n      --markers <TSV>            Single-copy markers: contig marker (one hit/row)\n      --bio-features <TSV>       Optional taxonomy/gene/ESM-C feature table\n      --links <TSV>              Optional graph/read/Hi-C must/cannot-link evidence\n  -o, --out-dir <DIR>            Output directory\n      --min-contig <BP>          Minimum contig length [default: 1500]\n\n\
+V2 SIGNED EVIDENCE GRAPH:\n      --v2-max-neighbors <N>         Sparse candidate neighbors [default: 64]\n      --v2-min-component-bp <BP>     Minimum core-bin size [default: 20000]\n      --v2-core-attraction <0..1>    Edge attraction floor [default: 0.80]\n      --v2-max-repulsion <0..1>      Allowed repulsion ceiling [default: 0.20]\n      --v2-component-attraction <N>  Component centroid attraction floor [default: 0.72]\n      --v2-rescue-attraction <N>     Residual-component rescue floor [default: 0.76]\n      --v2-rescue-margin <N>         Best-vs-second rescue margin [default: 0.05]\n      --v2-max-gc-delta <N>          Component GC delta ceiling [default: 0.075]\n      --v2-min-composition <N>       Component 5-mer similarity floor [default: 0.50]\n      --v2-min-coverage <N>          Component coverage similarity floor [default: 0.48]\n      --v2-taxonomy-confidence <N>   Confidence for taxonomy cannot-link [default: 0.90]\n      --v2-soft-markers              Do not make duplicate SCGs a hard veto\n\n\
+BIO FEATURE TSV:\n  Header-based TSV. Supported columns: contig, taxonomy, taxonomy_confidence,\n  gene_profile, gene_confidence, esm_embedding/protein_embedding, protein_confidence.\n  Vector columns are comma-separated floats. Missing modalities are allowed.\n\n\
+LINK TSV:\n  Header-based TSV with left/source, right/target, optional must_link, cannot_link,\n  and evidence_source. A cannot_link >= 0.95 is component-transitive hard negative\n  evidence. Positive graph/read links increase confidence but never force a merge.\n\n\
+LEGACY V0/V1 OPTIONS:\n      --seed-min-contig, --join-threshold, --rescue-threshold, --rescue-margin,\n      --composition-weight, --coverage-weight, --gc-weight, and v1 reconcile flags\n      remain available for controlled benchmark comparisons.\n\n\
+OUTPUT:\n  assignments.tsv, bins.tsv, bins/bin_XXXX.fa, abundance.tsv (with coverage),\n  and optionally unbinned.fa."
     );
 }
