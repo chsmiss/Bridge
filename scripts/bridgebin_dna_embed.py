@@ -5,9 +5,12 @@ The default is the DNABERT-S authors' public checkpoint ``zhihan1996/DNABERT-S``
 with Transformers custom code as documented by the model repository. MultiMolecule models
 remain supported explicitly when a ``multimolecule/*`` name is requested.
 
-Long contigs are represented by overlapping windows; each window is encoded in forward
-and reverse-complement orientation and the pooled representations are averaged. The
-resulting per-window TSV is consumed by ``bridgebin_bio_features.py --dna-embeddings``.
+Long contigs are represented by overlapping windows; each selected window is encoded in
+forward and reverse-complement orientation and the pooled representations are averaged.
+For expensive foundation models ``--max-windows-per-contig`` can evenly subsample the
+full contig rather than spending inference on every overlapping window.  A value of zero
+keeps every window.  The resulting per-window TSV is consumed by
+``bridgebin_bio_features.py --dna-embeddings``.
 
 Optional dependencies:
   default DNABERT-S:  pip install torch transformers einops
@@ -34,6 +37,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--window-bp", type=int, default=2048)
     parser.add_argument("--stride-bp", type=int, default=1024)
     parser.add_argument("--min-window-bp", type=int, default=512)
+    parser.add_argument(
+        "--max-windows-per-contig",
+        type=int,
+        default=0,
+        help="evenly sample at most N windows per contig; 0 keeps all windows",
+    )
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
@@ -85,6 +94,20 @@ def windows(sequence: str, window_bp: int, stride_bp: int, min_window_bp: int):
         if start + window_bp >= len(sequence):
             break
         start += stride_bp
+
+
+def evenly_sample_windows(
+    candidates: Sequence[Tuple[int, str]], limit: int
+) -> List[Tuple[int, str]]:
+    if limit <= 0 or len(candidates) <= limit:
+        return list(candidates)
+    if limit == 1:
+        return [candidates[len(candidates) // 2]]
+    # Include both ends and spread the remaining samples across the full contig.  The
+    # integer formulation is deterministic and cannot select the same index twice when
+    # limit <= len(candidates).
+    indices = [round(i * (len(candidates) - 1) / (limit - 1)) for i in range(limit)]
+    return [candidates[index] for index in indices]
 
 
 def load_runtime(model_name: str, requested_device: str, trust_remote_code: bool):
@@ -182,14 +205,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("require 1 <= --min-window-bp <= --window-bp")
     if not (1 <= args.stride_bp <= args.window_bp):
         raise SystemExit("require 1 <= --stride-bp <= --window-bp")
+    if args.max_windows_per_contig < 0:
+        raise SystemExit("--max-windows-per-contig must be >= 0")
     if args.max_tokens < 4 or args.batch_size < 1:
         raise SystemExit("--max-tokens and --batch-size are too small")
 
     runtime = load_runtime(args.model, args.device, args.trust_remote_code)
     records = []
+    full_window_count = 0
     for contig, sequence in read_fasta(args.contigs):
-        for serial, piece in windows(
-            sequence, args.window_bp, args.stride_bp, args.min_window_bp
+        candidates = list(
+            windows(sequence, args.window_bp, args.stride_bp, args.min_window_bp)
+        )
+        full_window_count += len(candidates)
+        for serial, piece in evenly_sample_windows(
+            candidates, args.max_windows_per_contig
         ):
             records.append((contig, serial, piece))
 
@@ -218,8 +248,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 written += 1
     backend = runtime[-1]
     print(
-        f"bridgebin-dna: windows={written} contigs={len({c for c, _, _ in records})} "
-        f"model={args.model} backend={backend}"
+        f"bridgebin-dna: windows={written}/{full_window_count} "
+        f"contigs={len({c for c, _, _ in records})} model={args.model} backend={backend}"
     )
     return 0
 
