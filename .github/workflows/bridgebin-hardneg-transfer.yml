@@ -61,7 +61,7 @@ jobs:
             --input-dir "$root" --output-dir benchmark/hardneg_transfer/train \
             --fragment-bp 6000 --fragments-per-group 6 --samples 4 --seed 43
 
-      - name: Embed reference curriculum
+      - name: Embed reference curriculum and train DNA-only head
         env:
           TOKENIZERS_PARALLELISM: 'false'
         run: |
@@ -74,8 +74,11 @@ jobs:
             --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
           python scripts/bridgebin_bio_features.py \
             --dna-embeddings "$b/dnaberts_windows.tsv" --output "$b/features.tsv"
+          # Deliberately omit coverage from the pair table. The curriculum is testing
+          # transferable DNA identity; abundance will be fused later by the production
+          # candidate graph rather than allowed to distort this calibration.
           python scripts/bridgebin_make_pair_dataset.py \
-            --truth "$b/truth.tsv" --coverage "$b/coverage.tsv" --output "$b/pairs.tsv" \
+            --truth "$b/truth.tsv" --output "$b/pairs.tsv" \
             --anchors-per-genome 6 --positive-per-contig 4 \
             --negative-genomes-per-contig 6 --negative-anchors-per-genome 2
           python scripts/bridgebin_pair_head.py train \
@@ -133,7 +136,7 @@ jobs:
           print('zymo_panel',len(ids),'genomes',len(groups))
           PY
 
-      - name: Zero-shot score Zymo with reference-trained head
+      - name: Zero-shot score Zymo with reference-trained DNA head
         env:
           TOKENIZERS_PARALLELISM: 'false'
         run: |
@@ -147,6 +150,8 @@ jobs:
             --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
           python scripts/bridgebin_bio_features.py \
             --dna-embeddings "$z/dnaberts_windows.tsv" --output "$z/features.tsv"
+          # Keep coverage in the evaluation pair file: the trained DNA-only model has a
+          # zero coverage weight, so this also checks missing-modality robustness.
           python scripts/bridgebin_make_pair_dataset.py \
             --truth "$z/truth.tsv" --coverage "$z/coverage.tsv" --output "$z/pairs.tsv" \
             --anchors-per-genome 4 --positive-per-contig 3 \
@@ -154,7 +159,7 @@ jobs:
           python scripts/bridgebin_pair_head.py score \
             --features "$z/features.tsv" --pairs "$z/pairs.tsv" \
             --model "$train/pair_head.json" --output "$z/pair_scores.tsv" \
-            --model-name ref-hardneg-dnaberts
+            --model-name ref-hardneg-dnaberts-dna-only
           python - <<'PY'
           import json
           from pathlib import Path
