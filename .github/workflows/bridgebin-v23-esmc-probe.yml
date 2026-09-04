@@ -7,6 +7,8 @@ on:
     paths:
       - scripts/bridgebin_predict_orfs.py
       - scripts/bridgebin_esmc_embed.py
+      - scripts/bridgebin_protein_repertoire.py
+      - scripts/bridgebin_protein_pair_scores.py
       - scripts/bridgebin_bio_features.py
       - .github/workflows/bridgebin-v23-esmc-probe.yml
   workflow_dispatch:
@@ -28,36 +30,30 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
-          python -m pip install esm pyrodigal
-          python -m py_compile scripts/bridgebin_predict_orfs.py scripts/bridgebin_esmc_embed.py
+          python -m pip install esm pyrodigal numpy
+          python -m py_compile scripts/bridgebin_predict_orfs.py scripts/bridgebin_esmc_embed.py scripts/bridgebin_protein_pair_scores.py scripts/bridgebin_protein_repertoire.py
       - name: Build a small independent Zymo protein panel
         run: |
           set -euo pipefail
           base=benchmark/v23_esmc
           mkdir -p "$base"
-          curl -L --retry 3 -o /tmp/zymo-refs.zip \
-            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          curl -L --retry 3 -o /tmp/zymo-refs.zip 'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
           mkdir -p /tmp/zymo-refs
           unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
           python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
-          python scripts/bridgebin_zymo_reference_benchmark.py \
-            --reference-dir /tmp/zymo-species-refs --out "$base/full" \
-            --seed 43 --min-fragment 5000 --max-fragment 8500 --min-contig 1500
+          python scripts/bridgebin_zymo_reference_benchmark.py --reference-dir /tmp/zymo-species-refs --out "$base/full" --seed 43 --min-fragment 5000 --max-fragment 8500 --min-contig 1500
           python - <<'PY'
           import csv
           from collections import defaultdict
           from pathlib import Path
           src=Path('benchmark/v23_esmc/full'); out=Path('benchmark/v23_esmc/panel'); out.mkdir(parents=True,exist_ok=True)
-          truth=list(csv.DictReader((src/'truth.tsv').open(),delimiter='\t'))
-          groups=defaultdict(list)
+          truth=list(csv.DictReader((src/'truth.tsv').open(),delimiter='\t')); groups=defaultdict(list)
           for row in truth:
               if int(row['eligible']): groups[row['genome']].append(row)
           chosen=[]
           for genome,rs in sorted(groups.items()):
-              rs.sort(key=lambda x:(-int(x['length']),x['contig']))
-              chosen.extend(rs[:2])
-          ids={row['contig'] for row in chosen}
-          seq={}; name=None; chunks=[]
+              rs.sort(key=lambda x:(-int(x['length']),x['contig'])); chosen.extend(rs[:2])
+          ids={row['contig'] for row in chosen}; seq={}; name=None; chunks=[]
           for raw in (src/'contigs.fa').read_text().splitlines():
               if raw.startswith('>'):
                   if name is not None: seq[name]=''.join(chunks)
@@ -79,38 +75,58 @@ jobs:
         run: |
           set -euo pipefail
           p=benchmark/v23_esmc/panel
-          python scripts/bridgebin_predict_orfs.py \
-            --contigs "$p/contigs.fa" --output-faa "$p/proteins.faa" --mapping "$p/protein_map.tsv" \
-            --min-aa 70 --max-proteins-per-contig 3
-          python scripts/bridgebin_esmc_embed.py \
-            --proteins "$p/proteins.faa" --mapping "$p/protein_map.tsv" --output "$p/esmc.tsv" \
-            --model biohub/ESMC-300M --device cpu --batch-size 1 --max-aa 512 --truncate
-          python scripts/bridgebin_bio_features.py \
-            --protein-embeddings "$p/esmc.tsv" --output "$p/features.tsv"
-      - name: Evaluate raw protein identity geometry
+          python scripts/bridgebin_predict_orfs.py --contigs "$p/contigs.fa" --output-faa "$p/proteins.faa" --mapping "$p/protein_map.tsv" --min-aa 70 --max-proteins-per-contig 3
+          python scripts/bridgebin_esmc_embed.py --proteins "$p/proteins.faa" --mapping "$p/protein_map.tsv" --output "$p/esmc.tsv" --model biohub/ESMC-300M --device cpu --batch-size 1 --max-aa 512 --truncate
+          python scripts/bridgebin_bio_features.py --protein-embeddings "$p/esmc.tsv" --output "$p/features.tsv"
+      - name: Evaluate pooled, set-to-set, and repertoire geometry
         run: |
+          set -euo pipefail
+          p=benchmark/v23_esmc/panel
+          python - <<'PY'
+          import csv,itertools
+          from pathlib import Path
+          p=Path('benchmark/v23_esmc/panel'); truth={r['contig']:r['genome'] for r in csv.DictReader((p/'truth.tsv').open(),delimiter='\t')}; names=sorted(truth)
+          with (p/'pairs.tsv').open('w',newline='') as h:
+              w=csv.writer(h,delimiter='\t',lineterminator='\n'); w.writerow(['left','right','label'])
+              for a,b in itertools.combinations(names,2): w.writerow([a,b,int(truth[a]==truth[b])])
+          PY
+          python scripts/bridgebin_protein_pair_scores.py --protein-embeddings "$p/esmc.tsv" --pairs "$p/pairs.tsv" --output "$p/protein_set_pairs.tsv"
+          for k in 4 8 12; do
+            python scripts/bridgebin_protein_repertoire.py fit-transform --embeddings "$p/esmc.tsv" --output "$p/repertoire_k${k}.tsv" --codebook-out "$p/codebook_k${k}.npz" --clusters "$k" --iterations 30 --seed 43
+          done
           python - <<'PY'
           import csv,json,math
           from pathlib import Path
-          p=Path('benchmark/v23_esmc/panel')
-          truth={r['contig']:r['genome'] for r in csv.DictReader((p/'truth.tsv').open(),delimiter='\t')}
-          features={}
+          p=Path('benchmark/v23_esmc/panel'); truth={r['contig']:r['genome'] for r in csv.DictReader((p/'truth.tsv').open(),delimiter='\t')}
+          def auc(rows):
+              pos=[s for s,l,a,b in rows if l]; neg=[s for s,l,a,b in rows if not l]; wins=sum(1 if x>y else .5 if x==y else 0 for x in pos for y in neg); return wins/max(1,len(pos)*len(neg))
+          def med(x):
+              x=sorted(x); n=len(x); return x[n//2] if n%2 else .5*(x[n//2-1]+x[n//2])
+          def summary(rows):
+              pos=[s for s,l,a,b in rows if l]; neg=[s for s,l,a,b in rows if not l]; hard=[s for s,l,a,b in rows if not l and {truth[a],truth[b]}=={'Escherichia_coli','Salmonella_enterica'}]
+              return {'auc':auc(rows),'same_median':med(pos),'different_median':med(neg),'ecoli_salmonella_median':med(hard)}
+          result={}
+          feats={}
           for r in csv.DictReader((p/'features.tsv').open(),delimiter='\t'):
               raw=r.get('esm_embedding','')
-              if raw and raw!='.': features[r['contig']]=[float(x) for x in raw.split(',')]
+              if raw and raw!='.': feats[r['contig']]=[float(x) for x in raw.split(',')]
           def cos(a,b):
               dot=sum(x*y for x,y in zip(a,b)); na=math.sqrt(sum(x*x for x in a)); nb=math.sqrt(sum(y*y for y in b)); return dot/max(1e-12,na*nb)
-          scored=[]; names=sorted(features)
+          rows=[]; names=sorted(feats)
           for i,a in enumerate(names):
-              for b in names[i+1:]: scored.append((cos(features[a],features[b]),int(truth[a]==truth[b]),a,b))
-          pos=[s for s,l,*_ in scored if l]; neg=[s for s,l,*_ in scored if not l]
-          wins=sum(1 if a>b else 0.5 if a==b else 0 for a in pos for b in neg)
-          auc=wins/max(1,len(pos)*len(neg))
-          median=lambda xs: sorted(xs)[len(xs)//2] if xs else float('nan')
-          hard=[s for s,l,a,b in scored if not l and {truth[a],truth[b]}=={'Escherichia_coli','Salmonella_enterica'}]
-          metrics={'contigs':len(features),'positive_pairs':len(pos),'negative_pairs':len(neg),'auc':auc,'same_median':median(pos),'different_median':median(neg),'ecoli_salmonella_median':median(hard)}
-          (p/'esmc_probe.metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)+'\n')
-          print(json.dumps(metrics,sort_keys=True))
+              for b in names[i+1:]: rows.append((cos(feats[a],feats[b]),int(truth[a]==truth[b]),a,b))
+          result['pooled']=summary(rows)
+          setrows=[]
+          for r in csv.DictReader((p/'protein_set_pairs.tsv').open(),delimiter='\t'):
+              setrows.append((float(r['protein_set_similarity']),int(r['label']),r['left'],r['right']))
+          result['set_to_set']=summary(setrows)
+          for k in (4,8,12):
+              rep={r['contig']:[float(x) for x in r['protein_repertoire'].split(',')] for r in csv.DictReader((p/f'repertoire_k{k}.tsv').open(),delimiter='\t')}
+              rr=[]; names=sorted(rep)
+              for i,a in enumerate(names):
+                  for b in names[i+1:]: rr.append((cos(rep[a],rep[b]),int(truth[a]==truth[b]),a,b))
+              result[f'repertoire_k{k}']=summary(rr)
+          (p/'protein_identity.metrics.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(json.dumps(result,sort_keys=True))
           PY
       - uses: actions/upload-artifact@v4
         if: always()
