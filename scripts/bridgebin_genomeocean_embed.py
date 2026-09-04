@@ -13,7 +13,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Iterator, List, Optional, Sequence, Set, Tuple
 
 import torch
 from transformers import AutoModel, PreTrainedTokenizerFast
@@ -78,6 +78,9 @@ def normalize(x:torch.Tensor)->torch.Tensor:
 
 def pooled_hidden(model,tokenizer,sequences:List[str],device:torch.device,max_tokens:int)->torch.Tensor:
     enc=tokenizer(sequences,return_tensors='pt',padding=True,truncation=True,max_length=max_tokens)
+    # GenomeOcean is Mistral-based. Some fast-tokenizer versions emit token_type_ids,
+    # but MistralModel.forward does not accept them.
+    enc.pop('token_type_ids',None)
     enc={k:v.to(device) for k,v in enc.items()}
     with torch.inference_mode():
         out=model(**enc,output_hidden_states=False,return_dict=True)
@@ -116,7 +119,7 @@ def main(argv:Optional[Sequence[str]]=None)->int:
         batch=records[start:start+a.batch_size]
         vectors=pooled_hidden(model,tokenizer,[x[3] for x in batch],device,a.max_tokens)
         embeddings.extend(vectors.tolist())
-    by= {}
+    by={}
     for rec,vec in zip(records,embeddings):
         contig=rec[0]; by.setdefault(contig,[]).append(vec)
     a.output.parent.mkdir(parents=True,exist_ok=True)
