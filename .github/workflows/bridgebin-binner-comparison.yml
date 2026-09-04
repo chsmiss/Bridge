@@ -68,13 +68,15 @@ jobs:
           done
 
       - name: Run MetaBAT2 2.18
+        continue-on-error: true
         run: |
           set -euo pipefail
           b="$PWD/benchmark/binner_compare"
           mkdir -p "$b/metabat2_bins"
-          docker pull quay.io/biocontainers/metabat2:2.18_23_gc869c52-0
+          image='metabat/metabat:v2.18-23-gc869c52'
+          docker pull "$image"
           /usr/bin/time -v -o "$b/metabat2.runtime.txt" \
-            docker run --rm -v "$PWD:/work" quay.io/biocontainers/metabat2:2.18_23_gc869c52-0 \
+            docker run --rm -v "$PWD:/work" "$image" \
               metabat2 -i /work/benchmark/binner_compare/contigs.fa \
                 -a /work/benchmark/binner_compare/metabat_depth.tsv \
                 -o /work/benchmark/binner_compare/metabat2_bins/bin \
@@ -93,9 +95,10 @@ jobs:
         run: |
           set -euo pipefail
           b="$PWD/benchmark/binner_compare"
-          docker pull quay.io/biocontainers/semibin:2.4.1-0
+          image='ghcr.io/taffish-org/semibin2:2.4.1-r1'
+          docker pull "$image"
           /usr/bin/time -v -o "$b/semibin2.runtime.txt" \
-            docker run --rm -v "$PWD:/work" quay.io/biocontainers/semibin:2.4.1-0 \
+            docker run --rm -v "$PWD:/work" "$image" \
               SemiBin2 single_easy_bin \
                 --environment global \
                 --input-fasta /work/benchmark/binner_compare/contigs.fa \
@@ -112,6 +115,7 @@ jobs:
             --output "$b/semibin2.metrics.json" >/dev/null
 
       - name: Print comparison
+        if: always()
         run: |
           python3 - <<'PY'
           import json
@@ -128,6 +132,7 @@ jobs:
           PY
 
       - name: Upload comparison artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bridgebin-binner-comparison
