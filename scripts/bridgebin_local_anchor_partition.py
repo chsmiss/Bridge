@@ -183,17 +183,23 @@ def permuted_p_value(
 def coverage_partition_support(
     left: List[cheap.Feature], right: List[cheap.Feature]
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Measure whether the proposed DNA split is independently supported by coverage.
+
+    Keep this helper tied only to the stable coverage primitive rather than a combined
+    candidate-miner interface. Candidate generation can evolve without breaking this
+    validation layer again.
+    """
     within: List[float] = []
     cross: List[float] = []
     for group in (left, right):
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
-                coverage, _composition, _gc = cheap.component_sim(group[i], group[j])
+                coverage = cheap.log_coverage_similarity(group[i].coverage, group[j].coverage)
                 if coverage is not None:
                     within.append(coverage)
     for a in left:
         for b in right:
-            coverage, _composition, _gc = cheap.component_sim(a, b)
+            coverage = cheap.log_coverage_similarity(a.coverage, b.coverage)
             if coverage is not None:
                 cross.append(coverage)
     if not within or not cross:
