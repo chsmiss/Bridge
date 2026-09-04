@@ -1,0 +1,135 @@
+name: BridgeBin DNABERT-S fast identity probe
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_dna_embed.py
+      - .github/workflows/bridgebin-dnaberts-fast.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CPU-safe DNABERT-S
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
+
+      - name: Prepare 32-contig Zymo hard panel
+        run: |
+          set -euo pipefail
+          root=benchmark/dnaberts_fast
+          mkdir -p "$root"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$root" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          python - <<'PY'
+          import csv
+          from collections import defaultdict
+          from pathlib import Path
+          r=Path('benchmark/dnaberts_fast')
+          truth=list(csv.DictReader((r/'truth.tsv').open(), delimiter='\t'))
+          groups=defaultdict(list)
+          for row in truth:
+              if int(row['eligible']): groups[row['genome']].append(row)
+          chosen=[]
+          for genome,rows in sorted(groups.items()):
+              rows.sort(key=lambda x:(-int(x['length']),x['contig']))
+              chosen.extend(rows[:4])
+          ids={x['contig'] for x in chosen}
+          seq={}; name=None; chunks=[]
+          for raw in (r/'contigs.fa').read_text().splitlines():
+              if raw.startswith('>'):
+                  if name is not None: seq[name]=''.join(chunks)
+                  name=raw[1:].split()[0]; chunks=[]
+              else: chunks.append(raw.strip())
+          if name is not None: seq[name]=''.join(chunks)
+          with (r/'panel.fa').open('w') as h:
+              for cid in sorted(ids):
+                  h.write(f'>{cid}\n')
+                  s=seq[cid]
+                  for i in range(0,len(s),80): h.write(s[i:i+80]+'\n')
+          fields=['contig','genome','length','eligible','record','start','end']
+          with (r/'panel_truth.tsv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=fields,delimiter='\t'); w.writeheader(); w.writerows(sorted(chosen,key=lambda x:x['contig']))
+          with (r/'coverage.tsv').open() as src,(r/'panel_coverage.tsv').open('w',newline='') as dst:
+              rd=csv.reader(src,delimiter='\t'); wr=csv.writer(dst,delimiter='\t',lineterminator='\n'); wr.writerow(next(rd))
+              for row in rd:
+                  if row and row[0] in ids: wr.writerow(row)
+          print('panel_contigs',len(ids),'genomes',len(groups))
+          PY
+
+      - name: Baseline and real DNABERT-S embeddings
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          root=benchmark/dnaberts_fast
+          python scripts/bridgebin_sequence_baseline_features.py --contigs "$root/panel.fa" --output "$root/kmer5.tsv" -k 5
+          python scripts/bridgebin_eval_embeddings.py \
+            --features "$root/kmer5.tsv" --truth "$root/panel_truth.tsv" \
+            --column kmer_embedding --max-contigs-per-genome 4 --precision-target 0.99 \
+            --focus Escherichia_coli,Salmonella_enterica --output "$root/kmer5.metrics.json"
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$root/panel.fa" --output "$root/dnaberts_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py --dna-embeddings "$root/dnaberts_windows.tsv" --output "$root/dnaberts_features.tsv"
+          python scripts/bridgebin_eval_embeddings.py \
+            --features "$root/dnaberts_features.tsv" --truth "$root/panel_truth.tsv" \
+            --column dna_embedding --max-contigs-per-genome 4 --precision-target 0.99 \
+            --focus Escherichia_coli,Salmonella_enterica --output "$root/dnaberts.metrics.json"
+
+      - name: Whole-genome-holdout pair head
+        run: |
+          set -euo pipefail
+          root=benchmark/dnaberts_fast
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$root/panel_truth.tsv" --coverage "$root/panel_coverage.tsv" \
+            --output "$root/pairs.tsv" --anchors-per-genome 4 \
+            --positive-per-contig 3 --negative-genomes-per-contig 4 --negative-anchors-per-genome 2
+          python scripts/bridgebin_pair_head.py train \
+            --features "$root/dnaberts_features.tsv" --pairs "$root/pairs.tsv" \
+            --model-out "$root/pair_head.json" --validation-fraction 0.25 \
+            --epochs 500 --negative-weight 3 --precision-target 0.99 --require-group-holdout \
+            | tee "$root/pair_head.metrics.jsonl"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r=Path('benchmark/dnaberts_fast')
+          k=json.loads((r/'kmer5.metrics.json').read_text())
+          d=json.loads((r/'dnaberts.metrics.json').read_text())
+          print('representation\tauc\tnn_acc\tP99_recall\tEcoli-Salmonella_median')
+          for n,m in [('5mer',k),('DNABERT-S',d)]:
+              f=m['focus_cross_genome_cosine'].get('Escherichia_coli vs Salmonella_enterica',{})
+              print(f"{n}\t{m['pair_auc']:.6f}\t{m['nearest_neighbor_genome_accuracy']:.6f}\t{m['high_precision_threshold']['recall']:.6f}\t{f.get('median',float('nan')):.6f}")
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-dnaberts-fast
+          path: benchmark/dnaberts_fast
+          retention-days: 14
