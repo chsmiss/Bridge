@@ -1,0 +1,224 @@
+name: Zymo Stage26 gap-free path-cover 500k
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "500000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage26-gapfree-pathcover-500k.yml
+
+concurrency:
+  group: zymo-stage26-gapfree-pathcover-500k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PAIRS: ${{ inputs.pairs || '500000' }}
+      THREADS: "2"
+      CANONICAL_MEGAHIT_N50: "269356"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install benchmark tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit time
+
+      - name: Download deterministic Zymo 500k subset
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies benchmark/profiles
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+
+      - name: Validate and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          cargo build --release
+
+      - name: Run BridgeAsm baseline and path-cover sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_bridgeasm() {
+            name=$1
+            min_primary=$2
+            dominance=$3
+            secondary=$4
+            use_path_cover=$5
+            out="benchmark/$name"
+            args=(
+              assemble
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz
+              -o "$out"
+              -k 31
+              --min-count 2
+              --mercy-max-kmers 16
+              --mercy-min-support 1
+              --mercy-min-quality 25
+              --min-read-support 2
+              --min-pair-support 2
+              --min-primary-support "$min_primary"
+              --primary-dominance "$dominance"
+              --min-contig-length 200
+              --threads "$THREADS"
+            )
+            if [[ "$use_path_cover" == "yes" ]]; then
+              args+=(
+                --threaded-path-cover
+                --major-path-cover
+                --path-cover-secondary-dominance "$secondary"
+              )
+            fi
+            /usr/bin/time -v -o "benchmark/${name}.time.txt" \
+              target/release/bridgeasm "${args[@]}"
+            cp "$out/primary_contigs.fasta" "benchmark/assemblies/${name}.fasta"
+            cp "$out/run_profile.json" "benchmark/profiles/${name}.json"
+            python3 scripts/fasta_stats.py "$out/primary_contigs.fasta" \
+              --json "benchmark/${name}.stats.json" > "benchmark/${name}.stats.tsv"
+          }
+
+          # The first three path-cover settings mirror the historical 200k sweep.
+          # The final two intentionally explore a wider branch-resolution envelope.
+          run_bridgeasm baseline        5 0.75 0.20 no
+          run_bridgeasm pc_conservative 5 0.75 0.25 yes
+          run_bridgeasm pc_balanced     4 0.65 0.20 yes
+          run_bridgeasm pc_relaxed      3 0.60 0.15 yes
+          run_bridgeasm pc_aggressive   2 0.55 0.10 yes
+          run_bridgeasm pc_maximal      1 0.50 0.05 yes
+
+      - name: Verify BridgeAsm outputs are gap-free
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for path in sorted(Path("benchmark/assemblies").glob("*.fasta")):
+              bad = set()
+              for line in path.read_text().splitlines():
+                  if line.startswith(">"):
+                      continue
+                  bad.update(set(line.strip().upper()) - set("ACGT"))
+              if bad:
+                  raise SystemExit(f"{path}: non-ACGT sequence symbols found: {sorted(bad)}")
+              print(f"gap-free: {path}")
+          PY
+
+      - name: Run MEGAHIT baseline
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit \
+              --min-contig-len 200 \
+              -t "$THREADS"
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json > benchmark/megahit.stats.tsv
+
+      - name: Summarize N50 challenge
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          names = [
+              "baseline",
+              "pc_conservative",
+              "pc_balanced",
+              "pc_relaxed",
+              "pc_aggressive",
+              "pc_maximal",
+          ]
+          canonical = 269356
+          megahit = json.loads(Path("benchmark/megahit.stats.json").read_text())
+          megahit_n50 = int(megahit["n50"])
+          rows = [
+              "assembly\tn50\tlargest\tsequences\ttotal_bp\tmajor_path_transitions\tthreaded_path_transitions\tratio_to_megahit\tbeats_megahit\tbeats_canonical_269356"
+          ]
+          best = None
+          for name in names:
+              stats = json.loads(Path(f"benchmark/{name}.stats.json").read_text())
+              profile = json.loads(Path(f"benchmark/profiles/{name}.json").read_text())
+              n50 = int(stats["n50"])
+              ratio = n50 / max(megahit_n50, 1)
+              row = [
+                  name,
+                  n50,
+                  stats["largest"],
+                  stats["sequences"],
+                  stats["total_bp"],
+                  profile.get("major_path_transitions", 0),
+                  profile.get("threaded_path_transitions", 0),
+                  f"{ratio:.6f}",
+                  str(n50 > megahit_n50).lower(),
+                  str(n50 > canonical).lower(),
+              ]
+              rows.append("\t".join(map(str, row)))
+              if best is None or n50 > best[1]:
+                  best = (name, n50)
+          rows.append("\t".join(map(str, [
+              "megahit",
+              megahit_n50,
+              megahit["largest"],
+              megahit["sequences"],
+              megahit["total_bp"],
+              "na",
+              "na",
+              "1.000000",
+              "false",
+              str(megahit_n50 > canonical).lower(),
+          ])))
+          Path("benchmark/stage26_n50_summary.tsv").write_text("\n".join(rows) + "\n")
+          print("\n".join(rows))
+
+          name, n50 = best
+          outcome = "PASS" if n50 > megahit_n50 else "MISS"
+          canonical_outcome = "PASS" if n50 > canonical else "MISS"
+          summary = f"""## Stage26 gap-free N50 challenge\n\n- Dataset: ERR2935805 first {Path('benchmark/subset_provenance.json').exists() and '500k' or ''} read pairs (workflow PAIRS={500000})\n- MEGAHIT same-run N50: **{megahit_n50:,} bp**\n- Canonical MEGAHIT target: **{canonical:,} bp**\n- Best BridgeAsm: **{name}**, N50 **{n50:,} bp**\n- Same-run MEGAHIT challenge: **{outcome}**\n- Canonical 269,356 bp challenge: **{canonical_outcome}**\n- BridgeAsm FASTAs were checked to contain only A/C/G/T (no N-gap scaffolding).\n\n```text\n{chr(10).join(rows)}\n```\n"""
+          Path("benchmark/stage26_summary.md").write_text(summary)
+          with Path("benchmark/stage26_outcome.env").open("w") as handle:
+              handle.write(f"BEST_NAME={name}\n")
+              handle.write(f"BEST_N50={n50}\n")
+              handle.write(f"MEGAHIT_N50={megahit_n50}\n")
+              handle.write(f"BEATS_MEGAHIT={'true' if n50 > megahit_n50 else 'false'}\n")
+          PY
+          cat benchmark/stage26_summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zymo-stage26-gapfree-pathcover-500k
+          path: |
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/*.md
+            benchmark/*.env
+            benchmark/profiles
+            benchmark/assemblies
+          retention-days: 14
