@@ -262,6 +262,15 @@ fn recursive_signed_partition(
     else {
         return vec![members.to_vec()];
     };
+    // A second model-only cut needs stronger support than the first split. This prevents
+    // a few calibration false negatives from recursively fragmenting a coherent genome,
+    // while marker conflicts remain strict at every depth.
+    if depth > 0
+        && candidate.cut_marker_hard == 0
+        && candidate.cut_model_hard < cfg.min_pair_support.max(3)
+    {
+        return vec![members.to_vec()];
+    }
     if !accept_cut(&candidate, cfg) {
         return vec![members.to_vec()];
     }
