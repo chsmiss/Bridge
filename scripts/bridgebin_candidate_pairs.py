@@ -56,6 +56,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-length", type=int, default=1000)
     parser.add_argument("--anchors-per-bin", type=int, default=10)
+    parser.add_argument(
+        "--anchor-strategy",
+        choices=("longest", "diverse"),
+        default="longest",
+        help=(
+            "anchor selection policy: longest preserves the legacy behavior; diverse keeps "
+            "two long cores then uses cheap-feature farthest-point sampling"
+        ),
+    )
     parser.add_argument("--within-neighbors", type=int, default=3)
     parser.add_argument("--within-contrast", type=int, default=2)
     parser.add_argument("--merge-bin-neighbors", type=int, default=4)
@@ -319,6 +328,47 @@ def add_pair(
         existing.classes.add(candidate_class)
 
 
+def select_anchors(
+    members: Sequence[Feature], count: int, strategy: str
+) -> List[Feature]:
+    if count <= 0 or not members:
+        return []
+    count = min(count, len(members))
+    if strategy == "longest":
+        return list(members[:count])
+    if strategy != "diverse":
+        raise ValueError(f"unknown anchor strategy: {strategy}")
+
+    # Preserve a small long-contig core for representation quality, then deliberately
+    # explore cheap-feature space. The length factor prevents a tiny composition outlier
+    # from winning solely because it is noisy, while still allowing minority components
+    # to beat another nearly identical long contig.
+    seed_count = min(2, count)
+    selected = list(members[:seed_count])
+    selected_ids = {feature.contig for feature in selected}
+    max_length = max(feature.length for feature in members)
+    while len(selected) < count:
+        best = None
+        best_key = None
+        for candidate in members:
+            if candidate.contig in selected_ids:
+                continue
+            min_distance = min(
+                1.0 - cheap_similarity(candidate, anchor) for anchor in selected
+            )
+            length_fraction = candidate.length / max(1, max_length)
+            score = min_distance * (0.65 + 0.35 * math.sqrt(length_fraction))
+            key = (score, min_distance, candidate.length, candidate.contig)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = candidate
+        if best is None:
+            break
+        selected.append(best)
+        selected_ids.add(best.contig)
+    return selected
+
+
 def ranked_anchors(member: Feature, anchors: Sequence[Feature]) -> List[Tuple[float, Feature]]:
     ranked = [
         (cheap_similarity(member, anchor), anchor)
@@ -346,7 +396,7 @@ def mine(
         members.sort(key=lambda feature: (-feature.length, feature.contig))
 
     anchors: Dict[str, List[Feature]] = {
-        bin_name: members[: args.anchors_per_bin]
+        bin_name: select_anchors(members, args.anchors_per_bin, args.anchor_strategy)
         for bin_name, members in bins.items()
         if members
     }
