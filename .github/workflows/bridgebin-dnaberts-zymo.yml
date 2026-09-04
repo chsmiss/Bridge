@@ -1,0 +1,172 @@
+name: BridgeBin DNABERT-S Zymo identity probe
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_dna_embed.py
+      - scripts/bridgebin_bio_features.py
+      - scripts/bridgebin_eval_embeddings.py
+      - scripts/bridgebin_make_pair_dataset.py
+      - scripts/bridgebin_pair_head.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - scripts/split_zymo_references.py
+      - .github/workflows/bridgebin-dnaberts-zymo.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dnaberts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install DNABERT-S runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'multimolecule==0.2.1'
+
+      - name: Prepare deterministic Zymo panel
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/dnaberts_zymo \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+
+          python - <<'PY'
+          import csv
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path('benchmark/dnaberts_zymo')
+          truth = []
+          with (root / 'truth.tsv').open() as handle:
+              reader = csv.DictReader(handle, delimiter='\t')
+              for row in reader:
+                  if int(row['eligible']):
+                      truth.append(row)
+          grouped = defaultdict(list)
+          for row in truth:
+              grouped[row['genome']].append(row)
+          selected = set()
+          subset_rows = []
+          for genome, rows in sorted(grouped.items()):
+              rows.sort(key=lambda row: (-int(row['length']), row['contig']))
+              for row in rows[:8]:
+                  selected.add(row['contig'])
+                  subset_rows.append(row)
+
+          records = {}
+          name = None
+          chunks = []
+          with (root / 'contigs.fa').open() as handle:
+              for raw in handle:
+                  line = raw.strip()
+                  if not line:
+                      continue
+                  if line.startswith('>'):
+                      if name is not None:
+                          records[name] = ''.join(chunks)
+                      name = line[1:].split()[0]
+                      chunks = []
+                  else:
+                      chunks.append(line)
+              if name is not None:
+                  records[name] = ''.join(chunks)
+
+          with (root / 'panel.fa').open('w') as handle:
+              for contig in sorted(selected):
+                  seq = records[contig]
+                  handle.write(f'>{contig}\n')
+                  for start in range(0, len(seq), 80):
+                      handle.write(seq[start:start+80] + '\n')
+
+          with (root / 'panel_truth.tsv').open('w', newline='') as handle:
+              fieldnames = ['contig', 'genome', 'length', 'eligible', 'record', 'start', 'end']
+              writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter='\t')
+              writer.writeheader()
+              writer.writerows(sorted(subset_rows, key=lambda row: row['contig']))
+
+          with (root / 'coverage.tsv').open() as source, (root / 'panel_coverage.tsv').open('w') as target:
+              reader = csv.reader(source, delimiter='\t')
+              writer = csv.writer(target, delimiter='\t', lineterminator='\n')
+              header = next(reader)
+              writer.writerow(header)
+              for row in reader:
+                  if row and row[0] in selected:
+                      writer.writerow(row)
+          print('panel_genomes', len(grouped), 'panel_contigs', len(selected))
+          PY
+
+      - name: Extract real DNABERT-S embeddings
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          python scripts/bridgebin_dna_embed.py \
+            --contigs benchmark/dnaberts_zymo/panel.fa \
+            --output benchmark/dnaberts_zymo/dnaberts_windows.tsv \
+            --model multimolecule/dnaberts \
+            --device cpu \
+            --window-bp 1200 --stride-bp 1200 --min-window-bp 512 \
+            --max-tokens 512 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings benchmark/dnaberts_zymo/dnaberts_windows.tsv \
+            --output benchmark/dnaberts_zymo/dnaberts_features.tsv
+
+      - name: Measure genome identity and hard-negative separation
+        run: |
+          set -euo pipefail
+          python scripts/bridgebin_eval_embeddings.py \
+            --features benchmark/dnaberts_zymo/dnaberts_features.tsv \
+            --truth benchmark/dnaberts_zymo/panel_truth.tsv \
+            --column dna_embedding \
+            --max-contigs-per-genome 8 \
+            --precision-target 0.99 \
+            --focus Escherichia_coli,Salmonella_enterica \
+            --output benchmark/dnaberts_zymo/dnaberts_identity_metrics.json
+          cat benchmark/dnaberts_zymo/dnaberts_identity_metrics.json
+
+      - name: Whole-genome-holdout pair-head probe
+        run: |
+          set -euo pipefail
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth benchmark/dnaberts_zymo/panel_truth.tsv \
+            --coverage benchmark/dnaberts_zymo/panel_coverage.tsv \
+            --output benchmark/dnaberts_zymo/panel_pairs.tsv \
+            --anchors-per-genome 8 \
+            --positive-per-contig 4 \
+            --negative-genomes-per-contig 4 \
+            --negative-anchors-per-genome 2
+          python scripts/bridgebin_pair_head.py train \
+            --features benchmark/dnaberts_zymo/dnaberts_features.tsv \
+            --pairs benchmark/dnaberts_zymo/panel_pairs.tsv \
+            --model-out benchmark/dnaberts_zymo/dnaberts_pair_head.json \
+            --validation-fraction 0.25 \
+            --epochs 500 --negative-weight 3 \
+            --precision-target 0.99 \
+            --require-group-holdout \
+            | tee benchmark/dnaberts_zymo/dnaberts_pair_head_metrics.jsonl
+          cat benchmark/dnaberts_zymo/dnaberts_pair_head.json
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-dnaberts-zymo-probe
+          path: benchmark/dnaberts_zymo
+          retention-days: 14
