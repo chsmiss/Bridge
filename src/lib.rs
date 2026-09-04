@@ -6,6 +6,7 @@ pub mod bridgebin_reconcile;
 pub mod bridgebin_v2;
 pub mod bridgebin_v21;
 pub mod bridgebin_v21_merge;
+#[allow(unused_variables)]
 pub mod bridgebin_v25;
 pub mod dna;
 pub mod fastq;
