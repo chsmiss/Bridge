@@ -4,20 +4,20 @@
 Root-cause hypothesis
 ---------------------
 The production multi-k pipeline projects a stage to the next k using virtual
-paired reads only for contigs >=500 bp.  Stage10's validated rare rescue is
+paired reads only for contigs >=500 bp. Stage10's validated rare rescue is
 almost entirely 200--499 bp, so those fragments are appended after assembly but
 never get a chance to recruit raw singleton k-mers and grow at k31/k41/k55.
 
-This experiment changes only that handoff mechanism.  Stage10 strict additions
+This experiment changes only that handoff mechanism. Stage10 strict additions
 are already cross-k validated; they are reintroduced as *single-copy* virtual
-evidence.  Virtual read intervals are non-overlapping, and a virtual pair is
-rejected if any k-mer at the target k has already appeared in another accepted
-virtual pair.  Therefore the synthetic library alone cannot satisfy
---min-count=2 for a target-k k-mer; it can only promote sequence that also has
-raw support (or pre-existing graph support).
+evidence. Virtual source intervals are non-overlapping, and a virtual pair is
+rejected if any target-k k-mer is repeated inside that pair or has appeared in
+another accepted virtual pair. Therefore the synthetic library alone cannot
+satisfy --min-count=2 for a target-k k-mer; it can only promote sequence that
+also has non-synthetic support.
 
 After each target-k assembly, only contigs carrying a locus-unique Stage10 seed
-signature are allowed to seed the next k.  Final sequence is add-only on top of
+signature are allowed to seed the next k. Final sequence is add-only on top of
 Stage10 and must be seed-connected, Stage10-novel, and independently present in
 at least two target-k assemblies.
 
@@ -40,7 +40,6 @@ from typing import Iterable
 import low_abundance_rescue as lr
 import stage14_amplified_methods as s14
 import stage16_root_cause as s16
-
 
 COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
@@ -71,11 +70,7 @@ def virtual_pair_sequences(
     read_length: int = 91,
     desired_insert: int = 220,
 ) -> Iterable[tuple[int, str, str]]:
-    """Yield non-overlapping source intervals as paired virtual reads.
-
-    Advancing by the actual insert keeps source intervals disjoint.  With
-    insert >= 2*read_length, left/right reads are also disjoint.
-    """
+    """Yield disjoint source intervals as paired virtual reads."""
     if desired_insert < 2 * read_length:
         raise ValueError("desired_insert must be >= 2*read_length")
     pos = 0
@@ -92,8 +87,8 @@ def virtual_pair_sequences(
         pos += insert
 
 
-def target_kmers_from_pair(left: str, right_rc: str, k: int) -> set[str]:
-    result = set(lr.kmers(left, k))
+def target_kmer_counts_from_pair(left: str, right_rc: str, k: int) -> Counter[str]:
+    result: Counter[str] = Counter(lr.kmers(left, k))
     result.update(lr.kmers(rc(right_rc), k))
     return result
 
@@ -116,6 +111,7 @@ def write_single_copy_virtual_pairs(
     accepted_read_bases = 0
     too_short_records = 0
     duplicate_pair_rejects = 0
+    internal_repeat_rejects = 0
     n_pair_rejects = 0
     with gzip.open(out1, "wt", compresslevel=3) as left_out, gzip.open(
         out2, "wt", compresslevel=3
@@ -137,12 +133,13 @@ def write_single_copy_virtual_pairs(
                 if "N" in left or "N" in right:
                     n_pair_rejects += 1
                     continue
-                kmers = target_kmers_from_pair(left, right, target_k)
-                if not kmers:
+                counts = target_kmer_counts_from_pair(left, right, target_k)
+                if not counts:
                     continue
-                # Strong invariant: every target-k k-mer is present in at most
-                # one accepted synthetic pair in the whole virtual library.
-                # Thus synthetic evidence alone cannot make count >=2.
+                if max(counts.values()) > 1:
+                    internal_repeat_rejects += 1
+                    continue
+                kmers = set(counts)
                 if kmers & used_target_kmers:
                     duplicate_pair_rejects += 1
                     continue
@@ -163,6 +160,7 @@ def write_single_copy_virtual_pairs(
         "accepted_virtual_read_bases": accepted_read_bases,
         "unique_virtual_target_kmers": len(used_target_kmers),
         "duplicate_pair_rejects": duplicate_pair_rejects,
+        "internal_repeat_rejects": internal_repeat_rejects,
         "n_pair_rejects": n_pair_rejects,
         "too_short_records": too_short_records,
         "virtual_to_source_base_ratio": accepted_read_bases / max(1, source_bases),
@@ -361,9 +359,6 @@ def build_short_handoff(
         }
         source = connected
 
-    # Cross-target-k recurrence is the independent validation channel.  Raw
-    # support is already enforced structurally: every virtual target-k k-mer has
-    # synthetic multiplicity <=1 and the assembler still requires count >=2.
     evidence = s16.local_evidence(
         assembly_inputs,
         seeds,
