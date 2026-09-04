@@ -1,0 +1,85 @@
+name: BridgeBin Zymo reference benchmark
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v0
+    paths:
+      - src/bridgebin.rs
+      - src/bridgebin_quant.rs
+      - src/bin/bridgebin.rs
+      - src/lib.rs
+      - scripts/bridgebin_benchmark.py
+      - scripts/bridgebin_zymo_reference_benchmark.py
+      - scripts/split_zymo_references.py
+      - .github/workflows/bridgebin-zymo-reference-benchmark.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format working tree and build BridgeBin
+        run: |
+          cargo fmt --all
+          cargo build --release --bin bridgebin
+          python3 -m py_compile \
+            scripts/bridgebin_benchmark.py \
+            scripts/bridgebin_zymo_reference_benchmark.py \
+            scripts/split_zymo_references.py
+
+      - name: Download and split Zymo references
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs
+
+      - name: Generate biological benchmark
+        run: |
+          python3 scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --out benchmark/bridgebin_zymo_ref \
+            --seed 43 \
+            --min-fragment 2200 \
+            --max-fragment 8500 \
+            --min-contig 1500
+
+      - name: Run BridgeBin
+        run: |
+          /usr/bin/time -v -o benchmark/bridgebin_zymo_ref/runtime.txt \
+            target/release/bridgebin \
+              --contigs benchmark/bridgebin_zymo_ref/contigs.fa \
+              --coverage benchmark/bridgebin_zymo_ref/coverage.tsv \
+              --out-dir benchmark/bridgebin_zymo_ref/result
+          test -s benchmark/bridgebin_zymo_ref/result/assignments.tsv
+          test -s benchmark/bridgebin_zymo_ref/result/abundance.tsv
+
+      - name: Evaluate against exact species truth
+        run: |
+          python3 scripts/bridgebin_benchmark.py evaluate \
+            --truth benchmark/bridgebin_zymo_ref/truth.tsv \
+            --truth-abundance benchmark/bridgebin_zymo_ref/truth_abundance.tsv \
+            --assignments benchmark/bridgebin_zymo_ref/result/assignments.tsv \
+            --abundance benchmark/bridgebin_zymo_ref/result/abundance.tsv \
+            --output benchmark/bridgebin_zymo_ref/metrics.json \
+            | tee benchmark/bridgebin_zymo_ref/metrics.stdout.tsv
+          cat benchmark/bridgebin_zymo_ref/runtime.txt
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-zymo-reference-benchmark
+          path: benchmark/bridgebin_zymo_ref
+          retention-days: 14
