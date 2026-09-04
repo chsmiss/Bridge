@@ -1,0 +1,211 @@
+name: BridgeBin v2.3 DNABERT-S metric transfer
+
+on:
+  push:
+    branches:
+      - codex/bridgebin-v2-signed-evidence
+    paths:
+      - scripts/bridgebin_metric_transfer.py
+      - scripts/bridgebin_pair_head.py
+      - scripts/bridgebin_pair_head_bio.py
+      - scripts/bridgebin_dna_embed.py
+      - scripts/bridgebin_bio_features.py
+      - scripts/bridgebin_reference_hardneg_panel.py
+      - scripts/bridgebin_make_pair_dataset.py
+      - scripts/bridgebin_eval_pair_scores.py
+      - .github/workflows/bridgebin-v23-metric-transfer.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metric-transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CPU-safe DNABERT-S and NCBI Datasets
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<3'
+          python -m pip install 'transformers==4.40.2' einops
+          python -m pip uninstall -y triton || true
+          curl -L --retry 3 -o /usr/local/bin/datasets \
+            'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'
+          chmod +x /usr/local/bin/datasets
+          python -m py_compile scripts/bridgebin_metric_transfer.py
+
+      - name: Build independent reference hard-negative curriculum
+        run: |
+          set -euo pipefail
+          root=benchmark/v23_metric_transfer/reference_groups
+          mkdir -p "$root"
+          fetch_group () {
+            label="$1"; taxon="$2"
+            mkdir -p "$root/$label/raw"
+            datasets download genome taxon "$taxon" --reference --include genome \
+              --no-progressbar --filename "/tmp/${label}.zip"
+            unzip -q "/tmp/${label}.zip" -d "$root/$label/raw"
+          }
+          fetch_group Escherichia_coli 'Escherichia coli'
+          fetch_group Salmonella_enterica 'Salmonella enterica'
+          fetch_group Klebsiella_pneumoniae 'Klebsiella pneumoniae'
+          fetch_group Enterobacter_cloacae 'Enterobacter cloacae'
+          fetch_group Citrobacter_freundii 'Citrobacter freundii'
+          fetch_group Shigella_flexneri 'Shigella flexneri'
+          fetch_group Serratia_marcescens 'Serratia marcescens'
+          fetch_group Yersinia_enterocolitica 'Yersinia enterocolitica'
+          fetch_group Proteus_mirabilis 'Proteus mirabilis'
+
+          python scripts/bridgebin_reference_hardneg_panel.py \
+            --input-dir "$root" --output-dir benchmark/v23_metric_transfer/train \
+            --fragment-bp 6000 --fragments-per-group 8 --samples 4 --seed 43
+
+      - name: Embed reference genomes and train raw/adapted heads
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          b=benchmark/v23_metric_transfer/train
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$b/contigs.fa" --output "$b/dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$b/dna_windows.tsv" --output "$b/features_raw.tsv"
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$b/truth.tsv" --output "$b/pairs.tsv" \
+            --anchors-per-genome 8 --positive-per-contig 5 \
+            --negative-genomes-per-contig 8 --negative-anchors-per-genome 2
+
+          python scripts/bridgebin_pair_head_bio.py train \
+            --features "$b/features_raw.tsv" --pairs "$b/pairs.tsv" \
+            --model-out "$b/pair_head_raw.json" --validation-fraction 0.25 \
+            --epochs 700 --negative-weight 5 --precision-target 0.99 --require-group-holdout \
+            | tee "$b/raw_head.metrics.jsonl"
+
+          python scripts/bridgebin_metric_transfer.py train \
+            --features "$b/features_raw.tsv" --pairs "$b/pairs.tsv" \
+            --model-out "$b/dna_adapter.pt" --validation-fraction 0.25 \
+            --rank 64 --residual-scale 0.35 --epochs 450 --learning-rate 0.003 \
+            --negative-margin 0.25 --negative-weight 4 --hard-negative-scale 6 \
+            --drift-weight 0.12 --require-group-holdout \
+            | tee "$b/metric_transfer.metrics.jsonl"
+          python scripts/bridgebin_metric_transfer.py transform \
+            --features "$b/features_raw.tsv" --model "$b/dna_adapter.pt" \
+            --output "$b/features_adapted.tsv"
+          python scripts/bridgebin_pair_head_bio.py train \
+            --features "$b/features_adapted.tsv" --pairs "$b/pairs.tsv" \
+            --model-out "$b/pair_head_adapted.json" --validation-fraction 0.25 \
+            --epochs 700 --negative-weight 5 --precision-target 0.99 --require-group-holdout \
+            | tee "$b/adapted_head.metrics.jsonl"
+
+      - name: Prepare independent Zymo 32-contig hard panel
+        run: |
+          set -euo pipefail
+          b=benchmark/v23_metric_transfer/zymo
+          mkdir -p "$b"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs >/dev/null
+          python scripts/bridgebin_zymo_reference_benchmark.py \
+            --reference-dir /tmp/zymo-species-refs --out "$b/full" \
+            --seed 43 --min-fragment 2200 --max-fragment 8500 --min-contig 1500
+          python - <<'PY'
+          import csv
+          from collections import defaultdict
+          from pathlib import Path
+          src=Path('benchmark/v23_metric_transfer/zymo/full')
+          out=Path('benchmark/v23_metric_transfer/zymo/panel'); out.mkdir(parents=True,exist_ok=True)
+          truth=list(csv.DictReader((src/'truth.tsv').open(),delimiter='\t'))
+          groups=defaultdict(list)
+          for row in truth:
+              if int(row['eligible']): groups[row['genome']].append(row)
+          chosen=[]
+          for genome,rs in sorted(groups.items()):
+              rs.sort(key=lambda x:(-int(x['length']),x['contig']))
+              chosen.extend(rs[:4])
+          ids={x['contig'] for x in chosen}
+          seq={}; name=None; chunks=[]
+          for raw in (src/'contigs.fa').read_text().splitlines():
+              if raw.startswith('>'):
+                  if name is not None: seq[name]=''.join(chunks)
+                  name=raw[1:].split()[0]; chunks=[]
+              else: chunks.append(raw.strip())
+          if name is not None: seq[name]=''.join(chunks)
+          with (out/'contigs.fa').open('w') as h:
+              for cid in sorted(ids):
+                  h.write(f'>{cid}\n'); s=seq[cid]
+                  for i in range(0,len(s),80): h.write(s[i:i+80]+'\n')
+          fields=['contig','genome','length','eligible','record','start','end']
+          with (out/'truth.tsv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=fields,delimiter='\t'); w.writeheader(); w.writerows(sorted(chosen,key=lambda x:x['contig']))
+          with (src/'coverage.tsv').open() as a,(out/'coverage.tsv').open('w',newline='') as z:
+              r=csv.reader(a,delimiter='\t'); w=csv.writer(z,delimiter='\t',lineterminator='\n'); w.writerow(next(r))
+              for row in r:
+                  if row and row[0] in ids: w.writerow(row)
+          print('zymo_panel',len(ids),'genomes',len(groups))
+          PY
+
+      - name: Zero-shot raw versus metric-transfer comparison
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+        run: |
+          set -euo pipefail
+          train=benchmark/v23_metric_transfer/train
+          z=benchmark/v23_metric_transfer/zymo/panel
+          python scripts/bridgebin_dna_embed.py \
+            --contigs "$z/contigs.fa" --output "$z/dna_windows.tsv" \
+            --model zhihan1996/DNABERT-S --device cpu \
+            --window-bp 1600 --stride-bp 1600 --min-window-bp 512 \
+            --max-windows-per-contig 2 --max-tokens 384 --batch-size 4
+          python scripts/bridgebin_bio_features.py \
+            --dna-embeddings "$z/dna_windows.tsv" --output "$z/features_raw.tsv"
+          python scripts/bridgebin_metric_transfer.py transform \
+            --features "$z/features_raw.tsv" --model "$train/dna_adapter.pt" \
+            --output "$z/features_adapted.tsv"
+          python scripts/bridgebin_make_pair_dataset.py \
+            --truth "$z/truth.tsv" --coverage "$z/coverage.tsv" --output "$z/pairs.tsv" \
+            --anchors-per-genome 4 --positive-per-contig 3 \
+            --negative-genomes-per-contig 7 --negative-anchors-per-genome 2
+
+          for mode in raw adapted; do
+            python scripts/bridgebin_pair_head_bio.py score \
+              --features "$z/features_${mode}.tsv" --pairs "$z/pairs.tsv" \
+              --model "$train/pair_head_${mode}.json" --output "$z/pair_scores_${mode}.tsv" \
+              --model-name "ref-hardneg-dnaberts-${mode}"
+            python - "$mode" <<'PY'
+          import json,sys
+          from pathlib import Path
+          mode=sys.argv[1]
+          model=json.loads(Path(f'benchmark/v23_metric_transfer/train/pair_head_{mode}.json').read_text())
+          tr=model['training']
+          Path(f'/tmp/v23_{mode}_thresholds').write_text(f"{tr['recommended_join_min_same']}\n{tr['recommended_split_max_same']}\n")
+          PY
+            join=$(sed -n '1p' "/tmp/v23_${mode}_thresholds")
+            split=$(sed -n '2p' "/tmp/v23_${mode}_thresholds")
+            python scripts/bridgebin_eval_pair_scores.py \
+              --pairs "$z/pairs.tsv" --scores "$z/pair_scores_${mode}.tsv" \
+              --join-threshold "$join" --split-threshold "$split" \
+              --focus Escherichia_coli,Salmonella_enterica \
+              --output "$z/${mode}.metrics.json"
+          done
+          echo '=== raw DNABERT-S ==='; cat "$z/raw.metrics.json"
+          echo '=== metric-transfer DNABERT-S ==='; cat "$z/adapted.metrics.json"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridgebin-v23-metric-transfer
+          path: benchmark/v23_metric_transfer
+          retention-days: 14
