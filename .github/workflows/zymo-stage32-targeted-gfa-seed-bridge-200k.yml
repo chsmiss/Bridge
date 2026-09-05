@@ -102,6 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p benchmark/stage32/highk_projection
           /usr/bin/time -v -o benchmark/stage32.time.txt \
             env PYTHONPATH=scripts python3 scripts/stage32_targeted_gfa_seed_bridge.py \
               --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
@@ -129,7 +130,6 @@ jobs:
               > "benchmark/stage32_${name}.stats.tsv"
           done
           PYTHONPATH=scripts python3 - <<'PY'
-          import json
           from pathlib import Path
           import stage23_guided_singleton_rescue as s23
           names=['consensus3','consensus2','paired1','any_graph']
