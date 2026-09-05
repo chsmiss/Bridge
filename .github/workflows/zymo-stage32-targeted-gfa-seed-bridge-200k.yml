@@ -1,0 +1,251 @@
+name: Zymo 200k Stage32 targeted GFA seed bridges
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - scripts/stage32_targeted_gfa_seed_bridge.py
+      - scripts/test_stage32_targeted_gfa_seed_bridge.py
+      - .github/workflows/zymo-stage32-targeted-gfa-seed-bridge-200k.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zymo-stage32-targeted-gfa-seed-bridge-200k
+  cancel-in-progress: true
+
+env:
+  PAIRS: '200000'
+  THREADS: '2'
+  STAGE31_RUN_ID: '33890704381'
+  STAGE31_ARTIFACT: zymo-stage31-multik-seed-bridge-200k
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          for attempt in 1 2 3; do
+            rm -rf /tmp/zymo-log
+            if python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 5
+          done
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+
+      - name: Reuse successful Stage31 graph artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.STAGE31_ARTIFACT }}
+          path: /tmp/stage31
+          github-token: ${{ github.token }}
+          repository: chsmiss/Bridge
+          run-id: ${{ env.STAGE31_RUN_ID }}
+
+      - name: Verify fixed inputs and unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          seed=/tmp/stage31/assemblies/stage24_pair2_gapfree.fasta
+          k31=/tmp/stage31/stage31/k31_discovery/assembly.gfa
+          strict=/tmp/stage31/stage31/k31_strict/primary_contigs.fasta
+          k55=/tmp/stage31/stage31/k55_validator/assembly.gfa
+          k77=/tmp/stage31/stage31/k77_validator/assembly.gfa
+          k99=/tmp/stage31/stage31/k99_validator/assembly.gfa
+          for path in "$seed" "$k31" "$strict" "$k55" "$k77" "$k99"; do
+            test -s "$path" || { echo "missing Stage31 input: $path"; find /tmp/stage31 -maxdepth 5 -type f | sort; exit 1; }
+          done
+          cp "$seed" benchmark/assemblies/stage24_pair2_gapfree.fasta
+          python3 scripts/fasta_stats.py "$seed" --json benchmark/stage24_pair2_gapfree.stats.json \
+            > benchmark/stage24_pair2_gapfree.stats.tsv
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('benchmark/stage24_pair2_gapfree.stats.json').read_text())
+          expected={'sequences':1482,'total_bp':3216810,'n50':9959}
+          got={k:s[k] for k in expected}
+          assert got==expected,(got,expected)
+          print('verified fixed gap-free Stage24 seed:',got)
+          PY
+          python3 -m py_compile \
+            scripts/stage32_targeted_gfa_seed_bridge.py \
+            scripts/test_stage32_targeted_gfa_seed_bridge.py
+          PYTHONPATH=scripts python3 scripts/test_stage32_targeted_gfa_seed_bridge.py
+
+      - name: Targeted seed-end graph search
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage32.time.txt \
+            env PYTHONPATH=scripts python3 scripts/stage32_targeted_gfa_seed_bridge.py \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --seed /tmp/stage31/assemblies/stage24_pair2_gapfree.fasta \
+              --k31-gfa /tmp/stage31/stage31/k31_discovery/assembly.gfa \
+              --strict-contigs /tmp/stage31/stage31/k31_strict/primary_contigs.fasta \
+              --highk-gfa /tmp/stage31/stage31/k55_validator/assembly.gfa \
+              --highk-gfa /tmp/stage31/stage31/k77_validator/assembly.gfa \
+              --highk-gfa /tmp/stage31/stage31/k99_validator/assembly.gfa \
+              --output benchmark/stage32 \
+              2>&1 | tee benchmark/stage32.log
+          for name in consensus3 consensus2 paired1 any_graph; do
+            cp "benchmark/stage32/$name/primary_contigs.fasta" \
+              "benchmark/assemblies/stage32_${name}.fasta"
+          done
+
+      - name: ACGT stats, 20k mass, and immutable seed k21 ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in consensus3 consensus2 paired1 any_graph; do
+            python3 scripts/fasta_stats.py "benchmark/assemblies/stage32_${name}.fasta" \
+              --json "benchmark/stage32_${name}.stats.json" \
+              > "benchmark/stage32_${name}.stats.tsv"
+          done
+          PYTHONPATH=scripts python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import stage23_guided_singleton_rescue as s23
+          names=['consensus3','consensus2','paired1','any_graph']
+          seed_path=Path('benchmark/assemblies/stage24_pair2_gapfree.fasta')
+          seed=s23.fasta_keyset(seed_path,21)
+          out=['assembly\tseed_k21\tretained\tlost\tretained_pct\tnew_k21\ttotal_k21\tbp_ge_20k\tcontigs_ge_20k']
+          for name in names:
+              path=Path(f'benchmark/assemblies/stage32_{name}.fasta')
+              lengths=[]
+              for _h,seq in s23.fasta_records(path):
+                  bad=set(seq)-set('ACGT')
+                  if bad: raise SystemExit(f'{name} contains {bad}')
+                  lengths.append(len(seq))
+              final=s23.fasta_keyset(path,21)
+              retained=len(seed&final); lost=len(seed-final); new=len(final-seed)
+              if lost: raise SystemExit(f'{name} lost {lost} immutable seed k21 keys')
+              bp20=sum(x for x in lengths if x>=20000)
+              n20=sum(x>=20000 for x in lengths)
+              out.append('\t'.join(map(str,[name,len(seed),retained,lost,100.0*retained/len(seed),new,len(final),bp20,n20])))
+          Path('benchmark/stage32_k21_retention.tsv').write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          PY
+
+      - name: MetaQUAST seed versus Stage32 variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/stage24_pair2_gapfree.fasta \
+            benchmark/assemblies/stage32_consensus3.fasta \
+            benchmark/assemblies/stage32_consensus2.fasta \
+            benchmark/assemblies/stage32_paired1.fasta \
+            benchmark/assemblies/stage32_any_graph.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Summarize first-principles 20k target
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv,json
+          from pathlib import Path
+          names=['consensus3','consensus2','paired1','any_graph']
+          with Path('benchmark/metaquast_summary.tsv').open() as h:
+              meta={r['Assembly']:r for r in csv.DictReader(h,delimiter='\t')}
+          with Path('benchmark/stage32_k21_retention.tsv').open() as h:
+              ret={r['assembly']:r for r in csv.DictReader(h,delimiter='\t')}
+          manifest=json.loads(Path('benchmark/stage32/stage32_manifest.json').read_text())
+          seed_stats=json.loads(Path('benchmark/stage24_pair2_gapfree.stats.json').read_text())
+          seed=meta['stage24_pair2_gapfree']
+          seed_gf=float(seed['Genome fraction (%)']); seed_dup=float(seed['Duplication ratio'])
+          seed_mis=int(float(seed['# misassemblies'])); seed_local=int(float(seed['# local misassemblies']))
+          rows=[]
+          for name in names:
+              m=meta[f'stage32_{name}']
+              s=json.loads(Path(f'benchmark/stage32_{name}.stats.json').read_text())
+              r=ret[name]; b=manifest['variants'][name]['bridge']; e=manifest['variants'][name]['extension']
+              row={
+                'assembly':name,'n50':s['n50'],'n50_delta':s['n50']-seed_stats['n50'],
+                'total_bp':s['total_bp'],'bp_ge_20k':int(r['bp_ge_20k']),'contigs_ge_20k':int(r['contigs_ge_20k']),
+                'gf':float(m['Genome fraction (%)']),'gf_delta':float(m['Genome fraction (%)'])-seed_gf,
+                'na50':float(m['NA50']),'dup':float(m['Duplication ratio']),
+                'misassemblies':int(float(m['# misassemblies'])),'local_misassemblies':int(float(m['# local misassemblies'])),
+                'seed_k21_lost':int(r['lost']),'new_k21':int(r['new_k21']),
+                'candidate_edges':int(b['candidate_edges']),'selected_bridges':int(b['selected_bridges']),
+                'max_chain_seeds':int(b['max_chain_seeds']),'extension_added_bp':int(e['added_bp']),
+              }
+              row['error_budget_ok']=(row['misassemblies']<=seed_mis+4 and row['local_misassemblies']<=seed_local+1 and row['dup']<=seed_dup+0.025)
+              row['safe_gain']=(row['seed_k21_lost']==0 and row['gf']>=seed_gf and row['n50']>=seed_stats['n50'] and row['error_budget_ok'])
+              row['target20k']=(row['safe_gain'] and row['n50']>=20000)
+              rows.append(row)
+          winners=[r for r in rows if r['target20k']]
+          safe=[r for r in rows if r['safe_gain']]
+          best_safe=max(safe,key=lambda r:(r['n50'],r['gf'],-r['misassemblies']),default=None)
+          summary={
+            'seed':{'n50':seed_stats['n50'],'gf':seed_gf,'dup':seed_dup,'misassemblies':seed_mis,'local_misassemblies':seed_local},
+            'anchor':manifest['anchor'],'contexts':manifest['contexts'],'discovery':manifest['discovery'],
+            'candidates':rows,'target20k_winners':winners,'best_safe':best_safe,
+          }
+          Path('benchmark/stage32_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          fields=list(rows[0])
+          with Path('benchmark/stage32_summary.tsv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=fields,delimiter='\t'); w.writeheader(); w.writerows(rows)
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          print('TARGET20K='+(','.join(r['assembly'] for r in winners) if winners else 'none'))
+          PY
+
+      - name: Save provenance
+        shell: bash
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nstage31_source_run\t%s\nexperiment\tStage32 targeted seed-end GFA traversal with raw/high-k/pair evidence\n' \
+            "$GITHUB_SHA" "$PAIRS" "$STAGE31_RUN_ID" > benchmark/benchmark_provenance.tsv
+
+      - name: Upload Stage32 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage32-targeted-gfa-seed-bridge-200k
+          path: |
+            benchmark/assemblies
+            benchmark/stage32_summary.json
+            benchmark/stage32_summary.tsv
+            benchmark/stage32_k21_retention.tsv
+            benchmark/metaquast_summary.json
+            benchmark/metaquast_summary.tsv
+            benchmark/stage32/stage32_manifest.json
+            benchmark/stage32/*/bridge_stats.json
+            benchmark/stage32/*/extension_stats.json
+            benchmark/stage32/*/bridges.tsv
+            benchmark/*.stats.json
+            benchmark/*.stats.tsv
+            benchmark/*.log
+            benchmark/*.time.txt
+            benchmark/benchmark_provenance.tsv
+            benchmark/subset_provenance.json
+          retention-days: 14
