@@ -1,0 +1,179 @@
+name: Zymo Stage27 Stage10 repro 200k
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage27-stage10-repro-200k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage27-stage10-repro-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install minimap2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minimap2
+
+      - name: Download deterministic Zymo 200k subset
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+
+      - name: Validate and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/na50_repeat_pipeline.py \
+            scripts/stage8_backbone_optimizer.py \
+            scripts/stage10_multik_rescue.py
+          cargo build --release
+
+      - name: Run raw k31 baseline matching Stage26 settings
+        run: |
+          set -euo pipefail
+          target/release/bridgeasm assemble \
+            -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/raw_k31 \
+            -k 31 \
+            --min-count 2 \
+            --mercy-max-kmers 16 \
+            --mercy-min-support 1 \
+            --mercy-min-quality 25 \
+            --min-read-support 2 \
+            --min-pair-support 2 \
+            --min-primary-support 5 \
+            --primary-dominance 0.75 \
+            --min-contig-length 200 \
+            --threads "$THREADS"
+          cp benchmark/raw_k31/primary_contigs.fasta benchmark/assemblies/raw_k31_stage26_baseline.fasta
+
+      - name: Reproduce historical Stage10 depth3 backbone
+        run: |
+          set -euo pipefail
+          python3 scripts/na50_repeat_pipeline.py \
+            --bridgeasm target/release/bridgeasm \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --output benchmark/bridge_repeat \
+            --threads "$THREADS" \
+            --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/bridge_repeat \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 3 \
+            --lookahead-max-branch 4
+          cp benchmark/bridge_repeat/bridge_backbone.fasta \
+             benchmark/assemblies/stage8_depth3_current.fasta
+
+      - name: Reproduce historical Stage10 residual multi-k rescue
+        run: |
+          set -euo pipefail
+          python3 scripts/stage10_multik_rescue.py \
+            --bridgeasm target/release/bridgeasm \
+            --pipeline-dir benchmark/bridge_repeat \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --threads "$THREADS" \
+            --ks 17,21,25,31
+          cp benchmark/bridge_repeat/stage10_multik_rescue/candidate_multik_strict/primary_contigs.fasta \
+             benchmark/assemblies/stage10_multik_strict_current.fasta
+          cp benchmark/bridge_repeat/stage10_multik_rescue/candidate_multik_balanced/primary_contigs.fasta \
+             benchmark/assemblies/stage10_multik_balanced_current.fasta
+
+      - name: Reproduce Stage10 depth4 probe
+        run: |
+          set -euo pipefail
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/bridge_repeat \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 4 \
+            --lookahead-max-branch 4
+          cp benchmark/bridge_repeat/bridge_backbone.fasta \
+             benchmark/assemblies/stage8_depth4_current.fasta
+
+      - name: Summarize continuity
+        run: |
+          set -euo pipefail
+          printf 'assembly\tn50\tlargest\tsequences\ttotal_bp\n' > benchmark/stage27_summary.tsv
+          for f in benchmark/assemblies/*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+            python3 - "$name" "benchmark/${name}.stats.json" >> benchmark/stage27_summary.tsv <<'PY'
+          import json, sys
+          name, path = sys.argv[1:]
+          s = json.load(open(path))
+          print(f"{name}\t{s['n50']}\t{s['largest']}\t{s['sequences']}\t{s['total_bp']}")
+          PY
+          done
+          cat benchmark/stage27_summary.tsv
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          rows = list(csv.DictReader(Path('benchmark/stage27_summary.tsv').open(), delimiter='\t'))
+          by = {r['assembly']: r for r in rows}
+          raw = int(by['raw_k31_stage26_baseline']['n50'])
+          d3 = int(by['stage8_depth3_current']['n50'])
+          d4 = int(by['stage8_depth4_current']['n50'])
+          strict = int(by['stage10_multik_strict_current']['n50'])
+          balanced = int(by['stage10_multik_balanced_current']['n50'])
+          hist = {'depth3': 10385, 'depth4': 10425, 'strict': 10123, 'balanced': 10123}
+          lines = [
+              '## Stage27 Stage10 reproduction', '',
+              f'- Current raw k31 baseline (Stage26-style, 200k): **{raw:,} bp**',
+              f'- Current Stage8 depth3: **{d3:,} bp** (historical Stage10: {hist["depth3"]:,})',
+              f'- Current Stage8 depth4: **{d4:,} bp** (historical Stage10: {hist["depth4"]:,})',
+              f'- Current Stage10 multi-k strict: **{strict:,} bp** (historical: {hist["strict"]:,})',
+              f'- Current Stage10 multi-k balanced: **{balanced:,} bp** (historical: {hist["balanced"]:,})',
+              '',
+              'This separates raw single-k primary-contig continuity from the Stage8/Stage10 optimized backbone.',
+              '', '```text', Path('benchmark/stage27_summary.tsv').read_text().rstrip(), '```', ''
+          ]
+          Path('benchmark/stage27_summary.md').write_text('\n'.join(lines))
+          print(Path('benchmark/stage27_summary.md').read_text())
+          PY
+          cat benchmark/stage27_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save provenance
+        run: |
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\ncomparison\traw_k31_vs_stage8_stage10_current_head\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage27-stage10-repro-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.md
+            benchmark/bridge_repeat/pipeline_manifest.json
+            benchmark/bridge_repeat/stage8_backbone_stats.json
+            benchmark/bridge_repeat/stage10_multik_rescue/stage10_stats.json
+          retention-days: 14

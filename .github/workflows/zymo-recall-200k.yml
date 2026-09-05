@@ -1,0 +1,168 @@
+name: Zymo 200k low-depth recall tuning
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-recall-200k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-recall-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Download frozen high-k stages and competitors
+        uses: actions/download-artifact@v4
+        with:
+          name: zymo-optimized-200k-three-way
+          path: /tmp/frozen
+          repository: chsmiss/Bridge
+          run-id: 33521053707
+          github-token: ${{ github.token }}
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+
+      - name: Build BridgeAsm
+        run: cargo build --release
+
+      - name: Run k21 recall variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_variant() {
+            name=$1
+            fraction=$2
+            quality=$3
+            out="benchmark/${name}"
+            mkdir -p "$out"
+            BRIDGEASM_SINGLETON_ISLAND_MIN_FRACTION="$fraction" \
+            BRIDGEASM_SINGLETON_ISLAND_MIN_QUALITY="$quality" \
+            BRIDGEASM_MATE_TERMINAL_MERCY_KMERS=96 \
+              /usr/bin/time -v -o "benchmark/${name}.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o "$out" -k 21 --min-count 2 \
+                --mercy-max-kmers 24 --mercy-min-support 1 --mercy-min-quality 25 \
+                --min-read-support 2 --min-pair-support 2 \
+                --min-primary-support 5 --primary-dominance 0.75 \
+                --threaded-path-cover --major-path-cover \
+                --path-cover-secondary-dominance 0.25 \
+                --min-contig-length 200 --threads "$THREADS"
+          }
+          run_variant recall55q30 0.55 30
+          run_variant recall50q30 0.50 30
+          run_variant recall50q35 0.50 35
+
+      - name: Reconcile each recall variant with frozen high-k stages
+        shell: bash
+        run: |
+          set -euo pipefail
+          frozen=/tmp/frozen/bridge_recovery
+          for name in recall55q30 recall50q30 recall50q35; do
+            python3 scripts/merge_fasta_unique.py \
+              "benchmark/${name}.union.fasta" \
+              "benchmark/${name}/primary_contigs.fasta" \
+              "benchmark/${name}/haplotigs.fasta" \
+              "$frozen/k31_resolve/primary_contigs.fasta" \
+              "$frozen/k31_resolve/haplotigs.fasta" \
+              "$frozen/k41_resolve/primary_contigs.fasta" \
+              "$frozen/k41_resolve/haplotigs.fasta" \
+              "$frozen/k55_resolve/primary_contigs.fasta" \
+              "$frozen/k55_resolve/haplotigs.fasta" \
+              --min-length 200
+            python3 scripts/filter_contained_fasta.py \
+              "benchmark/${name}.union.fasta" \
+              "benchmark/${name}.noncontained.fasta" \
+              --min-length 200 --seed-k 21 --window 12 --candidate-minimizers 16 \
+              --stats-json "benchmark/${name}.containment.json"
+            python3 scripts/stitch_exact_overlaps.py \
+              "benchmark/assemblies/${name}.fasta" \
+              "benchmark/${name}.noncontained.fasta" \
+              --min-overlap 31 --overlap-margin 10 --seed-length 31 \
+              --max-seed-occurrences 64 --min-length 200 \
+              | tee "benchmark/${name}.stitch.log"
+            python3 scripts/fasta_stats.py "benchmark/assemblies/${name}.fasta" \
+              --json "benchmark/${name}.stats.json" > "benchmark/${name}.stats.tsv"
+          done
+          cp /tmp/frozen/assemblies/megahit.fasta benchmark/assemblies/megahit.fasta
+          cp /tmp/frozen/assemblies/metaspades.fasta benchmark/assemblies/metaspades.fasta
+          cp /mnt/data/none /tmp/does-not-exist 2>/dev/null || true
+
+      - name: Add frozen Bridge 31/10 candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: zymo-reconcile-200k
+          path: /tmp/reconcile
+          repository: chsmiss/Bridge
+          run-id: 33522630817
+          github-token: ${{ github.token }}
+
+      - name: Run MetaQUAST
+        run: |
+          cp /tmp/reconcile/assemblies/bridge_full_o31m10.fasta \
+            benchmark/assemblies/bridge_recall60q30.fasta
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_recall60q30.fasta \
+            benchmark/assemblies/recall55q30.fasta \
+            benchmark/assemblies/recall50q30.fasta \
+            benchmark/assemblies/recall50q35.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          cp benchmark/metaquast/combined_reference/report.tsv benchmark/recall_report.tsv
+
+      - name: Save provenance
+        run: |
+          printf 'source_high_k_run\t33521053707\nsource_reconcile_run\t33522630817\nread_pairs\t200000\nthreads\t2\n' \
+            > benchmark/recall_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-recall-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.log
+            benchmark/*.time.txt
+            benchmark/recall55q30/run_profile.json
+            benchmark/recall50q30/run_profile.json
+            benchmark/recall50q35/run_profile.json
+            benchmark/metaquast/combined_reference/report.tsv
+          retention-days: 14

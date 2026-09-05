@@ -1,0 +1,374 @@
+name: Zymo 50k oracle split and adaptive-k
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - src/**
+      - scripts/oracle_partition_pairs.py
+      - scripts/adaptive_k_local.py
+      - scripts/merge_fasta_unique.py
+      - scripts/filter_contained_fasta.py
+      - .github/workflows/zymo-oracle-adaptive-50k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-oracle-adaptive-50k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: "50000"
+      SEED: "43"
+      WINDOWS: "5"
+      TOTAL_SPOTS: "23916276"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install assemblers and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit spades sra-toolkit curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+          {
+            echo "fastq-dump: $(fastq-dump --version 2>&1 | tail -n 1)"
+            echo "minimap2: $(minimap2 --version 2>&1 | head -n 1)"
+            echo "megahit: $(megahit --version 2>&1 | head -n 1)"
+            echo "metaspades: $(metaspades.py --version 2>&1 | head -n 1)"
+            echo "metaquast: $(python3 /tmp/quast-5.3.0/metaquast.py --version 2>&1 | head -n 1)"
+            echo "rustc: $(rustc --version)"
+          } | tee /tmp/tool_versions.txt
+
+      - name: Sample random 50k pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zymo benchmark/assemblies benchmark/times
+          python3 - <<'PY'
+          import os, random
+          total = int(os.environ['TOTAL_SPOTS'])
+          pairs = int(os.environ['PAIRS'])
+          windows = int(os.environ['WINDOWS'])
+          rng = random.Random(int(os.environ['SEED']))
+          sizes = [pairs // windows] * windows
+          for i in range(pairs % windows):
+              sizes[i] += 1
+          chosen = []
+          for size in sizes:
+              for _ in range(100000):
+                  start = rng.randint(1, total - size + 1)
+                  end = start + size - 1
+                  if all(end < old_start or start > old_end for old_start, old_end in chosen):
+                      chosen.append((start, end))
+                      break
+              else:
+                  raise SystemExit('failed to choose non-overlapping random windows')
+          chosen.sort()
+          with open('/tmp/zymo/ranges.tsv', 'w') as handle:
+              handle.write('window\tstart_spot\tend_spot\tpairs\n')
+              for index, (start, end) in enumerate(chosen, 1):
+                  handle.write(f'{index}\t{start}\t{end}\t{end-start+1}\n')
+          PY
+
+          : > /tmp/zymo/R1.fastq.gz
+          : > /tmp/zymo/R2.fastq.gz
+          tail -n +2 /tmp/zymo/ranges.tsv | while IFS=$'\t' read -r idx start end count; do
+            part="/tmp/zymo/part-${idx}"
+            mkdir -p "$part"
+            (
+              cd "$part"
+              fastq-dump ERR2935805 -N "$start" -X "$end" --split-files --skip-technical --gzip
+            )
+            cat "$part/ERR2935805_1.fastq.gz" >> /tmp/zymo/R1.fastq.gz
+            cat "$part/ERR2935805_2.fastq.gz" >> /tmp/zymo/R2.fastq.gz
+          done
+          r1=$(gzip -cd /tmp/zymo/R1.fastq.gz | awk 'END {print NR/4}')
+          r2=$(gzip -cd /tmp/zymo/R2.fastq.gz | awk 'END {print NR/4}')
+          echo "sampled R1=$r1 R2=$r2"
+          test "$r1" -eq "$PAIRS"
+          test "$r2" -eq "$PAIRS"
+
+      - name: Download and prefix Zymo reference genomes
+        run: |
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('/tmp/zymo-refs')
+          files = sorted(
+              path for path in root.rglob('*')
+              if path.is_file() and path.suffix.lower() in {'.fa', '.fna', '.fasta'}
+          )
+          if not files:
+              raise SystemExit('no reference FASTA files found')
+          manifest = Path('/tmp/reference_manifest.tsv')
+          output = Path('/tmp/zymo-references.fasta')
+          with manifest.open('w') as mf, output.open('w') as out:
+              mf.write('bin\tpath\n')
+              for index, path in enumerate(files, 1):
+                  stem = re.sub(r'[^A-Za-z0-9_.-]+', '_', path.stem).strip('._') or 'reference'
+                  label = f'{index:02d}_{stem}'
+                  mf.write(f'{label}\t{path}\n')
+                  with path.open() as handle:
+                      for raw in handle:
+                          if raw.startswith('>'):
+                              out.write(f'>{label}|{raw[1:].strip()}\n')
+                          else:
+                              out.write(raw)
+          print(manifest.read_text())
+          PY
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build BridgeAsm
+        run: cargo build --release
+
+      - name: BridgeAsm fixed-k baselines
+        run: |
+          for k in 21 31; do
+            out="benchmark/bridge_k${k}"
+            mkdir -p "$out"
+            mercy=16
+            if [ "$k" -eq 21 ]; then mercy=24; fi
+            /usr/bin/time -v -o "benchmark/times/bridge_k${k}.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+                -o "$out" -k "$k" \
+                --min-count 2 --mercy-max-kmers "$mercy" \
+                --mercy-min-support 1 --mercy-min-quality 25 \
+                --min-read-support 2 --min-pair-support 2 \
+                --min-primary-support 5 --primary-dominance 0.75 \
+                --min-contig-length 200 --threads 2
+            cp "$out/primary_contigs.fasta" "benchmark/assemblies/bridge_k${k}.fasta"
+          done
+
+      - name: Local adaptive-k experiment
+        run: |
+          mkdir -p benchmark/adaptive
+          /usr/bin/time -v -o benchmark/times/adaptive_local.time.txt \
+            python3 scripts/adaptive_k_local.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo/R1.fastq.gz --read2 /tmp/zymo/R2.fastq.gz \
+              --base-dir benchmark/bridge_k21 \
+              --output benchmark/adaptive \
+              --base-k 21 --candidate-k 25,31,41 \
+              --max-neighborhoods 6 --radius 2 --max-nodes 80 \
+              --min-pairs 80 --min-candidate-base-fraction 0.85 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/adaptive/adaptive_contigs.fasta benchmark/assemblies/bridge_adaptive.fasta
+
+      - name: Reference-oracle pair partition
+        run: |
+          mkdir -p benchmark/oracle
+          minimap2 -x sr -N 10 -t 2 /tmp/zymo-references.fasta /tmp/zymo/R1.fastq.gz \
+            > benchmark/oracle/R1.paf
+          minimap2 -x sr -N 10 -t 2 /tmp/zymo-references.fasta /tmp/zymo/R2.fastq.gz \
+            > benchmark/oracle/R2.paf
+          python3 scripts/oracle_partition_pairs.py \
+            --paf1 benchmark/oracle/R1.paf --paf2 benchmark/oracle/R2.paf \
+            --read1 /tmp/zymo/R1.fastq.gz --read2 /tmp/zymo/R2.fastq.gz \
+            --output benchmark/oracle/partition \
+            --min-mapq 20 --min-aligned-fraction 0.70 --score-margin 10
+
+      - name: Assemble oracle bins at fixed k21
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/oracle/bin_assemblies benchmark/oracle/bin_times
+          : > benchmark/oracle/binned_fastas.txt
+          : > benchmark/oracle/shared_fastas.txt
+          index=0
+          while IFS=$'\t' read -r bin pairs r1 r2; do
+            [ "$bin" = "bin" ] && continue
+            [ "$pairs" -lt 20 ] && continue
+            index=$((index + 1))
+            safe=$(printf '%s' "$bin" | tr -c 'A-Za-z0-9_.-' '_')
+            out="benchmark/oracle/bin_assemblies/${index}_${safe}"
+            mkdir -p "$out"
+            /usr/bin/time -v -o "benchmark/oracle/bin_times/${index}_${safe}.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 "$r1" -2 "$r2" -o "$out" -k 21 \
+                --min-count 2 --mercy-max-kmers 24 \
+                --mercy-min-support 1 --mercy-min-quality 25 \
+                --min-read-support 2 --min-pair-support 2 \
+                --min-primary-support 5 --primary-dominance 0.75 \
+                --min-contig-length 200 --threads 2
+            if [ -s "$out/primary_contigs.fasta" ]; then
+              if [ "$bin" = "shared" ]; then
+                printf '%s\n' "$out/primary_contigs.fasta" >> benchmark/oracle/shared_fastas.txt
+              else
+                printf '%s\n' "$out/primary_contigs.fasta" >> benchmark/oracle/binned_fastas.txt
+              fi
+            fi
+          done < benchmark/oracle/partition/manifest.tsv
+
+          test -s benchmark/oracle/binned_fastas.txt
+          mapfile -t binned < benchmark/oracle/binned_fastas.txt
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/oracle/binned_exact.fasta "${binned[@]}" --min-length 200
+          python3 scripts/filter_contained_fasta.py \
+            benchmark/oracle/binned_exact.fasta benchmark/oracle/binned_contigs.fasta \
+            --min-length 200 --stats-json benchmark/oracle/binned_containment.json
+          cp benchmark/oracle/binned_contigs.fasta benchmark/assemblies/bridge_oracle_binned.fasta
+
+          all=("${binned[@]}")
+          if [ -s benchmark/oracle/shared_fastas.txt ]; then
+            mapfile -t shared < benchmark/oracle/shared_fastas.txt
+            all+=("${shared[@]}")
+          fi
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/oracle/soft_exact.fasta "${all[@]}" --min-length 200
+          python3 scripts/filter_contained_fasta.py \
+            benchmark/oracle/soft_exact.fasta benchmark/oracle/soft_contigs.fasta \
+            --min-length 200 --stats-json benchmark/oracle/soft_containment.json
+          cp benchmark/oracle/soft_contigs.fasta benchmark/assemblies/bridge_oracle_soft.fasta
+
+      - name: MEGAHIT default and meta-sensitive
+        run: |
+          /usr/bin/time -v -o benchmark/times/megahit.time.txt \
+            megahit -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+
+          /usr/bin/time -v -o benchmark/times/megahit_sensitive.time.txt \
+            megahit -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/megahit_sensitive --min-contig-len 200 -t 2 \
+              --presets meta-sensitive
+          cp benchmark/megahit_sensitive/final.contigs.fa benchmark/assemblies/megahit_sensitive.fasta
+
+      - name: metaSPAdes
+        run: |
+          /usr/bin/time -v -o benchmark/times/metaspades.time.txt \
+            metaspades.py -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/metaspades -t 2 -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
+
+      - name: MetaQUAST all strategies
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_k21.fasta \
+            benchmark/assemblies/bridge_k31.fasta \
+            benchmark/assemblies/bridge_adaptive.fasta \
+            benchmark/assemblies/bridge_oracle_binned.fasta \
+            benchmark/assemblies/bridge_oracle_soft.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/megahit_sensitive.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+
+      - name: Summarize quality, runtime, and memory
+        run: |
+          python3 - <<'PY'
+          import csv
+          import re
+          from pathlib import Path
+
+          report = Path('benchmark/metaquast/combined_reference/report.tsv')
+          with report.open() as handle:
+              reader = csv.reader(handle, delimiter='\t')
+              header = next(reader)
+              assemblies = header[1:]
+              rows = {row[0]: row[1:] for row in reader if row}
+
+          metrics = [
+              'Genome fraction (%)', 'N50', 'NA50', '# contigs', 'Total length',
+              'Largest contig', '# misassemblies', 'Duplication ratio', 'Total aligned length'
+          ]
+
+          def wall_seconds(text):
+              match = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text)
+              if not match:
+                  return 0.0
+              parts = match.group(1).split(':')
+              if len(parts) == 2:
+                  return float(parts[0]) * 60 + float(parts[1])
+              return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+
+          def resources(paths):
+              wall = 0.0
+              peak = 0
+              for path in paths:
+                  path = Path(path)
+                  if not path.exists():
+                      continue
+                  text = path.read_text()
+                  wall += wall_seconds(text)
+                  match = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text)
+                  if match:
+                      peak = max(peak, int(match.group(1)))
+              return wall, peak
+
+          oracle_times = sorted(Path('benchmark/oracle/bin_times').glob('*.time.txt'))
+          shared_times = []
+          manifest = Path('benchmark/oracle/partition/manifest.tsv')
+          if manifest.exists():
+              shared_pairs = 0
+              for line in manifest.read_text().splitlines()[1:]:
+                  fields = line.split('\t')
+                  if fields and fields[0] == 'shared':
+                      shared_pairs = int(fields[1])
+              # The shared assembly is one of the sequential oracle bin runs; keep the
+              # binned-only estimate conservative by reporting all oracle time for both.
+              # Detailed per-bin files remain in the artifact.
+
+          mapping = {
+              'bridge_k21': [Path('benchmark/times/bridge_k21.time.txt')],
+              'bridge_k31': [Path('benchmark/times/bridge_k31.time.txt')],
+              'bridge_adaptive': [Path('benchmark/times/bridge_k21.time.txt'), Path('benchmark/times/adaptive_local.time.txt')],
+              'bridge_oracle_binned': oracle_times,
+              'bridge_oracle_soft': oracle_times,
+              'megahit': [Path('benchmark/times/megahit.time.txt')],
+              'megahit_sensitive': [Path('benchmark/times/megahit_sensitive.time.txt')],
+              'metaspades': [Path('benchmark/times/metaspades.time.txt')],
+          }
+
+          output = Path('benchmark/summary.tsv')
+          with output.open('w') as handle:
+              handle.write('assembly\t' + '\t'.join(metrics) + '\twall_seconds\tpeak_rss_kb\tpeak_rss_mib\n')
+              for index, name in enumerate(assemblies):
+                  wall, peak = resources(mapping.get(name, []))
+                  values = [rows.get(metric, ['NA'] * len(assemblies))[index] for metric in metrics]
+                  handle.write(
+                      name + '\t' + '\t'.join(values) +
+                      f'\t{wall:.3f}\t{peak or "NA"}\t{peak / 1024:.1f}\n'
+                  )
+          print(output.read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo/ranges.tsv benchmark/random_ranges.tsv
+          cp /tmp/reference_manifest.tsv benchmark/reference_manifest.tsv
+          cp /tmp/tool_versions.txt benchmark/tool_versions.txt
+          {
+            printf 'commit\t%s\n' "$GITHUB_SHA"
+            printf 'run\tERR2935805\n'
+            printf 'sampling\tseeded_nonoverlapping_random_windows\n'
+            printf 'seed\t%s\n' "$SEED"
+            printf 'read_pairs\t%s\n' "$PAIRS"
+            printf 'windows\t%s\n' "$WINDOWS"
+            printf 'threads\t2\n'
+            printf 'reference\tZymoBIOMICS.STD.refseq.v2\n'
+            printf 'oracle_definition\tper-reference-file minimap2 unique pair assignment plus shared fallback\n'
+            printf 'adaptive_definition\tbranch-neighborhood read routing plus local k=21,25,31,41 selection\n'
+          } > benchmark/provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-oracle-adaptive-50k
+          path: benchmark
+          retention-days: 14

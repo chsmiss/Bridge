@@ -1,0 +1,131 @@
+name: Biological Brain protein-bridge smoke
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - biological_brain/**
+      - src/bin/bridgeasm-evidence-path.rs
+      - tests/test_biological_brain.py
+      - tests/make_plass_bridge_fixture.py
+      - tests/check_plass_bridge_fixture.py
+      - .github/workflows/biological-brain-smoke.yml
+  pull_request:
+    paths:
+      - biological_brain/**
+      - src/bin/bridgeasm-evidence-path.rs
+      - tests/test_biological_brain.py
+      - tests/make_plass_bridge_fixture.py
+      - tests/check_plass_bridge_fixture.py
+      - .github/workflows/biological-brain-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Python syntax
+        run: |
+          python -m py_compile \
+            biological_brain/dedup_proteins.py \
+            biological_brain/protein_bridge_evidence.py \
+            biological_brain/kmer_junction_lm.py \
+            biological_brain/esm_breakpoint_score.py \
+            tests/test_biological_brain.py \
+            tests/make_plass_bridge_fixture.py \
+            tests/check_plass_bridge_fixture.py
+      - name: Compile evidence path
+        run: cargo check --bin bridgeasm-evidence-path
+      - name: Protein branch-selection tests
+        run: python tests/test_biological_brain.py
+
+  real-plass-integration:
+    needs: deterministic-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bridge-plass
+          create-args: >-
+            -c conda-forge
+            -c bioconda
+            python=3.11
+            plass
+          cache-environment: true
+          init-shell: bash
+      - name: Generate translated-assembly fixture
+        run: python tests/make_plass_bridge_fixture.py --output fixture
+      - name: Assemble and collapse technical PLASS protein copies
+        run: |
+          mkdir -p fixture/plass_tmp
+          plass assemble \
+            fixture/reads.fasta \
+            fixture/plass_proteins.faa \
+            fixture/plass_tmp \
+            --threads 2
+          test -s fixture/plass_proteins.faa
+          echo "Plass proteins: $(grep -c '^>' fixture/plass_proteins.faa)"
+          python biological_brain/dedup_proteins.py \
+            fixture/plass_proteins.faa \
+            fixture/plass_proteins.dedup.faa \
+            --collapse-contained \
+            --mapping fixture/plass_proteins.dedup.tsv \
+            --json fixture/plass_proteins.dedup.json
+          test -s fixture/plass_proteins.dedup.faa
+      - name: Convert protein assembly into edge evidence
+        run: |
+          python biological_brain/protein_bridge_evidence.py \
+            --gfa fixture/graph.gfa \
+            --proteins fixture/plass_proteins.dedup.faa \
+            --output fixture/protein_evidence.tsv \
+            --junction-nt 450
+          python biological_brain/kmer_junction_lm.py \
+            --gfa fixture/graph.gfa \
+            --output fixture/dna_lm.tsv
+      - name: Select nucleotide path with fused evidence
+        run: |
+          cargo run --quiet --bin bridgeasm-evidence-path -- \
+            --gfa fixture/graph.gfa \
+            --edge-evidence fixture/protein_evidence.tsv \
+            --dna-lm-scores fixture/dna_lm.tsv \
+            --output fixture/evidence_contigs.fasta \
+            --report fixture/evidence_path_report.tsv \
+            --mode balanced \
+            --min-length 100
+      - name: Verify true branch and reject decoy
+        run: |
+          python tests/check_plass_bridge_fixture.py \
+            --expected fixture/expected_dna.fasta \
+            --evidence fixture/protein_evidence.tsv \
+            --report fixture/evidence_path_report.tsv \
+            --contigs fixture/evidence_contigs.fasta \
+            --plass-proteins fixture/plass_proteins.dedup.faa
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: biological-brain-plass-smoke
+          path: |
+            fixture/manifest.json
+            fixture/reference_protein.faa
+            fixture/plass_proteins.faa
+            fixture/plass_proteins.dedup.faa
+            fixture/plass_proteins.dedup.tsv
+            fixture/plass_proteins.dedup.json
+            fixture/protein_evidence.tsv
+            fixture/dna_lm.tsv
+            fixture/evidence_path_report.tsv
+            fixture/evidence_contigs.fasta
+          if-no-files-found: warn

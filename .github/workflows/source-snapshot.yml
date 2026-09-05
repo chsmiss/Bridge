@@ -1,0 +1,29 @@
+name: Source snapshot
+
+# Snapshot revision: greedy path-cover development.
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/source-snapshot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridgeasm-source-snapshot
+          path: |
+            Cargo.toml
+            Cargo.lock
+            src
+            tests
+            scripts
+          retention-days: 1

@@ -1,0 +1,237 @@
+name: Zymo 200k Stage23 guided singleton rescue
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage23-guided-singleton-200k.yml
+      - scripts/stage23_guided_singleton_rescue.py
+      - scripts/test_stage23_guided_singleton_rescue.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage23-guided-singleton-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate Stage23 and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/stage23_guided_singleton_rescue.py \
+            scripts/test_stage23_guided_singleton_rescue.py \
+            scripts/stage17_breakpoint_oracle.py
+          PYTHONPATH=scripts python3 scripts/test_stage23_guided_singleton_rescue.py
+          cargo build --release
+
+      - name: Build fixed Stage8 and Stage10
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/current \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/current \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 3 \
+            --lookahead-max-branch 4
+          /usr/bin/time -v -o benchmark/stage10.time.txt \
+            python3 scripts/stage10_multik_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" --ks 17,21,25,31
+          cp benchmark/current/stage10_multik_rescue/candidate_multik_strict/primary_contigs.fasta \
+             benchmark/assemblies/bridge_stage10.fasta
+
+      - name: Run Stage23 guided singleton rescue
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage23.time.txt \
+            python3 scripts/stage23_guided_singleton_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" \
+              --singleton-quality 30 \
+              --min-distinct-singleton-fragments 2
+          cp benchmark/current/stage23_guided_singleton/guided_k31_primary.fasta \
+             benchmark/assemblies/bridge_stage23_guided_k31.fasta
+          cp benchmark/current/stage23_guided_singleton/candidate_guided_singleton/primary_contigs.fasta \
+             benchmark/assemblies/bridge_stage23_final.fasta
+          cp benchmark/current/stage23_guided_singleton/stage23_stats.json benchmark/stage23_stats.json
+
+      - name: Compare breakpoint retention on identical Stage10 gaps
+        run: |
+          set -euo pipefail
+          minimap2 -x asm5 --secondary=yes /tmp/zymo-references.fasta \
+            benchmark/assemblies/bridge_stage10.fasta > benchmark/stage10_vs_reference.paf
+          python3 scripts/stage17_breakpoint_oracle.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --paf benchmark/stage10_vs_reference.paf \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --k21-gfa benchmark/current/current_pipeline/iterative/k21_recall/assembly.gfa \
+            --k31-gfa benchmark/current/current_pipeline/iterative/k31_resolve/assembly.gfa \
+            --baseline benchmark/assemblies/bridge_stage10.fasta \
+            --output-prefix benchmark/oracle_current
+          python3 scripts/stage17_breakpoint_oracle.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --paf benchmark/stage10_vs_reference.paf \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --k21-gfa benchmark/current/current_pipeline/iterative/k21_recall/assembly.gfa \
+            --k31-gfa benchmark/current/stage23_guided_singleton/guided_k31/assembly.gfa \
+            --baseline benchmark/assemblies/bridge_stage23_final.fasta \
+            --output-prefix benchmark/oracle_stage23
+          python3 - <<'PY'
+          import csv
+          from collections import Counter
+          from pathlib import Path
+          def load(path):
+              with Path(path).open() as h:
+                  return {(r['species'],r['target'],r['start'],r['end']):r for r in csv.DictReader(h,delimiter='\t')}
+          cur=load('benchmark/oracle_current_gaps.tsv')
+          new=load('benchmark/oracle_stage23_gaps.tsv')
+          keys=[k for k in cur if k[0]=='Pseudomonas_aeruginosa' and cur[k]['category']=='k21_to_k31_propagation_loss' and k in new]
+          bases=sum(int(cur[k]['gap_bases']) for k in keys)
+          metrics=['raw31_fraction','k21_graph_fraction','k31_graph_fraction','stage10_fraction']
+          out=Path('benchmark/stage23_pseudomonas_retention.tsv')
+          with out.open('w') as h:
+              h.write('metric\tcurrent\tstage23\tdelta\n')
+              for metric in metrics:
+                  def avg(rows):
+                      return sum(float(rows[k][metric])*int(cur[k]['gap_bases']) for k in keys)/max(1,bases)
+                  a=avg(cur); b=avg(new)
+                  h.write(f'{metric}\t{a:.6f}\t{b:.6f}\t{b-a:+.6f}\n')
+              for label,rows in [('current',cur),('stage23',new)]:
+                  c=Counter()
+                  for key in keys:
+                      c[rows[key]['category']]+=int(cur[key]['gap_bases'])
+                  for category,value in sorted(c.items()):
+                      h.write(f'category_bases:{category}:{label}\t{value}\t{value}\t+0\n')
+          print(out.read_text())
+          PY
+
+      - name: FASTA stats
+        run: |
+          for f in benchmark/assemblies/*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run combined-reference MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_stage10.fasta \
+            benchmark/assemblies/bridge_stage23_guided_k31.fasta \
+            benchmark/assemblies/bridge_stage23_final.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Run per-bacterium QUAST
+        run: |
+          set -euo pipefail
+          assemblies=(benchmark/assemblies/bridge_stage10.fasta benchmark/assemblies/bridge_stage23_guided_k31.fasta benchmark/assemblies/bridge_stage23_final.fasta)
+          for ref in /tmp/zymo-species-refs/{Bacillus_subtilis,Enterococcus_faecalis,Escherichia_coli,Lactobacillus_fermentum,Listeria_monocytogenes,Pseudomonas_aeruginosa,Salmonella_enterica,Staphylococcus_aureus}.fasta; do
+            species="$(basename "$ref" .fasta)"
+            python3 /tmp/quast-5.3.0/quast.py "${assemblies[@]}" -r "$ref" \
+              -o "benchmark/species_quast/$species" --threads "$THREADS" --min-contig 200 --no-plots
+          done
+          python3 scripts/summarize_species_quast.py benchmark/species_quast \
+            --json benchmark/species_summary.json | tee benchmark/species_summary.tsv
+
+      - name: Compare Stage23 without metric gates
+        run: |
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          def rows(path):
+              with Path(path).open() as h: return list(csv.DictReader(h,delimiter='\t'))
+          meta={r['Assembly']:r for r in rows('benchmark/metaquast_summary.tsv')}
+          species={r['assembly']:r for r in rows('benchmark/species_summary.tsv')}
+          base='bridge_stage10'; bg=float(species[base]['bacteria_mean_gf']); bp=float(species[base]['pseudomonas_gf']); bn=float(meta[base]['NA50'])
+          names=['bridge_stage10','bridge_stage23_guided_k31','bridge_stage23_final']
+          p=Path('benchmark/stage23_comparison.tsv')
+          with p.open('w') as out:
+              out.write('assembly\tmean_gf\tdelta_mean_gf\tpseudomonas_gf\tdelta_pseudomonas\tcombined_gf\tna50\tdelta_na50\tdup\tmisassemblies\tlocal_misassemblies\n')
+              for name in names:
+                  m=meta[name]; sp=species[name]
+                  gf=float(sp['bacteria_mean_gf']); ps=float(sp['pseudomonas_gf']); na=float(m['NA50'])
+                  out.write(f'{name}\t{gf:.4f}\t{gf-bg:+.4f}\t{ps:.4f}\t{ps-bp:+.4f}\t{m["Genome fraction (%)"]}\t{na:.1f}\t{na-bn:+.1f}\t{float(m["Duplication ratio"]):.4f}\t{int(float(m["# misassemblies"]))}\t{int(float(m["# local misassemblies"]))}\n')
+          print(p.read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nmechanism\tk21_unitig_guided_raw_edge_constrained_q30_singletons\nselection_policy\troot_cause_no_metric_targets\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage23-guided-singleton-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/*.paf
+            benchmark/current/stage23_guided_singleton/stage23_stats.json
+            benchmark/current/stage23_guided_singleton/guided_segments.fasta
+            benchmark/current/stage23_guided_singleton/guided_additions.fasta

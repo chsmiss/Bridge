@@ -1,0 +1,182 @@
+name: Zymo optimized 200k three-way benchmark
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-optimized-200k.yml
+      - scripts/bridge_recovery_pipeline.py
+      - scripts/merge_fasta_unique.py
+      - scripts/filter_contained_fasta.py
+      - scripts/stitch_exact_overlaps.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-optimized-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install assemblers and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit spades curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Validate and build BridgeAsm
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/bridge_recovery_pipeline.py \
+            scripts/merge_fasta_unique.py \
+            scripts/filter_contained_fasta.py \
+            scripts/stitch_exact_overlaps.py
+          cargo build --release
+
+      - name: Run optimized Bridge recovery pipeline
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/bridge_recovery.time.txt \
+            python3 scripts/bridge_recovery_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/bridge_recovery \
+              --threads "$THREADS" \
+              --singleton-fraction 0.50 \
+              --singleton-quality 35 \
+              --mate-terminal-mercy 96 \
+              --stitch-min-overlap 31 \
+              --stitch-overlap-margin 10
+          cp benchmark/bridge_recovery/primary_contigs.fasta \
+            benchmark/assemblies/bridge_recovery.fasta
+          python3 scripts/fasta_stats.py benchmark/bridge_recovery/primary_contigs.fasta \
+            --json benchmark/bridge_recovery.stats.json \
+            | tee benchmark/bridge_recovery.stats.tsv
+
+      - name: Run MEGAHIT
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit \
+              --min-contig-len 200 -t "$THREADS"
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json \
+            | tee benchmark/megahit.stats.tsv
+
+      - name: Run metaSPAdes
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/metaspades.time.txt \
+            metaspades.py \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/metaspades \
+              -t "$THREADS" -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
+          python3 scripts/fasta_stats.py benchmark/metaspades/contigs.fasta \
+            --json benchmark/metaspades.stats.json \
+            | tee benchmark/metaspades.stats.tsv
+
+      - name: Run MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_recovery.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast \
+            --threads "$THREADS" --min-contig 200 --no-plots
+          find benchmark/metaquast -name report.tsv -print > benchmark/metaquast_report_paths.txt
+
+      - name: Summarize runtime and provenance
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          def time_resources(path):
+              text = Path(path).read_text()
+              wall_text = re.search(
+                  r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text
+              ).group(1)
+              parts = [float(x) for x in wall_text.split(':')]
+              wall = parts[-1]
+              if len(parts) >= 2:
+                  wall += 60 * parts[-2]
+              if len(parts) >= 3:
+                  wall += 3600 * parts[-3]
+              rss = int(re.search(
+                  r'Maximum resident set size \(kbytes\):\s*(\d+)', text
+              ).group(1)) / 1024.0
+              return wall, rss
+
+          manifest = json.loads(Path('benchmark/bridge_recovery/pipeline_manifest.json').read_text())
+          rows = [
+              ('bridge_recovery', manifest['wall_seconds'], manifest['peak_child_rss_mib']),
+          ]
+          for name in ('megahit', 'metaspades'):
+              wall, rss = time_resources(f'benchmark/{name}.time.txt')
+              rows.append((name, wall, rss))
+          out = ['assembly\twall_seconds\tpeak_rss_mib']
+          out += [f'{name}\t{wall:.3f}\t{rss:.1f}' for name, wall, rss in rows]
+          Path('benchmark/runtime_summary.tsv').write_text('\n'.join(out) + '\n')
+          print('\n'.join(out))
+          PY
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-optimized-200k-three-way
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/bridge_recovery/pipeline_manifest.json
+            benchmark/bridge_recovery/containment_stats.json
+            benchmark/bridge_recovery/k21_recall/run_profile.json
+            benchmark/bridge_recovery/k31_resolve/run_profile.json
+            benchmark/bridge_recovery/k41_resolve/run_profile.json
+            benchmark/bridge_recovery/k55_resolve/run_profile.json
+            benchmark/metaquast/combined_reference/report.tsv
+          retention-days: 14

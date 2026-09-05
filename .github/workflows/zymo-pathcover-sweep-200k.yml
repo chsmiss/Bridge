@@ -1,0 +1,148 @@
+name: Zymo 200k k31 path-cover sweep
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-pathcover-sweep-200k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-pathcover-sweep-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies benchmark/profiles
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Validate and build BridgeAsm
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          cargo build --release
+
+      - name: Run k31 path-cover sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r name min_primary dominance secondary; do
+            out="benchmark/${name}"
+            /usr/bin/time -v -o "benchmark/${name}.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o "$out" \
+                -k 31 \
+                --min-count 2 \
+                --mercy-max-kmers 16 \
+                --mercy-min-support 1 \
+                --mercy-min-quality 25 \
+                --min-read-support 2 \
+                --min-pair-support 2 \
+                --min-primary-support "$min_primary" \
+                --primary-dominance "$dominance" \
+                --threaded-path-cover \
+                --major-path-cover \
+                --path-cover-secondary-dominance "$secondary" \
+                --min-contig-length 200 \
+                --threads "$THREADS"
+            cp "$out/primary_contigs.fasta" "benchmark/assemblies/${name}.fasta"
+            cp "$out/run_profile.json" "benchmark/profiles/${name}.json"
+            python3 scripts/fasta_stats.py "$out/primary_contigs.fasta" \
+              --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done <<'EOF'
+          k31_baseline 5 0.75 0.25
+          k31_balanced 4 0.65 0.20
+          k31_relaxed 3 0.60 0.15
+          k31_lowdom 4 0.60 0.25
+          EOF
+
+      - name: Run MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/k31_baseline.fasta \
+            benchmark/assemblies/k31_balanced.fasta \
+            benchmark/assemblies/k31_relaxed.fasta \
+            benchmark/assemblies/k31_lowdom.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast \
+            --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json \
+            | tee benchmark/metaquast_summary.tsv
+
+      - name: Summarize profiles and resources
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          rows = ["assembly\tprimary_n50\tlargest_primary\tprimary_contigs\tprimary_bases\tdominant_transitions\tthreaded_path_transitions\tmajor_path_transitions\twall_seconds\tpeak_rss_mib"]
+          for name in ("k31_baseline", "k31_balanced", "k31_relaxed", "k31_lowdom"):
+              p = json.loads(Path(f"benchmark/profiles/{name}.json").read_text())
+              text = Path(f"benchmark/{name}.time.txt").read_text()
+              wall_text = re.search(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)", text).group(1)
+              parts = [float(x) for x in wall_text.split(":")]
+              wall = parts[-1] + (60 * parts[-2] if len(parts) >= 2 else 0) + (3600 * parts[-3] if len(parts) >= 3 else 0)
+              rss = int(re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text).group(1)) / 1024.0
+              rows.append("\t".join(map(str, [
+                  name, p["primary_n50"], p["largest_primary"], p["primary_contigs"], p["primary_bases"],
+                  p["dominant_transitions"], p["threaded_path_transitions"], p["major_path_transitions"],
+                  f"{wall:.3f}", f"{rss:.1f}",
+              ])))
+          Path("benchmark/profile_summary.tsv").write_text("\n".join(rows) + "\n")
+          print("\n".join(rows))
+          PY
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-pathcover-sweep-200k
+          path: |
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/profiles
+            benchmark/metaquast/combined_reference/report.tsv
+            benchmark/metaquast/combined_reference/transposed_report.tsv
+          retention-days: 14

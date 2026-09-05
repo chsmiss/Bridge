@@ -1,0 +1,89 @@
+name: Biological Brain ESM breakpoint smoke
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - biological_brain/esm_breakpoint_score.py
+      - biological_brain/protein_bridge_evidence.py
+      - src/bin/bridgeasm-evidence-path.rs
+      - tests/make_plass_bridge_fixture.py
+      - .github/workflows/biological-brain-esm.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  esm-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install the smallest ESM2 runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install transformers
+      - name: Generate candidate junctions
+        run: |
+          python tests/make_plass_bridge_fixture.py --output fixture
+          python biological_brain/protein_bridge_evidence.py \
+            --gfa fixture/graph.gfa \
+            --proteins fixture/reference_protein.faa \
+            --output fixture/protein_evidence.tsv
+      - name: Score junctions with ESM2 8M
+        run: |
+          python biological_brain/esm_breakpoint_score.py \
+            --candidates fixture/protein_evidence.tsv \
+            --output fixture/esm_scores.tsv \
+            --model facebook/esm2_t6_8M_UR50D \
+            --device cpu \
+            --window-aa 8 \
+            --flank-aa 64 \
+            --batch-size 16
+          test -s fixture/esm_scores.tsv
+          python - <<'PY'
+          import csv
+          import math
+          rows = list(csv.DictReader(open('fixture/esm_scores.tsv'), delimiter='\t'))
+          if not rows:
+              raise SystemExit('ESM adapter produced no score rows')
+          for row in rows:
+              value = float(row['esm_delta'])
+              if not math.isfinite(value):
+                  raise SystemExit(f'non-finite ESM score: {row}')
+          print('finite ESM rows:', len(rows))
+          PY
+      - name: Re-run path selection with bounded ESM evidence
+        run: |
+          cargo run --quiet --bin bridgeasm-evidence-path -- \
+            --gfa fixture/graph.gfa \
+            --edge-evidence fixture/protein_evidence.tsv \
+            --esm-scores fixture/esm_scores.tsv \
+            --output fixture/esm_contigs.fasta \
+            --report fixture/esm_path_report.tsv \
+            --mode balanced \
+            --min-length 100
+          python tests/check_plass_bridge_fixture.py \
+            --expected fixture/expected_dna.fasta \
+            --evidence fixture/protein_evidence.tsv \
+            --report fixture/esm_path_report.tsv \
+            --contigs fixture/esm_contigs.fasta \
+            --plass-proteins fixture/reference_protein.faa
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: biological-brain-esm-smoke
+          path: |
+            fixture/protein_evidence.tsv
+            fixture/esm_scores.tsv
+            fixture/esm_path_report.tsv
+            fixture/esm_contigs.fasta
+          if-no-files-found: warn

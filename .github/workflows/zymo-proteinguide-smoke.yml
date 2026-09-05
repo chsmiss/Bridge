@@ -1,0 +1,325 @@
+name: Zymo Log protein-guided smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "50000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-proteinguide-smoke.yml
+      - Cargo.toml
+      - src/bin/bridgeasm-proteinguide.rs
+      - scripts/download_ena_subset.py
+      - scripts/fasta_stats.py
+      - scripts/fasta_to_gfa.py
+      - scripts/protein_recall.py
+
+concurrency:
+  group: zymo-proteinguide-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: ${{ inputs.pairs || '50000' }}
+      OMP_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install evaluation tools and PLASS PenguiN
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 prodigal mmseqs2 megahit
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+          curl -L --retry 3 -o /tmp/plass.tar.gz \
+            https://github.com/soedinglab/plass/releases/download/5-cf8933/plass-linux-avx2.tar.gz
+          tar -xzf /tmp/plass.tar.gz -C /tmp
+          test -x /tmp/plass/bin/plass
+          test -x /tmp/plass/bin/penguin
+          /tmp/plass/bin/plass version | tee /tmp/plass-version.txt
+          /tmp/plass/bin/penguin version | tee /tmp/penguin-version.txt
+
+      - name: Download deterministic reads and Zymo references
+        shell: bash
+        run: |
+          mkdir -p benchmark/assemblies benchmark/protein benchmark/proteinguide
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build and test BridgeAsm
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile scripts/fasta_to_gfa.py scripts/protein_recall.py
+          cargo build --release
+
+      - name: Assemble BridgeAsm nucleotide backbone
+        shell: bash
+        run: |
+          mkdir -p benchmark/bridgeasm-k29
+          /usr/bin/time -v -o benchmark/bridgeasm-k29.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/bridgeasm-k29 -k 29 \
+              --min-count 2 --mercy-max-kmers 48 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 1 --min-pair-support 2 \
+              --min-primary-support 3 --primary-dominance 0.60 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridgeasm-k29/primary_contigs.fasta \
+            benchmark/assemblies/bridgeasm-baseline.fasta
+          python3 scripts/fasta_to_gfa.py \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            benchmark/proteinguide/backbone.gfa \
+            --min-length 200 | tee benchmark/proteinguide/backbone.tsv
+          python3 scripts/fasta_stats.py \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            --json benchmark/bridgeasm-baseline.stats.json \
+            | tee benchmark/bridgeasm-baseline.stats.tsv
+
+      - name: Assemble PenguiN nucleotide guides and PLASS proteins
+        shell: bash
+        run: |
+          mkdir -p benchmark/penguin benchmark/plass
+          /usr/bin/time -v -o benchmark/penguin.time.txt \
+            /tmp/plass/bin/penguin guided_nuclassemble \
+              /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              benchmark/penguin/guided.fasta benchmark/penguin/tmp \
+              --threads 2 --min-length 20 --num-iterations 3
+          /usr/bin/time -v -o benchmark/plass.time.txt \
+            /tmp/plass/bin/plass assemble \
+              /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              benchmark/plass/proteins.raw.fasta benchmark/plass/tmp \
+              --threads 2 --min-length 20 --num-iterations 3
+          test -s benchmark/penguin/guided.fasta
+          test -s benchmark/plass/proteins.raw.fasta
+          awk '/^>/{print; next} {gsub(/\*/, ""); print}' \
+            benchmark/plass/proteins.raw.fasta > benchmark/plass/proteins.faa
+          cp benchmark/penguin/guided.fasta benchmark/assemblies/penguin.fasta
+          python3 scripts/fasta_stats.py benchmark/penguin/guided.fasta \
+            --json benchmark/penguin.stats.json | tee benchmark/penguin.stats.tsv
+          python3 scripts/fasta_stats.py benchmark/plass/proteins.faa \
+            --json benchmark/plass.stats.json | tee benchmark/plass.stats.tsv
+
+      - name: Map immutable BridgeAsm contigs to PenguiN guides
+        shell: bash
+        run: |
+          minimap2 -x asm20 --secondary=yes -t 2 \
+            benchmark/penguin/guided.fasta \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            > benchmark/proteinguide/backbone-to-penguin.paf
+          test -s benchmark/proteinguide/backbone-to-penguin.paf
+          awk 'BEGIN{FS="\t"} {n++; if ($12 >= 30) q++} END{print "paf_records\t" n; print "mapq_ge_30\t" q}' \
+            benchmark/proteinguide/backbone-to-penguin.paf \
+            | tee benchmark/proteinguide/paf.stats.tsv
+
+      - name: Build protein-guided BridgeAsm outputs
+        shell: bash
+        run: |
+          run_guide() {
+            mode=$1
+            shift
+            target/release/bridgeasm-proteinguide \
+              --gfa benchmark/proteinguide/backbone.gfa \
+              --guide benchmark/penguin/guided.fasta \
+              --paf benchmark/proteinguide/backbone-to-penguin.paf \
+              --output "benchmark/assemblies/bridgeasm-${mode}.fasta" \
+              --report "benchmark/proteinguide/${mode}.tsv" \
+              --summary "benchmark/proteinguide/${mode}.json" \
+              --mode "$mode" --min-length 200 "$@"
+            python3 scripts/fasta_stats.py \
+              "benchmark/assemblies/bridgeasm-${mode}.fasta" \
+              --json "benchmark/bridgeasm-${mode}.stats.json" \
+              | tee "benchmark/bridgeasm-${mode}.stats.tsv"
+          }
+          run_guide overlap-only \
+            --min-mapq 30 --min-alignment 90 \
+            --min-query-fraction 0.80 --min-identity 0.97 \
+            --min-coverage-ratio 0.0
+          run_guide conservative \
+            --min-mapq 40 --min-alignment 120 \
+            --min-query-fraction 0.90 --min-identity 0.985 \
+            --min-coverage-ratio 0.0 --max-gap 120 \
+            --conservative-max-gap 60 --max-gap-disagreement 20
+          run_guide protein \
+            --min-mapq 30 --min-alignment 90 \
+            --min-query-fraction 0.80 --min-identity 0.97 \
+            --min-coverage-ratio 0.0 --max-gap 300 \
+            --max-gap-disagreement 30
+
+      - name: Run MEGAHIT nucleotide comparator
+        shell: bash
+        run: |
+          megahit \
+            -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json | tee benchmark/megahit.stats.tsv
+
+      - name: Evaluate nucleotide assemblies with MetaQUAST
+        shell: bash
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            benchmark/assemblies/bridgeasm-overlap-only.fasta \
+            benchmark/assemblies/bridgeasm-conservative.fasta \
+            benchmark/assemblies/bridgeasm-protein.fasta \
+            benchmark/assemblies/penguin.fasta \
+            benchmark/assemblies/megahit.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+          cp benchmark/metaquast/combined_reference/report.tsv \
+            benchmark/nucleotide-report.tsv
+          cp benchmark/metaquast/combined_reference/transposed_report.tsv \
+            benchmark/nucleotide-transposed-report.tsv
+          cat benchmark/nucleotide-report.tsv
+
+      - name: Predict and evaluate proteins
+        shell: bash
+        run: |
+          prodigal -q -p meta -i /tmp/zymo-references.fasta \
+            -a benchmark/protein/reference.faa
+          predict_proteins() {
+            label=$1
+            fasta=$2
+            prodigal -q -p meta -i "$fasta" \
+              -a "benchmark/protein/${label}.faa"
+          }
+          predict_proteins bridgeasm-baseline \
+            benchmark/assemblies/bridgeasm-baseline.fasta
+          predict_proteins bridgeasm-overlap-only \
+            benchmark/assemblies/bridgeasm-overlap-only.fasta
+          predict_proteins bridgeasm-conservative \
+            benchmark/assemblies/bridgeasm-conservative.fasta
+          predict_proteins bridgeasm-protein \
+            benchmark/assemblies/bridgeasm-protein.fasta
+          predict_proteins penguin benchmark/assemblies/penguin.fasta
+          predict_proteins megahit benchmark/assemblies/megahit.fasta
+          cp benchmark/plass/proteins.faa benchmark/protein/plass.faa
+
+          search_proteins() {
+            label=$1
+            rm -rf "/tmp/mmseqs-${label}"
+            mmseqs easy-search \
+              benchmark/protein/reference.faa \
+              "benchmark/protein/${label}.faa" \
+              "benchmark/protein/${label}.m8" \
+              "/tmp/mmseqs-${label}" \
+              --threads 2 -s 7.5 -e 1e-3 --max-seqs 50 \
+              --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
+          }
+          search_proteins bridgeasm-baseline
+          search_proteins bridgeasm-overlap-only
+          search_proteins bridgeasm-conservative
+          search_proteins bridgeasm-protein
+          search_proteins penguin
+          search_proteins megahit
+          search_proteins plass
+
+          python3 scripts/protein_recall.py \
+            --reference benchmark/protein/reference.faa \
+            --sample bridgeasm-baseline \
+              benchmark/protein/bridgeasm-baseline.faa \
+              benchmark/protein/bridgeasm-baseline.m8 \
+            --sample bridgeasm-overlap-only \
+              benchmark/protein/bridgeasm-overlap-only.faa \
+              benchmark/protein/bridgeasm-overlap-only.m8 \
+            --sample bridgeasm-conservative \
+              benchmark/protein/bridgeasm-conservative.faa \
+              benchmark/protein/bridgeasm-conservative.m8 \
+            --sample bridgeasm-protein \
+              benchmark/protein/bridgeasm-protein.faa \
+              benchmark/protein/bridgeasm-protein.m8 \
+            --sample penguin benchmark/protein/penguin.faa \
+              benchmark/protein/penguin.m8 \
+            --sample megahit benchmark/protein/megahit.faa \
+              benchmark/protein/megahit.m8 \
+            --sample plass benchmark/protein/plass.faa \
+              benchmark/protein/plass.m8 \
+            --min-identity 0.80 --min-query-coverage 0.80 \
+            --min-target-coverage 0.80 \
+            --json benchmark/protein-recall.json \
+            | tee benchmark/protein-recall.tsv
+
+      - name: Write benchmark provenance and concise comparison
+        shell: bash
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          cp /tmp/plass-version.txt /tmp/penguin-version.txt benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\n' "$GITHUB_SHA" "$PAIRS" \
+            > benchmark/benchmark-provenance.tsv
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          rows = json.loads(Path("benchmark/protein-recall.json").read_text())
+          by_label = {row["label"]: row for row in rows}
+          baseline = by_label["bridgeasm-baseline"]
+          with Path("benchmark/protein-guide-delta.tsv").open("w") as handle:
+              handle.write(
+                  "label\tsingle_recall_delta\tunion_recall_delta\t"
+                  "reciprocal_recall_delta\taa_coverage_delta\n"
+              )
+              for label in (
+                  "bridgeasm-overlap-only",
+                  "bridgeasm-conservative",
+                  "bridgeasm-protein",
+                  "penguin",
+                  "megahit",
+                  "plass",
+              ):
+                  row = by_label[label]
+                  values = [
+                      row["single_recall_fraction"]
+                      - baseline["single_recall_fraction"],
+                      row["union_recall_fraction"]
+                      - baseline["union_recall_fraction"],
+                      row["reciprocal_recall_fraction"]
+                      - baseline["reciprocal_recall_fraction"],
+                      row["reference_aa_coverage_fraction"]
+                      - baseline["reference_aa_coverage_fraction"],
+                  ]
+                  handle.write(label + "\t" + "\t".join(f"{x:.6f}" for x in values) + "\n")
+          PY
+          cat benchmark/protein-guide-delta.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-protein-guided-smoke
+          path: |
+            benchmark/*.tsv
+            benchmark/*.json
+            benchmark/*.txt
+            benchmark/proteinguide/*.tsv
+            benchmark/proteinguide/*.json
+            benchmark/protein-recall.tsv
+            benchmark/protein-recall.json
+          retention-days: 14

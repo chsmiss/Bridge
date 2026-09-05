@@ -1,0 +1,234 @@
+name: Zymo 200k low-abundance GF rescue
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-gf-rescue-200k.yml
+      - scripts/stage8_backbone_optimizer.py
+      - scripts/low_abundance_rescue.py
+      - scripts/test_low_abundance_rescue.py
+      - scripts/stage789_optimizer.py
+      - scripts/na50_repeat_pipeline.py
+      - scripts/repeat_graph_optimizer.py
+      - scripts/repeat_graph_optimizer_v2.py
+      - scripts/graph_path_phaser.py
+      - scripts/merge_backbone_replacement.py
+      - scripts/postprocess_segment_grafts.py
+      - scripts/filter_contained_fasta.py
+      - scripts/stitch_exact_overlaps.py
+      - scripts/merge_fasta_unique.py
+      - src/**
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-gf-rescue-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install assemblers and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit spades curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/graph_path_phaser.py \
+            scripts/repeat_graph_optimizer.py \
+            scripts/repeat_graph_optimizer_v2.py \
+            scripts/na50_repeat_pipeline.py \
+            scripts/stage789_optimizer.py \
+            scripts/stage8_backbone_optimizer.py \
+            scripts/low_abundance_rescue.py \
+            scripts/test_low_abundance_rescue.py \
+            scripts/merge_backbone_replacement.py \
+            scripts/postprocess_segment_grafts.py \
+            scripts/filter_contained_fasta.py \
+            scripts/stitch_exact_overlaps.py \
+            scripts/merge_fasta_unique.py
+          PYTHONPATH=scripts python3 scripts/test_stage789_optimizer.py
+          PYTHONPATH=scripts python3 scripts/test_low_abundance_rescue.py
+          cargo build --release
+
+      - name: Build promoted Stage8 backbone
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/bridge_stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/bridge_repeat \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+              --pipeline-dir benchmark/bridge_repeat \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --segment-anchor-bases 31 \
+              --lookahead-depth 3 \
+              --lookahead-max-branch 4
+          cp benchmark/bridge_repeat/bridge_backbone.fasta \
+             benchmark/assemblies/bridge_stage8_backbone.fasta
+
+      - name: Run low-abundance rescue candidates
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/low_abundance_rescue.time.txt \
+            python3 scripts/low_abundance_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/bridge_repeat \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS"
+          cp benchmark/bridge_repeat/low_abundance_rescue/candidate_graph_strict/primary_contigs.fasta \
+             benchmark/assemblies/bridge_graph_strict.fasta
+          cp benchmark/bridge_repeat/low_abundance_rescue/candidate_residual_strict/primary_contigs.fasta \
+             benchmark/assemblies/bridge_residual_strict.fasta
+          cp benchmark/bridge_repeat/low_abundance_rescue/candidate_hybrid_balanced/primary_contigs.fasta \
+             benchmark/assemblies/bridge_hybrid_balanced.fasta
+          for f in benchmark/assemblies/bridge_*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run MEGAHIT and metaSPAdes controls
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                    -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                    -o benchmark/megahit --min-contig-len 200 -t "$THREADS"
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          /usr/bin/time -v -o benchmark/metaspades.time.txt \
+            metaspades.py -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                          -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                          -o benchmark/metaspades -t "$THREADS" -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
+
+      - name: Run combined-reference MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_stage8_backbone.fasta \
+            benchmark/assemblies/bridge_graph_strict.fasta \
+            benchmark/assemblies/bridge_residual_strict.fasta \
+            benchmark/assemblies/bridge_hybrid_balanced.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json \
+            | tee benchmark/metaquast_summary.tsv
+
+      - name: Run per-bacterium QUAST
+        run: |
+          set -euo pipefail
+          assemblies=(benchmark/assemblies/bridge_stage8_backbone.fasta benchmark/assemblies/bridge_graph_strict.fasta benchmark/assemblies/bridge_residual_strict.fasta benchmark/assemblies/bridge_hybrid_balanced.fasta benchmark/assemblies/megahit.fasta benchmark/assemblies/metaspades.fasta)
+          for ref in /tmp/zymo-species-refs/{Bacillus_subtilis,Enterococcus_faecalis,Escherichia_coli,Lactobacillus_fermentum,Listeria_monocytogenes,Pseudomonas_aeruginosa,Salmonella_enterica,Staphylococcus_aureus}.fasta; do
+            species="$(basename "$ref" .fasta)"
+            python3 /tmp/quast-5.3.0/quast.py "${assemblies[@]}" -r "$ref" \
+              -o "benchmark/species_quast/$species" --threads "$THREADS" --min-contig 200 --no-plots
+          done
+          python3 scripts/summarize_species_quast.py benchmark/species_quast \
+            --json benchmark/species_summary.json | tee benchmark/species_summary.tsv
+
+      - name: Score promotion gate
+        run: |
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          def rows(path):
+              with Path(path).open() as handle:
+                  return list(csv.DictReader(handle, delimiter='\t'))
+
+          meta = {r['Assembly']: r for r in rows('benchmark/metaquast_summary.tsv')}
+          species = {r['assembly']: r for r in rows('benchmark/species_summary.tsv')}
+          baseline = 'bridge_stage8_backbone'
+          candidates = ['bridge_graph_strict', 'bridge_residual_strict', 'bridge_hybrid_balanced']
+          b = meta[baseline]
+          bgf = float(species[baseline]['bacteria_mean_gf'])
+          with Path('benchmark/promotion_gate.tsv').open('w') as out:
+              out.write('assembly\tmean_gf\tmean_gf_delta\tcombined_gf\tdup\tmisassemblies\tna50\tna50_delta\tsafety_gate\n')
+              for name in candidates:
+                  m = meta[name]
+                  mean_gf = float(species[name]['bacteria_mean_gf'])
+                  dup = float(m['Duplication ratio'])
+                  mis = int(float(m['# misassemblies']))
+                  na50 = float(m['NA50'])
+                  bna50 = float(b['NA50'])
+                  safe = dup <= 1.010 and mis <= 13 and na50 >= 0.90 * bna50
+                  out.write(
+                      f"{name}\t{mean_gf:.4f}\t{mean_gf-bgf:+.4f}\t{m['Genome fraction (%)']}\t{dup:.4f}"
+                      f"\t{mis}\t{na50:.1f}\t{na50-bna50:+.1f}\t{'PASS' if safe else 'FAIL'}\n"
+                  )
+          print(Path('benchmark/promotion_gate.tsv').read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\ndataset\tERR2935805_first_pairs\nproduction_backbone\tstage8_simplified_lookahead\nlegacy_stage9\tdisabled_not_promoted\nrare_graph\tnonbranching_k21_k31_abundance_gc_quota\nresidual_pair_filter\tstage8_31mer_representation\nresidual_assembly\tk21_min_count2\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-gf-rescue-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/bridge_repeat/pipeline_manifest.json
+            benchmark/bridge_repeat/stage8_backbone_stats.json
+            benchmark/bridge_repeat/repeat_optimizer/stage7_bounded_lookahead.paths.tsv
+            benchmark/bridge_repeat/repeat_optimizer/stage8_simplified_lookahead.paths.tsv
+            benchmark/bridge_repeat/low_abundance_rescue/*.json
+            benchmark/bridge_repeat/low_abundance_rescue/*.tsv
+            benchmark/bridge_repeat/low_abundance_rescue/candidate_*/containment_stats.json
+            benchmark/metaquast/combined_reference/report.tsv
+            benchmark/metaquast/combined_reference/transposed_report.tsv
+            benchmark/species_quast/*/report.tsv
+          retention-days: 14

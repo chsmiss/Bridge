@@ -1,0 +1,307 @@
+name: Zymo Log PLASS junction-rescore smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "50000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-plass-rescore-smoke.yml
+      - src/bin/bridgeasm-proteinguide.rs
+      - scripts/plass_junction_scores.py
+      - scripts/fasta_to_gfa.py
+      - scripts/protein_recall.py
+      - scripts/download_ena_subset.py
+      - scripts/fasta_stats.py
+      - Cargo.toml
+      - Cargo.lock
+
+concurrency:
+  group: zymo-plass-rescore-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: ${{ inputs.pairs || '50000' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install PenguiN, PLASS and evaluation tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 prodigal mmseqs2
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+          curl -L --retry 3 -o /tmp/plass.tar.gz \
+            https://github.com/soedinglab/plass/releases/download/5-cf8933/plass-linux-avx2.tar.gz
+          tar -xzf /tmp/plass.tar.gz -C /tmp
+          test -x /tmp/plass/bin/plass
+          test -x /tmp/plass/bin/penguin
+          /tmp/plass/bin/plass version | tee /tmp/plass-version.txt
+          /tmp/plass/bin/penguin version | tee /tmp/penguin-version.txt
+
+      - name: Download deterministic reads and Zymo references
+        shell: bash
+        run: |
+          mkdir -p benchmark/assemblies benchmark/protein benchmark/proteinguide benchmark/plass benchmark/penguin
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build and test
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/fasta_to_gfa.py \
+            scripts/protein_recall.py \
+            scripts/plass_junction_scores.py
+          cargo build --release
+
+      - name: Assemble immutable BridgeAsm nucleotide backbone
+        shell: bash
+        run: |
+          mkdir -p benchmark/bridgeasm-k29
+          /usr/bin/time -v -o benchmark/bridgeasm-k29.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/bridgeasm-k29 -k 29 \
+              --min-count 2 --mercy-max-kmers 48 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 1 --min-pair-support 2 \
+              --min-primary-support 3 --primary-dominance 0.60 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridgeasm-k29/primary_contigs.fasta \
+            benchmark/assemblies/bridgeasm-baseline.fasta
+          python3 scripts/fasta_to_gfa.py \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            benchmark/proteinguide/backbone.gfa --min-length 200 \
+            | tee benchmark/proteinguide/backbone.tsv
+          python3 scripts/fasta_stats.py benchmark/assemblies/bridgeasm-baseline.fasta \
+            --json benchmark/bridgeasm-baseline.stats.json \
+            | tee benchmark/bridgeasm-baseline.stats.tsv
+
+      - name: Assemble PenguiN nucleotide guides and PLASS protein catalog
+        shell: bash
+        run: |
+          /usr/bin/time -v -o benchmark/penguin.time.txt \
+            /tmp/plass/bin/penguin guided_nuclassemble \
+              /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              benchmark/penguin/guided.fasta benchmark/penguin/tmp \
+              --threads 2 --min-length 20 --num-iterations 3
+          /usr/bin/time -v -o benchmark/plass.time.txt \
+            /tmp/plass/bin/plass assemble \
+              /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              benchmark/plass/proteins.raw.fasta benchmark/plass/tmp \
+              --threads 2 --min-length 20 --num-iterations 3
+          test -s benchmark/penguin/guided.fasta
+          test -s benchmark/plass/proteins.raw.fasta
+          awk '/^>/{print; next} {gsub(/\*/, ""); print}' \
+            benchmark/plass/proteins.raw.fasta > benchmark/plass/proteins.faa
+          test -s benchmark/plass/proteins.faa
+          cp benchmark/penguin/guided.fasta benchmark/assemblies/penguin.fasta
+
+      - name: Generate conservative candidate edges
+        shell: bash
+        run: |
+          minimap2 -x asm20 --secondary=yes -t 2 \
+            benchmark/penguin/guided.fasta \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            > benchmark/proteinguide/backbone-to-penguin.paf
+          test -s benchmark/proteinguide/backbone-to-penguin.paf
+          target/release/bridgeasm-proteinguide \
+            --gfa benchmark/proteinguide/backbone.gfa \
+            --guide benchmark/penguin/guided.fasta \
+            --paf benchmark/proteinguide/backbone-to-penguin.paf \
+            --output benchmark/assemblies/bridgeasm-conservative.fasta \
+            --report benchmark/proteinguide/conservative.tsv \
+            --summary benchmark/proteinguide/conservative.json \
+            --mode conservative --min-length 200 \
+            --min-mapq 40 --min-alignment 120 \
+            --min-query-fraction 0.90 --min-identity 0.985 \
+            --min-coverage-ratio 0.0 --max-gap 120 \
+            --conservative-max-gap 60 --max-gap-disagreement 20
+          python3 scripts/fasta_stats.py \
+            benchmark/assemblies/bridgeasm-conservative.fasta \
+            --json benchmark/bridgeasm-conservative.stats.json \
+            | tee benchmark/bridgeasm-conservative.stats.tsv
+
+      - name: Score candidate junctions against PLASS proteins
+        shell: bash
+        run: |
+          prodigal -q -p meta \
+            -i benchmark/assemblies/bridgeasm-baseline.fasta \
+            -a benchmark/protein/backbone.faa
+          rm -rf /tmp/mmseqs-backbone-to-plass
+          mmseqs easy-search \
+            benchmark/protein/backbone.faa \
+            benchmark/plass/proteins.faa \
+            benchmark/proteinguide/backbone-to-plass.m8 \
+            /tmp/mmseqs-backbone-to-plass \
+            --threads 2 -s 5.7 -e 1e-3 --max-seqs 20 \
+            --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
+          python3 scripts/plass_junction_scores.py \
+            --backbone benchmark/assemblies/bridgeasm-baseline.fasta \
+            --proteins benchmark/protein/backbone.faa \
+            --alignments benchmark/proteinguide/backbone-to-plass.m8 \
+            --edge-report benchmark/proteinguide/conservative.tsv \
+            --output benchmark/proteinguide/plass-model-scores.tsv \
+            --details benchmark/proteinguide/plass-junction-details.tsv \
+            --end-window 900 --min-identity 0.50 \
+            --min-alignment-aa 12 --min-bits 30 \
+            --max-protein-gap 80 --max-protein-overlap 25 \
+            --min-output-score 0.0 \
+            2> benchmark/proteinguide/plass-junction-summary.tsv
+          cat benchmark/proteinguide/plass-junction-summary.tsv
+          head -n 20 benchmark/proteinguide/plass-junction-details.tsv || true
+
+      - name: Rebuild path cover with PLASS edge scores
+        shell: bash
+        run: |
+          target/release/bridgeasm-proteinguide \
+            --gfa benchmark/proteinguide/backbone.gfa \
+            --guide benchmark/penguin/guided.fasta \
+            --paf benchmark/proteinguide/backbone-to-penguin.paf \
+            --model-scores benchmark/proteinguide/plass-model-scores.tsv \
+            --model-weight 800 \
+            --output benchmark/assemblies/bridgeasm-conservative-plass.fasta \
+            --report benchmark/proteinguide/conservative-plass.tsv \
+            --summary benchmark/proteinguide/conservative-plass.json \
+            --mode conservative --min-length 200 \
+            --min-mapq 40 --min-alignment 120 \
+            --min-query-fraction 0.90 --min-identity 0.985 \
+            --min-coverage-ratio 0.0 --max-gap 120 \
+            --conservative-max-gap 60 --max-gap-disagreement 20
+          python3 scripts/fasta_stats.py \
+            benchmark/assemblies/bridgeasm-conservative-plass.fasta \
+            --json benchmark/bridgeasm-conservative-plass.stats.json \
+            | tee benchmark/bridgeasm-conservative-plass.stats.tsv
+          python3 - <<'PY' | tee benchmark/proteinguide/edge-selection-delta.tsv
+          import csv
+          from pathlib import Path
+
+          def selected(path):
+              with Path(path).open() as handle:
+                  rows = csv.DictReader(handle, delimiter='\t')
+                  return {(row['source'], row['target']) for row in rows if row['selected'].lower() == 'true'}
+
+          before = selected('benchmark/proteinguide/conservative.tsv')
+          after = selected('benchmark/proteinguide/conservative-plass.tsv')
+          print('metric\tvalue')
+          print(f'before_selected\t{len(before)}')
+          print(f'after_selected\t{len(after)}')
+          print(f'unchanged\t{len(before & after)}')
+          print(f'added_after_plass\t{len(after - before)}')
+          print(f'removed_after_plass\t{len(before - after)}')
+          for source, target in sorted(after - before):
+              print(f'added_edge\t{source}->{target}')
+          for source, target in sorted(before - after):
+              print(f'removed_edge\t{source}->{target}')
+          PY
+
+      - name: Evaluate nucleotide assemblies
+        shell: bash
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridgeasm-baseline.fasta \
+            benchmark/assemblies/bridgeasm-conservative.fasta \
+            benchmark/assemblies/bridgeasm-conservative-plass.fasta \
+            benchmark/assemblies/penguin.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+          cp benchmark/metaquast/combined_reference/report.tsv \
+            benchmark/nucleotide-report.tsv
+          cp benchmark/metaquast/combined_reference/transposed_report.tsv \
+            benchmark/nucleotide-transposed-report.tsv
+          cat benchmark/nucleotide-report.tsv
+
+      - name: Compare protein recall before and after PLASS rescoring
+        shell: bash
+        run: |
+          prodigal -q -p meta -i /tmp/zymo-references.fasta \
+            -a benchmark/protein/reference.faa
+          prodigal -q -p meta \
+            -i benchmark/assemblies/bridgeasm-conservative.fasta \
+            -a benchmark/protein/bridgeasm-conservative.faa
+          prodigal -q -p meta \
+            -i benchmark/assemblies/bridgeasm-conservative-plass.fasta \
+            -a benchmark/protein/bridgeasm-conservative-plass.faa
+
+          search_proteins() {
+            label=$1
+            rm -rf "/tmp/mmseqs-recall-${label}"
+            mmseqs easy-search \
+              benchmark/protein/reference.faa \
+              "benchmark/protein/${label}.faa" \
+              "benchmark/protein/${label}.m8" \
+              "/tmp/mmseqs-recall-${label}" \
+              --threads 2 -s 5.7 -e 1e-3 --max-seqs 20 \
+              --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
+          }
+          search_proteins backbone
+          search_proteins bridgeasm-conservative
+          search_proteins bridgeasm-conservative-plass
+          python3 scripts/protein_recall.py \
+            --reference benchmark/protein/reference.faa \
+            --sample backbone benchmark/protein/backbone.faa benchmark/protein/backbone.m8 \
+            --sample bridgeasm-conservative \
+              benchmark/protein/bridgeasm-conservative.faa \
+              benchmark/protein/bridgeasm-conservative.m8 \
+            --sample bridgeasm-conservative-plass \
+              benchmark/protein/bridgeasm-conservative-plass.faa \
+              benchmark/protein/bridgeasm-conservative-plass.m8 \
+            --min-identity 0.80 --min-query-coverage 0.80 \
+            --min-target-coverage 0.80 \
+            --json benchmark/protein-recall.json \
+            | tee benchmark/protein-recall.tsv
+
+      - name: Save provenance and compact reports
+        shell: bash
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          cp /tmp/plass-version.txt benchmark/
+          cp /tmp/penguin-version.txt benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\n' "$GITHUB_SHA" "$PAIRS" \
+            > benchmark/benchmark-provenance.tsv
+          echo '=== Assembly statistics ==='
+          cat benchmark/bridgeasm-baseline.stats.tsv
+          cat benchmark/bridgeasm-conservative.stats.tsv
+          cat benchmark/bridgeasm-conservative-plass.stats.tsv
+          echo '=== PLASS junction support ==='
+          cat benchmark/proteinguide/plass-junction-summary.tsv
+          cat benchmark/proteinguide/edge-selection-delta.tsv
+          echo '=== Protein recall ==='
+          cat benchmark/protein-recall.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-plass-junction-rescore-${{ env.PAIRS }}-pairs
+          path: benchmark
+          retention-days: 14

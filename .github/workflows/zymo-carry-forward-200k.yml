@@ -1,0 +1,129 @@
+name: Zymo 200k iterative carry-forward
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-carry-forward-200k.yml
+      - scripts/bridge_carry_forward_pipeline.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-carry-forward-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Download frozen competitors
+        uses: actions/download-artifact@v4
+        with:
+          name: zymo-optimized-200k-three-way
+          path: /tmp/previous
+          repository: chsmiss/Bridge
+          run-id: 33521053707
+          github-token: ${{ github.token }}
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+
+      - name: Validate and build
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile scripts/bridge_carry_forward_pipeline.py
+          cargo build --release
+
+      - name: Run iterative carry-forward Bridge
+        run: |
+          /usr/bin/time -v -o benchmark/bridge_carry.time.txt \
+            python3 scripts/bridge_carry_forward_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/bridge_carry \
+              --threads "$THREADS" \
+              --prior-min-length 500 \
+              --stitch-min-overlap 40 \
+              --stitch-overlap-margin 10
+          cp benchmark/bridge_carry/primary_contigs.fasta benchmark/assemblies/bridge_carry_final.fasta
+          for k in 21 31 41 55; do
+            cp "benchmark/bridge_carry/k${k}/primary_contigs.fasta" \
+              "benchmark/assemblies/bridge_carry_k${k}.fasta"
+          done
+          cp /tmp/previous/assemblies/megahit.fasta benchmark/assemblies/megahit.fasta
+          cp /tmp/previous/assemblies/metaspades.fasta benchmark/assemblies/metaspades.fasta
+          for fasta in benchmark/assemblies/*.fasta; do
+            name=$(basename "$fasta" .fasta)
+            python3 scripts/fasta_stats.py "$fasta" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_carry_k21.fasta \
+            benchmark/assemblies/bridge_carry_k31.fasta \
+            benchmark/assemblies/bridge_carry_k41.fasta \
+            benchmark/assemblies/bridge_carry_k55.fasta \
+            benchmark/assemblies/bridge_carry_final.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          cp benchmark/metaquast/combined_reference/report.tsv benchmark/carry_forward_report.tsv
+
+      - name: Save compact provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nthreads\t%s\nprior_min_length\t500\nsource_competitor_run\t33521053707\n' \
+            "$GITHUB_SHA" "$PAIRS" "$THREADS" > benchmark/carry_forward_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-carry-forward-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/bridge_carry/pipeline_manifest.json
+            benchmark/bridge_carry/k21/run_profile.json
+            benchmark/bridge_carry/k31/run_profile.json
+            benchmark/bridge_carry/k41/run_profile.json
+            benchmark/bridge_carry/k55/run_profile.json
+            benchmark/metaquast/combined_reference/report.tsv
+          retention-days: 14

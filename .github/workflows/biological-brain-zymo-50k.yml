@@ -1,0 +1,234 @@
+name: Biological Brain Zymo 50k matched ablation
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/biological-brain-zymo-50k.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SOURCE_RUN_ID: "33306726454"
+  ENA_RUN: ERR2935805
+  READ_PAIRS: "50000"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: bridge-plass
+          create-args: >-
+            -c conda-forge
+            -c bioconda
+            python=3.11
+            plass
+            prodigal
+            mmseqs2
+            quast
+          cache-environment: true
+          init-shell: bash
+
+      - name: Download matched 50k assembly artifact
+        run: |
+          mkdir -p source baseline
+          gh run download "${SOURCE_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name zymo-log-reference-smoke \
+            --dir source
+          cp source/bridgeasm-k31/assembly.gfa graph.gfa
+          cp source/assemblies/bridgeasm-k31.fasta baseline/bridgeasm-k31.fasta
+          cp source/assemblies/megahit.fasta baseline/megahit.fasta
+          cp source/assemblies/metaspades.fasta baseline/metaspades.fasta
+          test -s graph.gfa
+          test -s baseline/bridgeasm-k31.fasta
+          test -s baseline/megahit.fasta
+          test -s baseline/metaspades.fasta
+          printf 'source_run_id\t%s\nena_run\t%s\nread_pairs\t%s\ngraph\tbridgeasm-k31/assembly.gfa\n' \
+            "$SOURCE_RUN_ID" "$ENA_RUN" "$READ_PAIRS" > provenance.tsv
+
+      - name: Download the same deterministic 50k read pairs
+        run: |
+          python scripts/download_ena_subset.py "$ENA_RUN" reads --pairs "$READ_PAIRS"
+          test -s "reads/${ENA_RUN}_1.fastq.gz"
+          test -s "reads/${ENA_RUN}_2.fastq.gz"
+
+      - name: PLASS protein preassembly
+        run: |
+          mkdir -p plass_tmp
+          plass assemble \
+            "reads/${ENA_RUN}_1.fastq.gz" \
+            "reads/${ENA_RUN}_2.fastq.gz" \
+            plass.raw.faa plass_tmp --threads 2
+          test -s plass.raw.faa
+          python biological_brain/dedup_proteins.py \
+            plass.raw.faa plass.faa \
+            --collapse-contained \
+            --mapping plass.dedup.tsv \
+            --json plass.dedup.json
+
+      - name: Project protein and DNA-LM evidence onto existing graph links
+        run: |
+          python biological_brain/protein_bridge_evidence.py \
+            --gfa graph.gfa --proteins plass.faa \
+            --output protein_evidence.tsv \
+            --junction-nt 300 --max-kmer-occurrences 24
+          python biological_brain/kmer_junction_lm.py \
+            --gfa graph.gfa --output dna_lm.tsv
+
+      - name: Conservative path ablation
+        run: |
+          cargo build --release --bin bridgeasm-evidence-path
+          common=(--gfa graph.gfa --edge-evidence protein_evidence.tsv --mode conservative --min-length 200)
+          target/release/bridgeasm-evidence-path \
+            "${common[@]}" \
+            --protein-weight 0 --esm-weight 0 --dna-lm-weight 0 \
+            --output physical_only.fasta --report physical_only.tsv
+          target/release/bridgeasm-evidence-path \
+            "${common[@]}" \
+            --protein-weight 2400 --esm-weight 0 --dna-lm-weight 0 \
+            --output physical_plus_plass.fasta --report physical_plus_plass.tsv
+          target/release/bridgeasm-evidence-path \
+            "${common[@]}" --dna-lm-scores dna_lm.tsv \
+            --protein-weight 2400 --esm-weight 0 --dna-lm-weight 180 \
+            --output physical_plus_plass_dna.fasta --report physical_plus_plass_dna.tsv
+
+      - name: Download Zymo references
+        run: |
+          curl -L --retry 3 -o refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir refs
+          unzip -q refs.zip -d refs
+          find refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > reference.fasta
+          test -s reference.fasta
+
+      - name: MetaQUAST nucleotide correctness
+        run: |
+          metaquast.py \
+            physical_only.fasta \
+            physical_plus_plass.fasta \
+            physical_plus_plass_dna.fasta \
+            -r reference.fasta \
+            -o metaquast --threads 2 --min-contig 200 --no-plots
+          cp metaquast/combined_reference/report.tsv nucleotide_report.tsv
+          cp metaquast/combined_reference/transposed_report.tsv nucleotide_transposed.tsv
+          cat nucleotide_report.tsv
+
+      - name: Protein recall across nucleotide assemblers and PLASS
+        run: |
+          mkdir protein
+          prodigal -q -p meta -i reference.fasta -a protein/reference.faa
+          for label in bridgeasm-k31 megahit metaspades; do
+            prodigal -q -p meta -i "baseline/${label}.fasta" -a "protein/${label}.faa"
+          done
+          for label in physical_only physical_plus_plass physical_plus_plass_dna; do
+            prodigal -q -p meta -i "${label}.fasta" -a "protein/${label}.faa"
+          done
+          cp plass.faa protein/plass_standalone.faa
+
+          for label in bridgeasm-k31 megahit metaspades plass_standalone physical_only physical_plus_plass physical_plus_plass_dna; do
+            rm -rf "/tmp/mmseqs-${label}"
+            mmseqs easy-search \
+              protein/reference.faa "protein/${label}.faa" "protein/${label}.m8" "/tmp/mmseqs-${label}" \
+              --threads 2 -s 7.5 -e 1e-3 --max-seqs 50 \
+              --format-output 'query,target,fident,alnlen,qstart,qend,qlen,tstart,tend,tlen,evalue,bits'
+          done
+          python scripts/protein_recall.py \
+            --reference protein/reference.faa \
+            --sample bridgeasm-k31 protein/bridgeasm-k31.faa protein/bridgeasm-k31.m8 \
+            --sample megahit protein/megahit.faa protein/megahit.m8 \
+            --sample metaspades protein/metaspades.faa protein/metaspades.m8 \
+            --sample plass_standalone protein/plass_standalone.faa protein/plass_standalone.m8 \
+            --sample physical_only protein/physical_only.faa protein/physical_only.m8 \
+            --sample physical_plus_plass protein/physical_plus_plass.faa protein/physical_plus_plass.m8 \
+            --sample physical_plus_plass_dna protein/physical_plus_plass_dna.faa protein/physical_plus_plass_dna.m8 \
+            --min-identity 0.80 --min-query-coverage 0.80 --min-target-coverage 0.80 \
+            --json protein_recall.json | tee protein_recall.tsv
+
+      - name: Edge-level ablation summary
+        run: |
+          python - <<'PY'
+          import csv, json
+          from collections import Counter
+
+          def selected(path):
+              with open(path, newline='') as handle:
+                  return {
+                      (row['source'], row['target'])
+                      for row in csv.DictReader(handle, delimiter='\t')
+                      if row['selected'] == 'true'
+                  }
+
+          classes = Counter()
+          protein_ok = set()
+          with open('protein_evidence.tsv', newline='') as handle:
+              for row in csv.DictReader(handle, delimiter='\t'):
+                  classes[row['breakpoint_class']] += 1
+                  if row['breakpoint_class'] == 'same_orf_supported':
+                      protein_ok.add((row['source'], row['target']))
+
+          control = selected('physical_only.tsv')
+          plass = selected('physical_plus_plass.tsv')
+          fused = selected('physical_plus_plass_dna.tsv')
+          summary = {
+              'source_run_id': 33306726454,
+              'ena_run': 'ERR2935805',
+              'read_pairs': 50000,
+              'graph': 'bridgeasm-k31/assembly.gfa',
+              'protein_evidence_classes': dict(classes),
+              'same_orf_supported_edges': len(protein_ok),
+              'same_orf_selected_control': len(protein_ok & control),
+              'same_orf_selected_plass': len(protein_ok & plass),
+              'physical_only_edges': len(control),
+              'plass_edges': len(plass),
+              'plass_symmetric_difference': len(control ^ plass),
+              'plass_added': len(plass - control),
+              'plass_removed': len(control - plass),
+              'fused_edges': len(fused),
+              'dna_symmetric_difference_vs_plass': len(plass ^ fused),
+              'safety_rule': 'Conservative mode: protein and DNA-LM only rank physically eligible existing GFA links.',
+          }
+          with open('edge_summary.json', 'w') as handle:
+              json.dump(summary, handle, indent=2, sort_keys=True)
+              handle.write('\n')
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: biological-brain-zymo-50k
+          path: |
+            provenance.tsv
+            baseline/bridgeasm-k31.fasta
+            baseline/megahit.fasta
+            baseline/metaspades.fasta
+            plass.faa
+            plass.dedup.json
+            plass.dedup.tsv
+            protein_evidence.tsv
+            dna_lm.tsv
+            physical_only.tsv
+            physical_plus_plass.tsv
+            physical_plus_plass_dna.tsv
+            nucleotide_report.tsv
+            nucleotide_transposed.tsv
+            protein_recall.tsv
+            protein_recall.json
+            edge_summary.json
+          if-no-files-found: warn
+          retention-days: 14

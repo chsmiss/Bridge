@@ -1,0 +1,42 @@
+name: Biological Brain core gate
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - biological_brain/**
+      - src/bin/bridgeasm-evidence-path.rs
+      - tests/test_biological_brain.py
+      - .github/workflows/biological-brain-core.yml
+  pull_request:
+    paths:
+      - biological_brain/**
+      - src/bin/bridgeasm-evidence-path.rs
+      - tests/test_biological_brain.py
+      - .github/workflows/biological-brain-core.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile Python modules
+        run: |
+          python -m py_compile \
+            biological_brain/protein_bridge_evidence.py \
+            biological_brain/kmer_junction_lm.py \
+            biological_brain/esm_breakpoint_score.py \
+            biological_brain/extract_fastq_urls.py \
+            biological_brain/assembly_stats.py \
+            tests/test_biological_brain.py
+      - name: Compile the evidence-aware path selector
+        run: cargo check --bin bridgeasm-evidence-path
+      - name: Run deterministic biological-evidence tests
+        run: python tests/test_biological_brain.py

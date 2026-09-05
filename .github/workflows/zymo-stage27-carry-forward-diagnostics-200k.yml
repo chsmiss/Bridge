@@ -1,0 +1,273 @@
+name: Zymo 200k Stage27 carry-forward diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage27-carry-forward-diagnostics-200k.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zymo-stage27-carry-forward-diagnostics-200k
+  cancel-in-progress: true
+
+env:
+  PAIRS: '200000'
+  THREADS: '2'
+  STAGE24_RUN_ID: '33838098251'
+  STAGE24_ARTIFACT: zymo-stage24-single-fragment-ab-200k
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          for attempt in 1 2 3; do
+            rm -rf /tmp/zymo-log
+            if python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "ENA subset download failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            > benchmark/reference_split.tsv
+
+      - name: Reuse verified Stage24 pair2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.STAGE24_ARTIFACT }}
+          path: /tmp/stage24
+          github-token: ${{ github.token }}
+          repository: chsmiss/Bridge
+          run-id: ${{ env.STAGE24_RUN_ID }}
+
+      - name: Verify seed and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          seed=/tmp/stage24/assemblies/bridge_pair2_final.fasta
+          test -s "$seed"
+          cp "$seed" benchmark/assemblies/stage24_pair2.fasta
+          python3 scripts/fasta_stats.py "$seed" --json benchmark/stage24_pair2.stats.json \
+            > benchmark/stage24_pair2.stats.tsv
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('benchmark/stage24_pair2.stats.json').read_text())
+          expected={'sequences':1469,'total_bp':3216914,'n50':10181}
+          got={k:s[k] for k in expected}
+          if got != expected:
+              raise SystemExit(f'wrong Stage24 pair2 seed: expected {expected}, got {got}')
+          print('verified Stage24 pair2 seed:', got)
+          PY
+          python3 -m py_compile scripts/stage26_stage24_carry_forward.py scripts/stitch_exact_overlaps.py
+          PYTHONPATH=scripts python3 scripts/test_stage26_stage24_carry_forward.py
+          cargo build --release
+
+      - name: Run one threaded carry-forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage27_carry.time.txt \
+            python3 scripts/stage26_stage24_carry_forward.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --seed-fasta benchmark/assemblies/stage24_pair2.fasta \
+              --output benchmark/stage27_carry \
+              --threads "$THREADS" \
+              --prior-min-length 200 \
+              --legacy-multik \
+              --stitch-min-overlap 40 \
+              --stitch-overlap-margin 10 \
+              2>&1 | tee benchmark/stage27_carry.log
+          cp benchmark/stage27_carry/k31/primary_contigs.fasta benchmark/assemblies/k31_primary.fasta
+          cp benchmark/stage27_carry/k41/primary_contigs.fasta benchmark/assemblies/k41_primary.fasta
+          cp benchmark/stage27_carry/k55/primary_contigs.fasta benchmark/assemblies/k55_primary.fasta
+          cp benchmark/stage27_carry/cross_k_noncontained.fasta benchmark/assemblies/all_noncontained.fasta
+          cp benchmark/stage27_carry/primary_contigs.fasta benchmark/assemblies/all_stitch40.fasta
+
+      - name: Build source-subset and conservative stitch candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/stage27_candidates
+          python3 scripts/merge_fasta_unique.py benchmark/stage27_candidates/primary_only_union.fasta \
+            benchmark/assemblies/stage24_pair2.fasta \
+            benchmark/stage27_carry/k31/primary_contigs.fasta \
+            benchmark/stage27_carry/k41/primary_contigs.fasta \
+            benchmark/stage27_carry/k55/primary_contigs.fasta \
+            --min-length 200
+          python3 scripts/filter_contained_fasta.py \
+            benchmark/stage27_candidates/primary_only_union.fasta \
+            benchmark/stage27_candidates/primary_only_noncontained.fasta \
+            --min-length 200 --seed-k 21 --window 12 --candidate-minimizers 16 \
+            --stats-json benchmark/stage27_candidates/primary_only_containment.json
+
+          python3 scripts/merge_fasta_unique.py benchmark/stage27_candidates/k31_only_union.fasta \
+            benchmark/assemblies/stage24_pair2.fasta \
+            benchmark/stage27_carry/k31/primary_contigs.fasta \
+            --min-length 200
+          python3 scripts/filter_contained_fasta.py \
+            benchmark/stage27_candidates/k31_only_union.fasta \
+            benchmark/stage27_candidates/k31_only_noncontained.fasta \
+            --min-length 200 --seed-k 21 --window 12 --candidate-minimizers 16 \
+            --stats-json benchmark/stage27_candidates/k31_only_containment.json
+
+          python3 scripts/stitch_exact_overlaps.py \
+            benchmark/assemblies/all_stitch80.fasta benchmark/stage27_carry/cross_k_noncontained.fasta \
+            --min-overlap 80 --overlap-margin 20 --seed-length 31 --max-seed-occurrences 64 --min-length 200 \
+            2>&1 | tee benchmark/stitch80.log
+          python3 scripts/stitch_exact_overlaps.py \
+            benchmark/assemblies/all_stitch120.fasta benchmark/stage27_carry/cross_k_noncontained.fasta \
+            --min-overlap 120 --overlap-margin 30 --seed-length 31 --max-seed-occurrences 64 --min-length 200 \
+            2>&1 | tee benchmark/stitch120.log
+          python3 scripts/stitch_exact_overlaps.py \
+            benchmark/assemblies/primary_only_stitch80.fasta benchmark/stage27_candidates/primary_only_noncontained.fasta \
+            --min-overlap 80 --overlap-margin 20 --seed-length 31 --max-seed-occurrences 64 --min-length 200 \
+            2>&1 | tee benchmark/primary_only_stitch80.log
+          python3 scripts/stitch_exact_overlaps.py \
+            benchmark/assemblies/k31_only_stitch80.fasta benchmark/stage27_candidates/k31_only_noncontained.fasta \
+            --min-overlap 80 --overlap-margin 20 --seed-length 31 --max-seed-occurrences 64 --min-length 200 \
+            2>&1 | tee benchmark/k31_only_stitch80.log
+
+      - name: FASTA stats and Stage24 k21 retention
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in benchmark/assemblies/*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" > "benchmark/${name}.stats.tsv"
+          done
+          PYTHONPATH=scripts python3 - <<'PY'
+          from pathlib import Path
+          import stage23_guided_singleton_rescue as s23
+          seed_path=Path('benchmark/assemblies/stage24_pair2.fasta')
+          seed=s23.fasta_keyset(seed_path,21)
+          with Path('benchmark/stage27_k21_retention.tsv').open('w') as out:
+              out.write('assembly\tseed_k21\tretained_seed_k21\tlost_seed_k21\tretained_pct\tnew_k21\ttotal_k21\n')
+              for path in sorted(Path('benchmark/assemblies').glob('*.fasta')):
+                  keys=s23.fasta_keyset(path,21)
+                  retained=len(seed & keys); lost=len(seed-keys); new=len(keys-seed)
+                  pct=100.0*retained/len(seed) if seed else 100.0
+                  out.write(f'{path.stem}\t{len(seed)}\t{retained}\t{lost}\t{pct:.6f}\t{new}\t{len(keys)}\n')
+          print(Path('benchmark/stage27_k21_retention.tsv').read_text())
+          PY
+
+      - name: MetaQUAST diagnostic matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/stage24_pair2.fasta \
+            benchmark/assemblies/k31_primary.fasta \
+            benchmark/assemblies/k41_primary.fasta \
+            benchmark/assemblies/k55_primary.fasta \
+            benchmark/assemblies/all_noncontained.fasta \
+            benchmark/assemblies/all_stitch40.fasta \
+            benchmark/assemblies/all_stitch80.fasta \
+            benchmark/assemblies/all_stitch120.fasta \
+            benchmark/assemblies/primary_only_stitch80.fasta \
+            benchmark/assemblies/k31_only_stitch80.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Pseudomonas diagnostic QUAST
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/quast.py \
+            benchmark/assemblies/stage24_pair2.fasta \
+            benchmark/assemblies/all_stitch40.fasta \
+            benchmark/assemblies/all_stitch80.fasta \
+            benchmark/assemblies/all_stitch120.fasta \
+            benchmark/assemblies/primary_only_stitch80.fasta \
+            benchmark/assemblies/k31_only_stitch80.fasta \
+            -r /tmp/zymo-species-refs/Pseudomonas_aeruginosa.fasta \
+            -o benchmark/pseudomonas_quast --threads "$THREADS" --min-contig 200 --no-plots
+
+      - name: Summarize diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv,json,re
+          from pathlib import Path
+
+          def rows(path):
+              with Path(path).open() as h:
+                  return list(csv.DictReader(h,delimiter='\t'))
+
+          meta={r['Assembly']:r for r in rows('benchmark/metaquast_summary.tsv')}
+          retention={r['assembly']:r for r in rows('benchmark/stage27_k21_retention.tsv')}
+          names=['stage24_pair2','k31_primary','k41_primary','k55_primary','all_noncontained','all_stitch40','all_stitch80','all_stitch120','primary_only_stitch80','k31_only_stitch80']
+          accepted={}
+          for name,log in [('all_stitch40','stage27_carry.log'),('all_stitch80','stitch80.log'),('all_stitch120','stitch120.log'),('primary_only_stitch80','primary_only_stitch80.log'),('k31_only_stitch80','k31_only_stitch80.log')]:
+              text=Path('benchmark/'+log).read_text(errors='replace')
+              vals=re.findall(r'accepted=(\d+)',text)
+              accepted[name]=int(vals[-1]) if vals else 0
+          out=Path('benchmark/stage27_comparison.tsv')
+          with out.open('w') as h:
+              h.write('assembly\tn50\ttotal_bp\tge500\tcombined_gf\tna50\tdup\tmisassemblies\tlocal_misassemblies\tseed_k21_retained_pct\tseed_k21_lost\tnew_k21\taccepted_stitches\n')
+              for name in names:
+                  fs=json.loads(Path(f'benchmark/{name}.stats.json').read_text())
+                  m=meta[name]; kr=retention[name]
+                  h.write(f'{name}\t{fs["n50"]}\t{fs["total_bp"]}\t{fs["ge_500"]}\t{float(m["Genome fraction (%)"]):.4f}\t{float(m["NA50"]):.1f}\t{float(m["Duplication ratio"]):.4f}\t{int(float(m["# misassemblies"]))}\t{int(float(m["# local misassemblies"]))}\t{float(kr["retained_pct"]):.6f}\t{kr["lost_seed_k21"]}\t{kr["new_k21"]}\t{accepted.get(name,0)}\n')
+          print(out.read_text())
+          PY
+
+      - name: Save provenance
+        shell: bash
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nseed_source_run\t%s\nseed_source_artifact\t%s\nexperiment\tStage27_carry_forward_diagnostics\n' \
+            "$GITHUB_SHA" "$PAIRS" "$STAGE24_RUN_ID" "$STAGE24_ARTIFACT" > benchmark/benchmark_provenance.tsv
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage27-carry-forward-diagnostics-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.log
+            benchmark/*.time.txt
+            benchmark/stage27_candidates/*.json
+            benchmark/stage27_carry/pipeline_manifest.json
+            benchmark/stage27_carry/containment_stats.json
+          retention-days: 14

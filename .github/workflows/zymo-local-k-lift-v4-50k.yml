@@ -1,0 +1,202 @@
+name: Zymo 50k local-k lift v4
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/local_k_lift_v3.py
+      - scripts/local_k_lift_v4.py
+      - .github/workflows/zymo-local-k-lift-v4-50k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-local-k-lift-v4-50k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PAIRS: "50000"
+      SEED: "43"
+      WINDOWS: "5"
+      TOTAL_SPOTS: "23916276"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sra-toolkit curl unzip time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Reproduce random 50k sample and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zymo benchmark/assemblies benchmark/times
+          python3 - <<'PY'
+          import os, random
+          total = int(os.environ['TOTAL_SPOTS'])
+          pairs = int(os.environ['PAIRS'])
+          windows = int(os.environ['WINDOWS'])
+          rng = random.Random(int(os.environ['SEED']))
+          sizes = [pairs // windows] * windows
+          for index in range(pairs % windows):
+              sizes[index] += 1
+          chosen = []
+          for size in sizes:
+              for _ in range(100000):
+                  start = rng.randint(1, total - size + 1)
+                  end = start + size - 1
+                  if all(end < a or start > b for a, b in chosen):
+                      chosen.append((start, end))
+                      break
+              else:
+                  raise SystemExit('failed to choose windows')
+          chosen.sort()
+          with open('/tmp/zymo/ranges.tsv', 'w') as handle:
+              handle.write('window\tstart_spot\tend_spot\tpairs\n')
+              for index, (start, end) in enumerate(chosen, 1):
+                  handle.write(f'{index}\t{start}\t{end}\t{end-start+1}\n')
+          PY
+          : > /tmp/zymo/R1.fastq.gz
+          : > /tmp/zymo/R2.fastq.gz
+          tail -n +2 /tmp/zymo/ranges.tsv | while IFS=$'\t' read -r idx start end count; do
+            part="/tmp/zymo/part-${idx}"
+            mkdir -p "$part"
+            (
+              cd "$part"
+              fastq-dump ERR2935805 -N "$start" -X "$end" --split-files --skip-technical --gzip
+            )
+            cat "$part/ERR2935805_1.fastq.gz" >> /tmp/zymo/R1.fastq.gz
+            cat "$part/ERR2935805_2.fastq.gz" >> /tmp/zymo/R2.fastq.gz
+          done
+          test "$(gzip -cd /tmp/zymo/R1.fastq.gz | awk 'END {print NR/4}')" -eq "$PAIRS"
+          test "$(gzip -cd /tmp/zymo/R2.fastq.gz | awk 'END {print NR/4}')" -eq "$PAIRS"
+
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build BridgeAsm
+        run: cargo build --release
+
+      - name: High-recall k21 backbone
+        run: |
+          mkdir -p benchmark/bridge_island60
+          /usr/bin/time -v -o benchmark/times/bridge_island60.time.txt \
+            env BRIDGEASM_MATE_TERMINAL_MERCY_KMERS=0 \
+                BRIDGEASM_SINGLETON_ISLAND_MIN_FRACTION=0.60 \
+                BRIDGEASM_SINGLETON_ISLAND_MIN_QUALITY=30 \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/bridge_island60 -k 21 \
+              --min-count 2 --mercy-max-kmers 24 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 2 --min-pair-support 2 \
+              --min-primary-support 5 --primary-dominance 0.75 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridge_island60/primary_contigs.fasta benchmark/assemblies/bridge_island60.fasta
+
+      - name: Weighted component-local k-lift v4
+        run: |
+          mkdir -p benchmark/local_k_lift_v4
+          /usr/bin/time -v -o benchmark/times/local_k_lift_v4.time.txt \
+            python3 scripts/local_k_lift_v4.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo/R1.fastq.gz --read2 /tmp/zymo/R2.fastq.gz \
+              --base-dir benchmark/bridge_island60 --output benchmark/local_k_lift_v4 \
+              --base-k 21 --candidate-k 31,41,55,77 \
+              --seed-k 11 --radius 3 --max-nodes 96 --max-neighborhoods 32 \
+              --min-neighborhood-coverage 1.5 --max-overlap-fraction 0.30 \
+              --min-seed-hits 2 --min-top-fraction 0.30 --soft-second-fraction 0.65 \
+              --min-pairs 20 --carry-read-length 101 --carry-stride 20 \
+              --min-candidate-base-fraction 0.92 --branch-fraction 0.90 \
+              --n50-gain 1.08 --min-base-gain 1.01 \
+              --stitch-min-overlap 80 --min-contig-length 200 --threads 2
+          cp benchmark/local_k_lift_v4/local_lift_contigs.fasta benchmark/assemblies/bridge_local_k_lift_v4.fasta
+
+      - name: MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_island60.fasta \
+            benchmark/assemblies/bridge_local_k_lift_v4.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+
+      - name: Summarize
+        run: |
+          python3 - <<'PY'
+          import csv, re
+          from pathlib import Path
+
+          report = Path('benchmark/metaquast/combined_reference/report.tsv')
+          with report.open() as handle:
+              reader = csv.reader(handle, delimiter='\t')
+              header = next(reader)
+              names = header[1:]
+              rows = {row[0]: row[1:] for row in reader if row}
+          metrics = [
+              'Genome fraction (%)', 'N50', 'NA50', '# contigs', 'Total length',
+              'Largest contig', '# misassemblies', 'Duplication ratio', 'Total aligned length'
+          ]
+
+          def parse_wall(value):
+              parts = value.split(':')
+              if len(parts) == 2:
+                  return float(parts[0]) * 60 + float(parts[1])
+              return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+
+          def resources(paths):
+              wall = 0.0
+              peak = 0
+              for filename in paths:
+                  text = Path(filename).read_text()
+                  match = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text)
+                  if match:
+                      wall += parse_wall(match.group(1))
+                  match = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text)
+                  if match:
+                      peak = max(peak, int(match.group(1)))
+              return wall, peak
+
+          times = {
+              'bridge_island60': ['benchmark/times/bridge_island60.time.txt'],
+              'bridge_local_k_lift_v4': [
+                  'benchmark/times/bridge_island60.time.txt',
+                  'benchmark/times/local_k_lift_v4.time.txt',
+              ],
+          }
+          output = Path('benchmark/summary.tsv')
+          with output.open('w') as handle:
+              handle.write('assembly\t' + '\t'.join(metrics) + '\twall_seconds\tpeak_rss_mib\n')
+              for index, name in enumerate(names):
+                  wall, peak = resources(times[name])
+                  values = [rows.get(metric, ['NA'] * len(names))[index] for metric in metrics]
+                  handle.write(name + '\t' + '\t'.join(values) + f'\t{wall:.3f}\t{peak/1024:.1f}\n')
+          print(output.read_text())
+          print('v4 summary:')
+          print(Path('benchmark/local_k_lift_v4/summary.json').read_text())
+          print('v4 choices:')
+          print(Path('benchmark/local_k_lift_v4/local_k_choices.tsv').read_text())
+          PY
+          cp /tmp/zymo/ranges.tsv benchmark/random_ranges.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-local-k-lift-v4-50k
+          path: benchmark
+          retention-days: 14

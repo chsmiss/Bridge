@@ -1,0 +1,160 @@
+name: Zymo Log GF challenge
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: Number of ERR2935805 read pairs
+        required: false
+        default: "500000"
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-gf-challenge.yml
+
+concurrency:
+  group: zymo-gf-challenge-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PAIRS: ${{ inputs.pairs || '500000' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install assembler and evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+      - name: Download deterministic reads and Zymo references
+        run: |
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          python3 - <<'PY'
+          import gzip, json
+          from pathlib import Path
+          path = Path('/tmp/zymo-log/ERR2935805_1.fastq.gz')
+          with gzip.open(path, 'rt') as handle:
+              handle.readline()
+              sequence = handle.readline().strip()
+          Path('benchmark/read_length.txt').write_text(f'{len(sequence)}\n')
+          print(f'observed read length: {len(sequence)}')
+          PY
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+      - name: Build BridgeAsm
+        run: cargo build --release
+      - name: Run focused BridgeAsm configurations
+        run: |
+          run_bridgeasm() {
+            name=$1
+            k=$2
+            mercy=$3
+            quality=$4
+            min_read=$5
+            min_primary=$6
+            dominance=$7
+            mkdir -p "benchmark/$name"
+            /usr/bin/time -v -o "benchmark/$name.time.txt" \
+              target/release/bridgeasm assemble \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -o "benchmark/$name" -k "$k" \
+                --min-count 2 --mercy-max-kmers "$mercy" \
+                --mercy-min-support 1 --mercy-min-quality "$quality" \
+                --min-read-support "$min_read" --min-pair-support 2 \
+                --min-primary-support "$min_primary" \
+                --primary-dominance "$dominance" \
+                --min-contig-length 200 --threads 2
+          }
+          run_bridgeasm k21-long-q25 21 64 25 2 5 0.75
+          run_bridgeasm k21-long-q30 21 64 30 2 5 0.75
+          run_bridgeasm k21-long-q35 21 64 35 2 5 0.75
+          run_bridgeasm k25-long-q30 25 64 30 2 5 0.75
+          run_bridgeasm k29-long-q30 29 64 30 2 5 0.75
+          run_bridgeasm k31-long-q25 31 64 25 2 5 0.75
+          run_bridgeasm k31-long-q30 31 64 30 2 5 0.75
+          run_bridgeasm k31-long-q35 31 64 35 2 5 0.75
+          run_bridgeasm k31-relaxed 31 16 25 1 3 0.67
+          run_bridgeasm k31-long-q30-relaxed 31 64 30 1 3 0.67
+          run_bridgeasm k41-long-q30 41 48 30 2 5 0.75
+      - name: Prepare exact recovery layers
+        run: |
+          names="k21-long-q25 k21-long-q30 k21-long-q35 k25-long-q30 k29-long-q30 k31-long-q25 k31-long-q30 k31-long-q35 k31-relaxed k31-long-q30-relaxed k41-long-q30"
+          for name in $names; do
+            cp "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/assemblies/$name-primary.fasta"
+            python3 scripts/merge_fasta_unique.py \
+              "benchmark/assemblies/$name-all-exact.fasta" \
+              "benchmark/$name/primary_contigs.fasta" \
+              "benchmark/$name/unitigs.fasta" \
+              "benchmark/$name/haplotigs.fasta" \
+              --min-length 200
+          done
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/assemblies/challenge-primary-union.fasta \
+            benchmark/assemblies/*-primary.fasta \
+            --min-length 200
+          python3 scripts/merge_fasta_unique.py \
+            benchmark/assemblies/challenge-exact-union.fasta \
+            benchmark/assemblies/*-all-exact.fasta \
+            --min-length 200
+          for fasta in benchmark/assemblies/*.fasta; do
+            base=$(basename "$fasta" .fasta)
+            python3 scripts/fasta_stats.py "$fasta" \
+              --json "benchmark/$base.stats.json" \
+              > "benchmark/$base.stats.tsv"
+          done
+      - name: Run MEGAHIT
+        run: |
+          /usr/bin/time -v -o benchmark/megahit.time.txt \
+            megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+          python3 scripts/fasta_stats.py benchmark/megahit/final.contigs.fa \
+            --json benchmark/megahit.stats.json > benchmark/megahit.stats.tsv
+      - name: Run MetaQUAST GF challenge
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/k21-long-q25-primary.fasta \
+            benchmark/assemblies/k21-long-q30-primary.fasta \
+            benchmark/assemblies/k21-long-q35-primary.fasta \
+            benchmark/assemblies/k25-long-q30-primary.fasta \
+            benchmark/assemblies/k29-long-q30-primary.fasta \
+            benchmark/assemblies/k31-long-q25-primary.fasta \
+            benchmark/assemblies/k31-long-q30-primary.fasta \
+            benchmark/assemblies/k31-long-q35-primary.fasta \
+            benchmark/assemblies/k31-relaxed-primary.fasta \
+            benchmark/assemblies/k31-long-q30-relaxed-primary.fasta \
+            benchmark/assemblies/k41-long-q30-primary.fasta \
+            benchmark/assemblies/challenge-primary-union.fasta \
+            benchmark/assemblies/challenge-exact-union.fasta \
+            benchmark/assemblies/megahit.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\nchallenge\tlong_mercy_and_emission_thresholds\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-log-gf-challenge-500k
+          path: benchmark
+          retention-days: 14

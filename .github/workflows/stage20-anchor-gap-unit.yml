@@ -1,0 +1,27 @@
+name: Stage20 anchor-gap unit
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/stage20-anchor-gap-unit.yml
+      - scripts/stage20_anchor_gap_thread.py
+      - scripts/test_stage20_anchor_gap_thread.py
+      - scripts/graph_path_phaser.py
+      - scripts/stage16_root_cause.py
+      - scripts/stage17_frontier_recovery.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test anchor-constrained threading
+        run: |
+          python3 -m py_compile scripts/stage20_anchor_gap_thread.py scripts/test_stage20_anchor_gap_thread.py
+          PYTHONPATH=scripts python3 scripts/test_stage20_anchor_gap_thread.py

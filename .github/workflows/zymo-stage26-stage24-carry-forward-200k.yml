@@ -1,0 +1,261 @@
+name: Zymo 200k Stage26 Stage24-seeded carry-forward
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage26-stage24-carry-forward-200k.yml
+      - scripts/stage26_stage24_carry_forward.py
+      - scripts/test_stage26_stage24_carry_forward.py
+      - scripts/stage23_guided_singleton_rescue.py
+      - scripts/test_stage23_guided_singleton_rescue.py
+      - scripts/bridge_carry_forward_pipeline.py
+      - scripts/merge_fasta_unique.py
+      - scripts/filter_contained_fasta.py
+      - scripts/stitch_exact_overlaps.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage26-stage24-carry-forward-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate and build BridgeAsm
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          python3 -m py_compile \
+            scripts/stage23_guided_singleton_rescue.py \
+            scripts/test_stage23_guided_singleton_rescue.py \
+            scripts/bridge_carry_forward_pipeline.py \
+            scripts/stage26_stage24_carry_forward.py \
+            scripts/test_stage26_stage24_carry_forward.py
+          PYTHONPATH=scripts python3 scripts/test_stage23_guided_singleton_rescue.py
+          PYTHONPATH=scripts python3 scripts/test_stage26_stage24_carry_forward.py
+          cargo build --release
+
+      - name: Build fixed Stage8 and Stage10 once
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/current \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/current \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 3 \
+            --lookahead-max-branch 4
+          /usr/bin/time -v -o benchmark/stage10.time.txt \
+            python3 scripts/stage10_multik_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" --ks 17,21,25,31
+
+      - name: Build Stage24 pair2 seed
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage24_pair2.time.txt \
+            python3 scripts/stage23_guided_singleton_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" \
+              --singleton-quality 30 \
+              --min-distinct-singleton-fragments 2
+          mv benchmark/current/stage23_guided_singleton benchmark/current/stage24_pair2
+          cp benchmark/current/stage24_pair2/candidate_guided_singleton/primary_contigs.fasta \
+             benchmark/assemblies/stage24_pair2.fasta
+          cp benchmark/current/stage24_pair2/stage23_stats.json benchmark/stage24_pair2_stats.json
+
+      - name: Carry Stage24 seed with threaded path cover only
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage26_threaded.time.txt \
+            python3 scripts/stage26_stage24_carry_forward.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --seed-fasta benchmark/assemblies/stage24_pair2.fasta \
+              --output benchmark/stage26_threaded \
+              --threads "$THREADS" \
+              --prior-min-length 200
+          cp benchmark/stage26_threaded/primary_contigs.fasta \
+             benchmark/assemblies/stage26_threaded.fasta
+
+      - name: Carry Stage24 seed with major path cover
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage26_major.time.txt \
+            python3 scripts/stage26_stage24_carry_forward.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --seed-fasta benchmark/assemblies/stage24_pair2.fasta \
+              --output benchmark/stage26_major \
+              --threads "$THREADS" \
+              --prior-min-length 200 \
+              --major-path-cover
+          cp benchmark/stage26_major/primary_contigs.fasta \
+             benchmark/assemblies/stage26_major.fasta
+
+      - name: Measure Stage24 seed k21 retention
+        run: |
+          PYTHONPATH=scripts python3 - <<'PY'
+          from pathlib import Path
+          import stage23_guided_singleton_rescue as s23
+
+          assemblies = {
+              'stage24_pair2': Path('benchmark/assemblies/stage24_pair2.fasta'),
+              'stage26_threaded': Path('benchmark/assemblies/stage26_threaded.fasta'),
+              'stage26_major': Path('benchmark/assemblies/stage26_major.fasta'),
+          }
+          keysets = {name: s23.fasta_keyset(path, 21) for name, path in assemblies.items()}
+          seed = keysets['stage24_pair2']
+          with Path('benchmark/stage26_k21_retention.tsv').open('w') as out:
+              out.write('assembly\tseed_k21\tretained_seed_k21\tlost_seed_k21\tretained_pct\tnew_k21\ttotal_k21\n')
+              for name, keys in keysets.items():
+                  retained = len(seed & keys)
+                  lost = len(seed - keys)
+                  new = len(keys - seed)
+                  pct = 100.0 * retained / len(seed) if seed else 100.0
+                  out.write(f'{name}\t{len(seed)}\t{retained}\t{lost}\t{pct:.6f}\t{new}\t{len(keys)}\n')
+          print(Path('benchmark/stage26_k21_retention.tsv').read_text())
+          PY
+
+      - name: FASTA stats
+        run: |
+          for f in benchmark/assemblies/*.fasta; do
+            name="$(basename "$f" .fasta)"
+            python3 scripts/fasta_stats.py "$f" --json "benchmark/${name}.stats.json" \
+              > "benchmark/${name}.stats.tsv"
+          done
+
+      - name: Run combined-reference MetaQUAST
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/stage24_pair2.fasta \
+            benchmark/assemblies/stage26_threaded.fasta \
+            benchmark/assemblies/stage26_major.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py \
+            benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Run per-bacterium QUAST
+        run: |
+          set -euo pipefail
+          assemblies=(benchmark/assemblies/stage24_pair2.fasta benchmark/assemblies/stage26_threaded.fasta benchmark/assemblies/stage26_major.fasta)
+          for ref in /tmp/zymo-species-refs/{Bacillus_subtilis,Enterococcus_faecalis,Escherichia_coli,Lactobacillus_fermentum,Listeria_monocytogenes,Pseudomonas_aeruginosa,Salmonella_enterica,Staphylococcus_aureus}.fasta; do
+            species="$(basename "$ref" .fasta)"
+            python3 /tmp/quast-5.3.0/quast.py "${assemblies[@]}" -r "$ref" \
+              -o "benchmark/species_quast/$species" --threads "$THREADS" --min-contig 200 --no-plots
+          done
+          python3 scripts/summarize_species_quast.py benchmark/species_quast \
+            --json benchmark/species_summary.json | tee benchmark/species_summary.tsv
+
+      - name: Summarize Stage24-seeded carry-forward
+        run: |
+          python3 - <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+
+          def rows(path):
+              with Path(path).open() as handle:
+                  return list(csv.DictReader(handle, delimiter='\t'))
+
+          meta = {r['Assembly']: r for r in rows('benchmark/metaquast_summary.tsv')}
+          species = {r['assembly']: r for r in rows('benchmark/species_summary.tsv')}
+          retention = {r['assembly']: r for r in rows('benchmark/stage26_k21_retention.tsv')}
+          names = ['stage24_pair2', 'stage26_threaded', 'stage26_major']
+          p = Path('benchmark/stage26_comparison.tsv')
+          with p.open('w') as out:
+              out.write('assembly\tn50\ttotal_bp\tge500\tmean_gf\tpseudomonas_gf\tcombined_gf\tna50\tdup\tmisassemblies\tlocal_misassemblies\tseed_k21_retained_pct\tseed_k21_lost\tnew_k21\n')
+              for name in names:
+                  fs = json.loads(Path(f'benchmark/{name}.stats.json').read_text())
+                  m = meta[name]
+                  sp = species[name]
+                  kr = retention[name]
+                  out.write(
+                      f'{name}\t{fs["n50"]}\t{fs["total_bp"]}\t{fs["ge_500"]}\t'
+                      f'{float(sp["bacteria_mean_gf"]):.4f}\t{float(sp["pseudomonas_gf"]):.4f}\t'
+                      f'{float(m["Genome fraction (%)"]):.4f}\t{float(m["NA50"]):.1f}\t'
+                      f'{float(m["Duplication ratio"]):.4f}\t{int(float(m["# misassemblies"]))}\t'
+                      f'{int(float(m["# local misassemblies"]))}\t{float(kr["retained_pct"]):.6f}\t'
+                      f'{kr["lost_seed_k21"]}\t{kr["new_k21"]}\n'
+                  )
+          print(p.read_text())
+          PY
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nseed\tStage24_pair2_min2_distinct_singleton_fragments\nexperiment\tStage24_seed_plus_k31_k41_k55_carry_forward\nselection_policy\troot_cause_ab_no_metric_targets\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage26-stage24-carry-forward-200k
+          path: |
+            benchmark/assemblies
+            benchmark/*.json
+            benchmark/*.tsv
+            benchmark/*.time.txt
+            benchmark/stage26_threaded/pipeline_manifest.json
+            benchmark/stage26_threaded/containment_stats.json
+            benchmark/stage26_major/pipeline_manifest.json
+            benchmark/stage26_major/containment_stats.json
+            benchmark/current/stage24_pair2/stage23_stats.json
+            benchmark/current/stage24_pair2/guided_segments.fasta

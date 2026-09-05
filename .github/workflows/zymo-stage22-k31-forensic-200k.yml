@@ -1,0 +1,132 @@
+name: Zymo 200k Stage22 k31 survival forensic
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage22-k31-forensic-200k.yml
+      - scripts/stage22_k31_survival_forensic.py
+      - scripts/test_stage22_k31_survival_forensic.py
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-stage22-k31-forensic-200k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  forensic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      PAIRS: "200000"
+      THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+
+      - name: Download deterministic 200k reads and Zymo references
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          python3 scripts/split_zymo_references.py /tmp/zymo-refs -o /tmp/zymo-species-refs \
+            | tee benchmark/reference_split.tsv
+
+      - name: Validate Stage22 diagnostic
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/stage22_k31_survival_forensic.py scripts/test_stage22_k31_survival_forensic.py
+          PYTHONPATH=scripts python3 scripts/test_stage22_k31_survival_forensic.py
+          cargo build --release
+
+      - name: Build fixed Stage8 and Stage10
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage8.time.txt \
+            python3 scripts/na50_repeat_pipeline.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --output benchmark/current \
+              --threads "$THREADS" \
+              --segment-anchor-bases 31
+          python3 scripts/stage8_backbone_optimizer.py \
+            --pipeline-dir benchmark/current \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --segment-anchor-bases 31 \
+            --lookahead-depth 3 \
+            --lookahead-max-branch 4
+          /usr/bin/time -v -o benchmark/stage10.time.txt \
+            python3 scripts/stage10_multik_rescue.py \
+              --bridgeasm target/release/bridgeasm \
+              --pipeline-dir benchmark/current \
+              -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --threads "$THREADS" --ks 17,21,25,31
+          cp benchmark/current/stage10_multik_rescue/candidate_multik_strict/primary_contigs.fasta \
+             benchmark/assemblies/bridge_stage10.fasta
+
+      - name: Recreate Stage10 breakpoint oracle
+        run: |
+          set -euo pipefail
+          minimap2 -x asm5 --secondary=yes /tmp/zymo-references.fasta \
+            benchmark/assemblies/bridge_stage10.fasta > benchmark/stage10_vs_reference.paf
+          python3 scripts/stage17_breakpoint_oracle.py \
+            --reference-dir /tmp/zymo-species-refs \
+            --paf benchmark/stage10_vs_reference.paf \
+            --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            --k21-gfa benchmark/current/current_pipeline/iterative/k21_recall/assembly.gfa \
+            --k31-gfa benchmark/current/current_pipeline/iterative/k31_resolve/assembly.gfa \
+            --baseline benchmark/assemblies/bridge_stage10.fasta \
+            --output-prefix benchmark/oracle
+
+      - name: Trace k31 node and edge survival
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage22_forensic.time.txt \
+            python3 scripts/stage22_k31_survival_forensic.py \
+              --reference-dir /tmp/zymo-species-refs \
+              --gaps benchmark/oracle_gaps.tsv \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --k31-gfa benchmark/current/current_pipeline/iterative/k31_resolve/assembly.gfa \
+              --stage10 benchmark/assemblies/bridge_stage10.fasta \
+              --species Pseudomonas_aeruginosa \
+              --output-prefix benchmark/stage22_forensic \
+            | tee benchmark/stage22_forensic.stdout.txt
+          cp benchmark/current/current_pipeline/iterative/k31_resolve/run_profile.json benchmark/k31_run_profile.json
+          cp benchmark/current/current_pipeline/iterative/k21_recall/run_profile.json benchmark/k21_run_profile.json
+
+      - name: Save provenance
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nmode\treference_only_forensic_no_assembler_feedback\n' \
+            "$GITHUB_SHA" "$PAIRS" > benchmark/benchmark_provenance.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage22-k31-forensic-200k
+          path: |
+            benchmark/*.tsv
+            benchmark/*.json
+            benchmark/*.txt
+            benchmark/*.paf
+            benchmark/*.time.txt
+            benchmark/assemblies/bridge_stage10.fasta

@@ -1,0 +1,113 @@
+name: Zymo Log 500k iterative rebuild challenge
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - scripts/fasta_to_fastq.py
+      - .github/workflows/zymo-iterative-rebuild-500k.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgeasm-rust-v0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+      - name: Download data and references
+        run: |
+          mkdir -p benchmark/assemblies benchmark/iter
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs 500000
+          curl -L --retry 3 -o /tmp/zymo-refs.zip 'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+      - name: Build
+        run: cargo build --release
+      - name: Stage k29 from raw reads
+        run: |
+          target/release/bridgeasm assemble \
+            -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/iter/k29 -k 29 \
+            --min-count 2 --mercy-max-kmers 48 \
+            --mercy-min-support 1 --mercy-min-quality 25 \
+            --min-read-support 1 --min-pair-support 2 \
+            --min-primary-support 3 --primary-dominance 0.60 \
+            --min-contig-length 200 --threads 2
+          cp benchmark/iter/k29/primary_contigs.fasta benchmark/assemblies/iter-k29.fasta
+      - name: Rebuild k39 k59 k79 from previous exact contigs
+        run: |
+          prev=benchmark/iter/k29/primary_contigs.fasta
+          for k in 39 59 79; do
+            python3 scripts/fasta_to_fastq.py "$prev" "benchmark/iter/k${k}.fastq" --min-length "$k" --copies 2
+            target/release/bridgeasm assemble \
+              -1 "benchmark/iter/k${k}.fastq" \
+              -o "benchmark/iter/k${k}" -k "$k" \
+              --min-count 2 --mercy-max-kmers 0 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 1 --min-pair-support 1 \
+              --min-primary-support 1 --primary-dominance 0.55 \
+              --min-contig-length 200 --threads 2
+            prev="benchmark/iter/k${k}/primary_contigs.fasta"
+            cp "$prev" "benchmark/assemblies/iter-k${k}.fasta"
+          done
+      - name: Rebuild k99 and k119 from iterative contigs
+        run: |
+          prev=benchmark/iter/k79/primary_contigs.fasta
+          for k in 99 119; do
+            python3 scripts/fasta_to_fastq.py "$prev" "benchmark/iter/k${k}.fastq" --min-length "$k" --copies 2
+            target/release/bridgeasm assemble \
+              -1 "benchmark/iter/k${k}.fastq" \
+              -o "benchmark/iter/k${k}" -k "$k" \
+              --min-count 2 --mercy-max-kmers 0 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 1 --min-pair-support 1 \
+              --min-primary-support 1 --primary-dominance 0.55 \
+              --min-contig-length 200 --threads 2
+            prev="benchmark/iter/k${k}/primary_contigs.fasta"
+            cp "$prev" "benchmark/assemblies/iter-k${k}.fasta"
+          done
+      - name: Build final exact iterative catalog
+        run: |
+          python3 scripts/merge_fasta_unique.py benchmark/assemblies/iter-final.fasta \
+            benchmark/assemblies/iter-k29.fasta benchmark/assemblies/iter-k39.fasta \
+            benchmark/assemblies/iter-k59.fasta benchmark/assemblies/iter-k79.fasta \
+            benchmark/assemblies/iter-k99.fasta benchmark/assemblies/iter-k119.fasta \
+            --min-length 200
+          for f in benchmark/assemblies/iter-*.fasta; do
+            python3 scripts/fasta_stats.py "$f" > "${f%.fasta}.stats.tsv"
+          done
+          cat benchmark/assemblies/*.stats.tsv
+      - name: Run MEGAHIT
+        run: |
+          megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+      - name: MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py benchmark/assemblies/*.fasta \
+            -r /tmp/zymo-references.fasta -o benchmark/metaquast \
+            --threads 2 --min-contig 200 --no-plots
+          cat benchmark/metaquast/combined_reference/report.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-iterative-rebuild-500k
+          path: |
+            benchmark/assemblies/*.stats.tsv
+            benchmark/metaquast/combined_reference/report.tsv
+            benchmark/metaquast/combined_reference/transposed_report.tsv
+          retention-days: 14

@@ -1,0 +1,105 @@
+name: Zymo Log 500k cleanpath challenge
+
+on:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/bin/bridgeasm-cleanpath.rs
+      - .github/workflows/zymo-cleanpath-500k.yml
+      - Cargo.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bridgeasm-rust-v0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit curl unzip minimap2
+          curl -L --retry 3 -o /tmp/quast.tar.gz https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+      - name: Download data
+        run: |
+          mkdir -p benchmark/assemblies benchmark/clean
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs 500000
+          curl -L --retry 3 -o /tmp/zymo-refs.zip 'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+      - name: Build and test
+        run: |
+          cargo fmt --all
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          cargo build --release
+      - name: Build k29 relaxed graph
+        run: |
+          mkdir -p benchmark/k29-relaxed
+          target/release/bridgeasm assemble \
+            -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/k29-relaxed -k 29 \
+            --min-count 2 --mercy-max-kmers 48 \
+            --mercy-min-support 1 --mercy-min-quality 25 \
+            --min-read-support 1 --min-pair-support 2 \
+            --min-primary-support 3 --primary-dominance 0.60 \
+            --min-contig-length 200 --threads 2
+          cp benchmark/k29-relaxed/primary_contigs.fasta benchmark/assemblies/k29-relaxed-primary.fasta
+      - name: Clean graph with multiple presets
+        run: |
+          run_clean() {
+            preset=$1
+            rounds=$2
+            suffix=$3
+            name="clean-${preset}-r${rounds}${suffix:+-$suffix}"
+            args=""
+            case "$suffix" in
+              strong) args="--disconnect-ratio 0.15 --low-local-ratio 0.30 --bubble-dominance 0.55" ;;
+              mild) args="--disconnect-ratio 0.07 --low-local-ratio 0.15 --bubble-dominance 0.70" ;;
+            esac
+            target/release/bridgeasm-cleanpath \
+              --gfa benchmark/k29-relaxed/assembly.gfa \
+              --output "benchmark/assemblies/$name.fasta" \
+              --removed "benchmark/clean/$name.removed.fasta" \
+              --report "benchmark/clean/$name.tsv" \
+              --preset "$preset" --rounds "$rounds" \
+              --min-direct 2 --min-pair 2 --max-tip-len 200 \
+              --min-length 200 $args
+            python3 scripts/fasta_stats.py "benchmark/assemblies/$name.fasta" > "benchmark/clean/$name.stats.tsv"
+          }
+          run_clean conservative 5 ""
+          run_clean megahit 5 ""
+          run_clean megahit 5 mild
+          run_clean megahit 5 strong
+          run_clean aggressive 5 ""
+          cat benchmark/clean/*.stats.tsv
+      - name: Run MEGAHIT
+        run: |
+          megahit -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+            -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+            -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+      - name: MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py benchmark/assemblies/*.fasta \
+            -r /tmp/zymo-references.fasta -o benchmark/metaquast \
+            --threads 2 --min-contig 200 --no-plots
+          cat benchmark/metaquast/combined_reference/report.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-cleanpath-500k
+          path: |
+            benchmark/clean/*.tsv
+            benchmark/metaquast/combined_reference/report.tsv
+            benchmark/metaquast/combined_reference/transposed_report.tsv
+          retention-days: 14

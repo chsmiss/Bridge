@@ -1,0 +1,82 @@
+name: Zymo kmer key perf
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/bin/kmer_key_perf.rs
+      - .github/workflows/zymo-kmer-key-perf.yml
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/bin/kmer_key_perf.rs
+      - .github/workflows/zymo-kmer-key-perf.yml
+
+concurrency:
+  group: zymo-kmer-key-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reproduce Zymo subset
+        run: python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs 200000
+      - name: Build benchmark
+        run: cargo build --release --bin kmer_key_perf
+      - name: Benchmark generic and compact keys
+        run: |
+          mkdir -p benchmark
+          for k in 21 31 41 55; do
+            /usr/bin/time -v -o benchmark/generic-k${k}.time.txt \
+              target/release/kmer_key_perf \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -k "$k" --mode generic > benchmark/generic-k${k}.json
+            /usr/bin/time -v -o benchmark/compact-k${k}.time.txt \
+              target/release/kmer_key_perf \
+                -1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+                -k "$k" --mode compact > benchmark/compact-k${k}.json
+          done
+      - name: Summarize
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          root=pathlib.Path('benchmark')
+          rows=[]
+          def rss(path):
+              t=path.read_text()
+              return int(re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)',t).group(1))
+          for k in (21,31,41,55):
+              g=json.loads((root/f'generic-k{k}.json').read_text())
+              c=json.loads((root/f'compact-k{k}.json').read_text())
+              assert (g['observations'],g['distinct']) == (c['observations'],c['distinct'])
+              gr=rss(root/f'generic-k{k}.time.txt'); cr=rss(root/f'compact-k{k}.time.txt')
+              rows.append({
+                  'k':k,
+                  'generic_seconds':g['seconds'],
+                  'compact_seconds':c['seconds'],
+                  'speedup':g['seconds']/c['seconds'],
+                  'generic_rss_kb':gr,
+                  'compact_rss_kb':cr,
+                  'rss_ratio':gr/cr,
+                  'generic_key_bytes':g['key_bytes'],
+                  'compact_key_bytes':c['key_bytes'],
+                  'distinct':g['distinct'],
+              })
+          (root/'summary.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print(json.dumps(rows,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-kmer-key-perf
+          path: benchmark
+          retention-days: 14

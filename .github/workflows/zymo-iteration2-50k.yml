@@ -1,0 +1,239 @@
+name: Zymo 50k iteration-2 sweep
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/adaptive_k_local_v2.py
+      - .github/workflows/zymo-iteration2-50k.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zymo-iteration2-50k-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      PAIRS: "50000"
+      SEED: "43"
+      WINDOWS: "5"
+      TOTAL_SPOTS: "23916276"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y megahit spades sra-toolkit curl unzip time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Reproduce random 50k sample and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zymo benchmark/assemblies benchmark/times
+          python3 - <<'PY'
+          import os, random
+          total = int(os.environ['TOTAL_SPOTS'])
+          pairs = int(os.environ['PAIRS'])
+          windows = int(os.environ['WINDOWS'])
+          rng = random.Random(int(os.environ['SEED']))
+          sizes = [pairs // windows] * windows
+          for index in range(pairs % windows):
+              sizes[index] += 1
+          chosen = []
+          for size in sizes:
+              for _ in range(100000):
+                  start = rng.randint(1, total - size + 1)
+                  end = start + size - 1
+                  if all(end < a or start > b for a, b in chosen):
+                      chosen.append((start, end))
+                      break
+              else:
+                  raise SystemExit('failed to choose windows')
+          chosen.sort()
+          with open('/tmp/zymo/ranges.tsv', 'w') as handle:
+              handle.write('window\tstart_spot\tend_spot\tpairs\n')
+              for index, (start, end) in enumerate(chosen, 1):
+                  handle.write(f'{index}\t{start}\t{end}\t{end-start+1}\n')
+          PY
+          : > /tmp/zymo/R1.fastq.gz
+          : > /tmp/zymo/R2.fastq.gz
+          tail -n +2 /tmp/zymo/ranges.tsv | while IFS=$'\t' read -r idx start end count; do
+            part="/tmp/zymo/part-${idx}"
+            mkdir -p "$part"
+            (
+              cd "$part"
+              fastq-dump ERR2935805 -N "$start" -X "$end" --split-files --skip-technical --gzip
+            )
+            cat "$part/ERR2935805_1.fastq.gz" >> /tmp/zymo/R1.fastq.gz
+            cat "$part/ERR2935805_2.fastq.gz" >> /tmp/zymo/R2.fastq.gz
+          done
+          test "$(gzip -cd /tmp/zymo/R1.fastq.gz | awk 'END {print NR/4}')" -eq "$PAIRS"
+          test "$(gzip -cd /tmp/zymo/R2.fastq.gz | awk 'END {print NR/4}')" -eq "$PAIRS"
+
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+
+      - name: Build BridgeAsm
+        run: cargo build --release
+
+      - name: Bridge k21 production baseline
+        run: |
+          mkdir -p benchmark/bridge_k21
+          /usr/bin/time -v -o benchmark/times/bridge_k21.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/bridge_k21 -k 21 \
+              --min-count 2 --mercy-max-kmers 24 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 2 --min-pair-support 2 \
+              --min-primary-support 5 --primary-dominance 0.75 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridge_k21/primary_contigs.fasta benchmark/assemblies/bridge_k21.fasta
+
+      - name: Bridge k21 permissive min-count=1 diagnostic
+        run: |
+          mkdir -p benchmark/bridge_min1
+          /usr/bin/time -v -o benchmark/times/bridge_min1.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/bridge_min1 -k 21 \
+              --min-count 1 --mercy-max-kmers 0 \
+              --min-read-support 2 --min-pair-support 2 \
+              --min-primary-support 5 --primary-dominance 0.75 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridge_min1/primary_contigs.fasta benchmark/assemblies/bridge_min1.fasta
+
+      - name: Bridge threaded plus major path-cover diagnostic
+        run: |
+          mkdir -p benchmark/bridge_pathcover
+          /usr/bin/time -v -o benchmark/times/bridge_pathcover.time.txt \
+            target/release/bridgeasm assemble \
+              -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/bridge_pathcover -k 21 \
+              --min-count 2 --mercy-max-kmers 24 \
+              --mercy-min-support 1 --mercy-min-quality 25 \
+              --min-read-support 2 --min-pair-support 2 \
+              --min-primary-support 5 --primary-dominance 0.75 \
+              --threaded-path-cover --major-path-cover \
+              --path-cover-secondary-dominance 0.20 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/bridge_pathcover/primary_contigs.fasta benchmark/assemblies/bridge_pathcover.fasta
+
+      - name: Adaptive-k v2
+        run: |
+          mkdir -p benchmark/adaptive_v2
+          /usr/bin/time -v -o benchmark/times/adaptive_v2.time.txt \
+            python3 scripts/adaptive_k_local_v2.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo/R1.fastq.gz --read2 /tmp/zymo/R2.fastq.gz \
+              --base-dir benchmark/bridge_k21 --output benchmark/adaptive_v2 \
+              --base-k 21 --candidate-k 25,31,41 \
+              --radius 2 --max-nodes 64 --max-neighborhoods 16 \
+              --min-pairs 30 --min-candidate-base-fraction 0.90 \
+              --branch-fraction 0.80 --n50-gain 1.15 \
+              --min-contig-length 200 --threads 2
+          cp benchmark/adaptive_v2/adaptive_contigs.fasta benchmark/assemblies/bridge_adaptive_v2.fasta
+
+      - name: MEGAHIT default
+        run: |
+          /usr/bin/time -v -o benchmark/times/megahit.time.txt \
+            megahit -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/megahit --min-contig-len 200 -t 2
+          cp benchmark/megahit/final.contigs.fa benchmark/assemblies/megahit.fasta
+
+      - name: metaSPAdes
+        run: |
+          /usr/bin/time -v -o benchmark/times/metaspades.time.txt \
+            metaspades.py -1 /tmp/zymo/R1.fastq.gz -2 /tmp/zymo/R2.fastq.gz \
+              -o benchmark/metaspades -t 2 -m 6 --only-assembler
+          cp benchmark/metaspades/contigs.fasta benchmark/assemblies/metaspades.fasta
+
+      - name: MetaQUAST
+        run: |
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/bridge_k21.fasta \
+            benchmark/assemblies/bridge_min1.fasta \
+            benchmark/assemblies/bridge_pathcover.fasta \
+            benchmark/assemblies/bridge_adaptive_v2.fasta \
+            benchmark/assemblies/megahit.fasta \
+            benchmark/assemblies/metaspades.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads 2 --min-contig 200 --no-plots
+
+      - name: Summarize
+        run: |
+          python3 - <<'PY'
+          import csv, re
+          from pathlib import Path
+
+          report = Path('benchmark/metaquast/combined_reference/report.tsv')
+          with report.open() as handle:
+              reader = csv.reader(handle, delimiter='\t')
+              header = next(reader)
+              names = header[1:]
+              rows = {row[0]: row[1:] for row in reader if row}
+          metrics = [
+              'Genome fraction (%)', 'N50', 'NA50', '# contigs', 'Total length',
+              'Largest contig', '# misassemblies', 'Duplication ratio', 'Total aligned length'
+          ]
+          times = {
+              'bridge_k21': ['benchmark/times/bridge_k21.time.txt'],
+              'bridge_min1': ['benchmark/times/bridge_min1.time.txt'],
+              'bridge_pathcover': ['benchmark/times/bridge_pathcover.time.txt'],
+              'bridge_adaptive_v2': ['benchmark/times/bridge_k21.time.txt', 'benchmark/times/adaptive_v2.time.txt'],
+              'megahit': ['benchmark/times/megahit.time.txt'],
+              'metaspades': ['benchmark/times/metaspades.time.txt'],
+          }
+
+          def parse_wall(value):
+              parts = value.split(':')
+              if len(parts) == 2:
+                  return float(parts[0]) * 60 + float(parts[1])
+              return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+
+          def resources(paths):
+              wall = 0.0
+              peak = 0
+              for filename in paths:
+                  text = Path(filename).read_text()
+                  match = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)', text)
+                  if match:
+                      wall += parse_wall(match.group(1))
+                  match = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', text)
+                  if match:
+                      peak = max(peak, int(match.group(1)))
+              return wall, peak
+
+          output = Path('benchmark/summary.tsv')
+          with output.open('w') as handle:
+              handle.write('assembly\t' + '\t'.join(metrics) + '\twall_seconds\tpeak_rss_mib\n')
+              for index, name in enumerate(names):
+                  wall, peak = resources(times[name])
+                  values = [rows.get(metric, ['NA'] * len(names))[index] for metric in metrics]
+                  handle.write(name + '\t' + '\t'.join(values) + f'\t{wall:.3f}\t{peak/1024:.1f}\n')
+          print(output.read_text())
+          PY
+          cp /tmp/zymo/ranges.tsv benchmark/random_ranges.tsv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zymo-iteration2-50k
+          path: benchmark
+          retention-days: 14

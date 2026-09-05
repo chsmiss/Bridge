@@ -1,0 +1,360 @@
+name: Zymo 200k Stage30b gap-free seed-lock path-cover
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - .github/workflows/zymo-stage30b-gapfree-seedlock-pathcover-200k.yml
+      - scripts/stage30_seedlock_pathcover_sweep.py
+      - scripts/stage26_stage24_carry_forward.py
+      - scripts/seed_locked_extensions.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zymo-stage30b-gapfree-seedlock-pathcover-200k
+  cancel-in-progress: true
+
+env:
+  PAIRS: '200000'
+  THREADS: '2'
+  STAGE24_RUN_ID: '33838098251'
+  STAGE24_ARTIFACT: zymo-stage24-single-fragment-ab-200k
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install evaluation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Download deterministic 200k reads and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/assemblies
+          for attempt in 1 2 3; do
+            rm -rf /tmp/zymo-log
+            if python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-log --pairs "$PAIRS"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "ENA subset download failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          rm -rf /tmp/zymo-refs
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+
+      - name: Reuse verified Stage24 pair2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.STAGE24_ARTIFACT }}
+          path: /tmp/stage24
+          github-token: ${{ github.token }}
+          repository: chsmiss/Bridge
+          run-id: ${{ env.STAGE24_RUN_ID }}
+
+      - name: Convert Stage24 seed to gap-free immutable ACGT blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw=/tmp/stage24/assemblies/bridge_pair2_final.fasta
+          test -s "$raw"
+          cp "$raw" benchmark/assemblies/stage24_pair2_raw.fasta
+          python3 scripts/fasta_stats.py "$raw" --json benchmark/stage24_pair2_raw.stats.json \
+            > benchmark/stage24_pair2_raw.stats.tsv
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          raw=Path('benchmark/assemblies/stage24_pair2_raw.fasta')
+          out=Path('benchmark/assemblies/stage24_pair2_gapfree.fasta')
+          records=[]
+          name=None
+          chunks=[]
+          for line in raw.read_text().splitlines():
+              if line.startswith('>'):
+                  if name is not None:
+                      records.append((name,''.join(chunks).upper()))
+                  name=line[1:].split()[0]
+                  chunks=[]
+              else:
+                  chunks.append(line.strip())
+          if name is not None:
+              records.append((name,''.join(chunks).upper()))
+
+          raw_n=sum(seq.count('N') for _,seq in records)
+          raw_n_records=sum('N' in seq for _,seq in records)
+          blocks=[]
+          for rid,(name,seq) in enumerate(records,1):
+              for bid,block in enumerate(re.split(r'[^ACGT]+',seq),1):
+                  if len(block) >= 21:
+                      blocks.append((f'{name}|gapfree_block={bid}|source_record={rid}',block))
+          with out.open('w') as h:
+              for name,seq in blocks:
+                  h.write(f'>{name} len={len(seq)}\n')
+                  for i in range(0,len(seq),80):
+                      h.write(seq[i:i+80]+'\n')
+
+          ledger={
+              'raw_records':len(records),
+              'raw_bp':sum(len(seq) for _,seq in records),
+              'raw_records_with_N':raw_n_records,
+              'raw_N_bases':raw_n,
+              'gapfree_records_ge21':len(blocks),
+              'gapfree_bp':sum(len(seq) for _,seq in blocks),
+              'min_gapfree_block':min(map(lambda x:len(x[1]),blocks)),
+              'blocks_lt200':sum(len(seq)<200 for _,seq in blocks),
+              'bp_lt200':sum(len(seq) for _,seq in blocks if len(seq)<200),
+          }
+          Path('benchmark/stage30b_gapfree_seed_ledger.json').write_text(json.dumps(ledger,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(ledger,indent=2,sort_keys=True))
+          PY
+          python3 scripts/fasta_stats.py benchmark/assemblies/stage24_pair2_gapfree.fasta \
+            --json benchmark/stage24_pair2_gapfree.stats.json \
+            > benchmark/stage24_pair2_gapfree.stats.tsv
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          raw=json.loads(Path('benchmark/stage24_pair2_raw.stats.json').read_text())
+          gap=json.loads(Path('benchmark/stage24_pair2_gapfree.stats.json').read_text())
+          expected_raw={'sequences':1469,'total_bp':3216914,'n50':10181}
+          got_raw={k:raw[k] for k in expected_raw}
+          if got_raw != expected_raw:
+              raise SystemExit(f'wrong Stage24 pair2 artifact: expected {expected_raw}, got {got_raw}')
+          expected_gap={'sequences':1482,'total_bp':3216810,'n50':9959}
+          got_gap={k:gap[k] for k in expected_gap}
+          if got_gap != expected_gap:
+              raise SystemExit(f'unexpected gap-free Stage24 seed: expected {expected_gap}, got {got_gap}')
+          print('verified raw seed:',got_raw)
+          print('verified gap-free seed:',got_gap)
+          PY
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/stage30_seedlock_pathcover_sweep.py \
+            scripts/stage26_stage24_carry_forward.py \
+            scripts/seed_locked_extensions.py
+          PYTHONPATH=scripts python3 - <<'PY'
+          from pathlib import Path
+          import stage30_seedlock_pathcover_sweep as s30
+          s30.validate_configs()
+          for config in s30.CONFIGS:
+              cmd=s30.configured_command(
+                  bridgeasm=Path('bridgeasm'),read1=Path('r1'),read2=Path('r2'),
+                  output=Path('out'),threads=2,config=config)
+              def value(flag): return cmd[cmd.index(flag)+1]
+              assert value('--min-primary-support') == str(config['min_primary_support'])
+              assert float(value('--primary-dominance')) == float(config['primary_dominance'])
+              assert float(value('--path-cover-secondary-dominance')) == float(config['secondary_dominance'])
+              assert ('--major-path-cover' in cmd) == bool(config['major_path_cover'])
+          print('Stage30b config command tests: passed')
+          PY
+          cargo fmt --all -- --check
+          cargo test --all-targets
+          cargo build --release
+
+      - name: Run gap-free seed-locked path-cover sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o benchmark/stage30b.time.txt \
+            env PYTHONPATH=scripts python3 scripts/stage30_seedlock_pathcover_sweep.py \
+              --bridgeasm target/release/bridgeasm \
+              --read1 /tmp/zymo-log/ERR2935805_1.fastq.gz \
+              --read2 /tmp/zymo-log/ERR2935805_2.fastq.gz \
+              --seed-fasta benchmark/assemblies/stage24_pair2_gapfree.fasta \
+              --output benchmark/stage30b \
+              --threads "$THREADS" \
+              --prior-min-length 200 \
+              --seed-lock-min-overlap 500 \
+              2>&1 | tee benchmark/stage30b.log
+          for name in threaded_strict major_strict major_balanced major_aggressive; do
+            cp "benchmark/stage30b/$name/primary_contigs.fasta" \
+              "benchmark/assemblies/stage30b_${name}.fasta"
+          done
+
+      - name: FASTA stats, ACGT validation, and k21 retention
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in threaded_strict major_strict major_balanced major_aggressive; do
+            python3 scripts/fasta_stats.py "benchmark/assemblies/stage30b_${name}.fasta" \
+              --json "benchmark/stage30b_${name}.stats.json" \
+              > "benchmark/stage30b_${name}.stats.tsv"
+          done
+          PYTHONPATH=scripts python3 - <<'PY'
+          from pathlib import Path
+          import stage23_guided_singleton_rescue as s23
+
+          names=['threaded_strict','major_strict','major_balanced','major_aggressive']
+          seed_path=Path('benchmark/assemblies/stage24_pair2_gapfree.fasta')
+          seed=s23.fasta_keyset(seed_path,21)
+          rows=[]
+          for name in names:
+              path=Path(f'benchmark/assemblies/stage30b_{name}.fasta')
+              for _header,seq in s23.fasta_records(path):
+                  bad=set(seq.upper())-set('ACGT')
+                  if bad:
+                      raise SystemExit(f'{name} contains non-ACGT symbols: {bad}')
+              final=s23.fasta_keyset(path,21)
+              retained=len(seed & final)
+              lost=len(seed-final)
+              new=len(final-seed)
+              pct=100.0*retained/len(seed)
+              rows.append((name,len(seed),retained,lost,pct,new,len(final)))
+              if lost:
+                  raise SystemExit(f'{name} lost {lost} Stage24 canonical k21 keys')
+          out=['assembly\tseed_k21\tretained\tlost\tretained_pct\tnew_k21\ttotal_k21']
+          out += ['\t'.join(map(str,row)) for row in rows]
+          Path('benchmark/stage30b_k21_retention.tsv').write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          PY
+
+      - name: MetaQUAST gap-free seed versus path-cover candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/quast-5.3.0/metaquast.py \
+            benchmark/assemblies/stage24_pair2_gapfree.fasta \
+            benchmark/assemblies/stage30b_threaded_strict.fasta \
+            benchmark/assemblies/stage30b_major_strict.fasta \
+            benchmark/assemblies/stage30b_major_balanced.fasta \
+            benchmark/assemblies/stage30b_major_aggressive.fasta \
+            -r /tmp/zymo-references.fasta \
+            -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+          python3 scripts/summarize_metaquast.py benchmark/metaquast/combined_reference/transposed_report.tsv \
+            --json benchmark/metaquast_summary.json | tee benchmark/metaquast_summary.tsv
+
+      - name: Summarize safe continuity gain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv,json
+          from pathlib import Path
+
+          names=['threaded_strict','major_strict','major_balanced','major_aggressive']
+          with Path('benchmark/metaquast_summary.tsv').open() as h:
+              meta={r['Assembly']:r for r in csv.DictReader(h,delimiter='\t')}
+          with Path('benchmark/stage30b_k21_retention.tsv').open() as h:
+              retention={r['assembly']:r for r in csv.DictReader(h,delimiter='\t')}
+          manifest=json.loads(Path('benchmark/stage30b/sweep_manifest.json').read_text())
+          cfg={str(c['name']):c for c in manifest['configs']}
+          seed_stats=json.loads(Path('benchmark/stage24_pair2_gapfree.stats.json').read_text())
+          seed=meta['stage24_pair2_gapfree']
+          seed_gf=float(seed['Genome fraction (%)'])
+          seed_dup=float(seed['Duplication ratio'])
+          seed_mis=int(float(seed['# misassemblies']))
+          seed_local=int(float(seed['# local misassemblies']))
+
+          rows=[]
+          for name in names:
+              assembly=f'stage30b_{name}'
+              stats=json.loads(Path(f'benchmark/stage30b_{name}.stats.json').read_text())
+              m=meta[assembly]
+              r=retention[name]
+              c=cfg[name]
+              row={
+                  'assembly':name,
+                  'n50':stats['n50'],
+                  'n50_delta':stats['n50']-seed_stats['n50'],
+                  'total_bp':stats['total_bp'],
+                  'gf':float(m['Genome fraction (%)']),
+                  'gf_delta':float(m['Genome fraction (%)'])-seed_gf,
+                  'na50':float(m['NA50']),
+                  'dup':float(m['Duplication ratio']),
+                  'misassemblies':int(float(m['# misassemblies'])),
+                  'local_misassemblies':int(float(m['# local misassemblies'])),
+                  'seed_k21_lost':int(r['lost']),
+                  'seed_k21_retained_pct':float(r['retained_pct']),
+                  'new_k21':int(r['new_k21']),
+                  'accepted_extensions':int(c['accepted_extensions']),
+                  'added_bp_by_seed_lock':int(c['added_bp']),
+                  'major_path_cover':c['major_path_cover'],
+                  'min_primary_support':c['min_primary_support'],
+                  'primary_dominance':c['primary_dominance'],
+                  'secondary_dominance':c['secondary_dominance'],
+              }
+              row['safe']=(
+                  row['seed_k21_lost']==0 and row['n50']>=seed_stats['n50'] and
+                  row['gf']>=seed_gf and row['misassemblies']<=seed_mis+2 and
+                  row['local_misassemblies']<=seed_local+1 and row['dup']<=seed_dup+0.020
+              )
+              rows.append(row)
+
+          safe=[r for r in rows if r['safe']]
+          best=max(safe,key=lambda r:r['n50']) if safe else None
+          summary={
+              'seed':{
+                  'n50':seed_stats['n50'],'total_bp':seed_stats['total_bp'],
+                  'gf':seed_gf,'dup':seed_dup,'misassemblies':seed_mis,
+                  'local_misassemblies':seed_local,
+              },
+              'candidates':rows,
+              'best_safe':best,
+          }
+          Path('benchmark/stage30b_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          fields=list(rows[0].keys())
+          with Path('benchmark/stage30b_summary.tsv').open('w',newline='') as h:
+              w=csv.DictWriter(h,fieldnames=fields,delimiter='\t')
+              w.writeheader(); w.writerows(rows)
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          if best:
+              print(f"BEST_SAFE={best['assembly']} N50={best['n50']} GF={best['gf']}")
+          else:
+              print('BEST_SAFE=none')
+          PY
+
+      - name: Save provenance
+        shell: bash
+        run: |
+          cp /tmp/zymo-log/subset_provenance.json benchmark/
+          printf 'commit\t%s\nread_pairs\t%s\ndataset\tERR2935805_first_pairs\nseed_source_run\t%s\nseed_source_artifact\t%s\nseed_normalization\tsplit_non_ACGT_keep_blocks_ge21\nseed_lock_min_overlap\t500\nexperiment\tgapfree_k31_path_cover_behind_stage24_pair2_sequence_seed\n' \
+            "$GITHUB_SHA" "$PAIRS" "$STAGE24_RUN_ID" "$STAGE24_ARTIFACT" > benchmark/benchmark_provenance.tsv
+
+      - name: Upload Stage30b artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage30b-gapfree-seedlock-pathcover-200k
+          path: |
+            benchmark/assemblies
+            benchmark/stage30b_gapfree_seed_ledger.json
+            benchmark/stage30b_summary.json
+            benchmark/stage30b_summary.tsv
+            benchmark/stage30b_k21_retention.tsv
+            benchmark/metaquast_summary.json
+            benchmark/metaquast_summary.tsv
+            benchmark/stage30b/*.json
+            benchmark/stage30b/*/seed_lock_stats.json
+            benchmark/*.stats.json
+            benchmark/*.stats.tsv
+            benchmark/*.log
+            benchmark/*.time.txt
+            benchmark/benchmark_provenance.tsv
+            benchmark/subset_provenance.json
+          retention-days: 14
