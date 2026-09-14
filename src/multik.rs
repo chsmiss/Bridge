@@ -200,8 +200,8 @@ impl Roller {
     fn push(&mut self, bits: u8) -> Option<(u128, usize)> {
         let mask = packed_mask(self.order);
         self.forward = ((self.forward << 2) | u128::from(bits)) & mask;
-        self.reverse = (self.reverse >> 2)
-            | (u128::from(3 - (bits & 0b11)) << (2 * (self.order - 1)));
+        self.reverse =
+            (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << (2 * (self.order - 1)));
         self.valid += 1;
         if self.valid < self.order {
             None
@@ -295,13 +295,16 @@ fn count_multi_k(
     let templates: Vec<Roller> = ks
         .iter()
         .enumerate()
-        .flat_map(|(layer, &k)| [Roller::new(k, layer, false), Roller::new(k + 1, layer, true)])
+        .flat_map(|(layer, &k)| {
+            [
+                Roller::new(k, layer, false),
+                Roller::new(k + 1, layer, true),
+            ]
+        })
         .collect();
     let mut pending: Vec<PendingLayer> = ks.iter().copied().map(PendingLayer::new).collect();
-    let mut node_seen: Vec<FxHashSet<u128>> =
-        (0..ks.len()).map(|_| FxHashSet::default()).collect();
-    let mut edge_seen: Vec<FxHashSet<u128>> =
-        (0..ks.len()).map(|_| FxHashSet::default()).collect();
+    let mut node_seen: Vec<FxHashSet<u128>> = (0..ks.len()).map(|_| FxHashSet::default()).collect();
+    let mut edge_seen: Vec<FxHashSet<u128>> = (0..ks.len()).map(|_| FxHashSet::default()).collect();
 
     let read_pairs = for_each_pair(read1, read2, max_pairs, |_pair_index, left, right| {
         for values in &mut node_seen {
