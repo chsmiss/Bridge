@@ -1,4 +1,4 @@
-use crate::dna::{base_bits, canonical_kmers, KmerKey, OrientedKmer, MAX_K};
+use crate::dna::{base_bits, canonical_kmers, KmerKey};
 use crate::fastq::for_each_pair;
 use crate::graph::{compact_unitigs, summarize, GraphSummary, RawGraph, UnitigGraph};
 use anyhow::{bail, Context, Result};
@@ -8,6 +8,8 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+const MAX_COMPACT_K: usize = 63;
 
 #[derive(Clone, Debug)]
 pub struct MultiKConfig {
@@ -23,15 +25,15 @@ pub struct MultiKConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct ObservationEvidence {
+struct NodeEvidence {
     count: u32,
     fragment_count: u32,
     quality_sum: u64,
 }
 
-impl ObservationEvidence {
+impl NodeEvidence {
     fn mean_quality(self, k: usize) -> f32 {
-        if self.count == 0 || k == 0 {
+        if self.count == 0 {
             0.0
         } else {
             self.quality_sum as f32 / (self.count as f32 * k as f32)
@@ -39,11 +41,17 @@ impl ObservationEvidence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct EdgeEvidence {
+    count: u32,
+    fragment_count: u32,
+}
+
 #[derive(Debug)]
 struct PendingLayer {
     k: usize,
-    node_evidence: FxHashMap<KmerKey, ObservationEvidence>,
-    edge_evidence: FxHashMap<KmerKey, ObservationEvidence>,
+    nodes: FxHashMap<u128, NodeEvidence>,
+    edges: FxHashMap<u128, EdgeEvidence>,
     observations: u64,
     edge_observations: u64,
 }
@@ -52,8 +60,8 @@ impl PendingLayer {
     fn new(k: usize) -> Self {
         Self {
             k,
-            node_evidence: FxHashMap::default(),
-            edge_evidence: FxHashMap::default(),
+            nodes: FxHashMap::default(),
+            edges: FxHashMap::default(),
             observations: 0,
             edge_observations: 0,
         }
@@ -162,135 +170,120 @@ pub struct MultiKGraph {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RollerState {
-    k: usize,
-    forward: KmerKey,
-    reverse: KmerKey,
+struct Roller {
+    order: usize,
+    layer: usize,
+    edge: bool,
+    forward: u128,
+    reverse: u128,
     valid: usize,
 }
 
-impl RollerState {
-    fn new(k: usize) -> Self {
+impl Roller {
+    fn new(order: usize, layer: usize, edge: bool) -> Self {
         Self {
-            k,
-            forward: KmerKey::ZERO,
-            reverse: KmerKey::ZERO,
+            order,
+            layer,
+            edge,
+            forward: 0,
+            reverse: 0,
             valid: 0,
         }
     }
 
     fn reset(&mut self) {
-        self.forward = KmerKey::ZERO;
-        self.reverse = KmerKey::ZERO;
+        self.forward = 0;
+        self.reverse = 0;
         self.valid = 0;
+    }
+
+    fn push(&mut self, bits: u8) -> Option<(u128, usize)> {
+        let mask = packed_mask(self.order);
+        self.forward = ((self.forward << 2) | u128::from(bits)) & mask;
+        self.reverse = (self.reverse >> 2)
+            | (u128::from(3 - (bits & 0b11)) << (2 * (self.order - 1)));
+        self.valid += 1;
+        if self.valid < self.order {
+            None
+        } else {
+            Some((self.forward.min(self.reverse), self.order))
+        }
     }
 }
 
-fn for_each_multi_canonical_kmer<F>(
-    sequence: &[u8],
-    orders: &[usize],
-    mut callback: F,
-) -> Result<usize>
-where
-    F: FnMut(usize, OrientedKmer),
-{
-    if orders.is_empty() {
-        bail!("at least one k-mer order is required");
+#[inline]
+fn packed_mask(k: usize) -> u128 {
+    (1_u128 << (2 * k)) - 1
+}
+
+fn reverse_complement_packed(mut value: u128, k: usize) -> u128 {
+    let mut output = 0_u128;
+    for _ in 0..k {
+        let bits = (value & 0b11) as u8;
+        value >>= 2;
+        output = (output << 2) | u128::from(3 - bits);
     }
-    let mut previous = None;
-    for &k in orders {
-        if k == 0 || k > MAX_K {
-            bail!("k-mer order must be in 1..={MAX_K}");
-        }
-        if previous.is_some_and(|value| k <= value) {
-            bail!("multi-k orders must be strictly increasing");
-        }
-        previous = Some(k);
+    output
+}
+
+fn canonical_packed(value: u128, k: usize) -> (u128, bool) {
+    let reverse = reverse_complement_packed(value, k);
+    if reverse < value {
+        (reverse, true)
+    } else {
+        (value, false)
     }
+}
 
-    let mut states: Vec<RollerState> = orders.iter().copied().map(RollerState::new).collect();
-    let mut emitted = 0_usize;
-
-    for (index, &base) in sequence.iter().enumerate() {
-        let Some(bits) = base_bits(base) else {
-            for state in &mut states {
-                state.reset();
-            }
-            continue;
-        };
-
-        for state in &mut states {
-            state.forward.shift_left_append(bits, state.k);
-            state.valid += 1;
-            if state.valid < state.k {
-                continue;
-            }
-            if state.valid == state.k {
-                state.reverse = state.forward.reverse_complement(state.k);
-            } else {
-                state
-                    .reverse
-                    .shift_right_prepend_complement(bits, state.k);
-            }
-
-            let position = index + 1 - state.k;
-            if state.reverse < state.forward {
-                callback(
-                    state.k,
-                    OrientedKmer {
-                        key: state.reverse,
-                        reverse: true,
-                        position,
-                    },
-                );
-            } else {
-                callback(
-                    state.k,
-                    OrientedKmer {
-                        key: state.forward,
-                        reverse: false,
-                        position,
-                    },
-                );
-            }
-            emitted += 1;
-        }
+fn packed_to_kmer(value: u128) -> KmerKey {
+    KmerKey {
+        words: [value as u64, (value >> 64) as u64, 0, 0, 0],
     }
-    Ok(emitted)
 }
 
 fn scan_record(
     sequence: &[u8],
     quality: &[u8],
-    orders: &[usize],
+    templates: &[Roller],
     pending: &mut [PendingLayer],
-    node_seen: &mut [FxHashSet<KmerKey>],
-    edge_seen: &mut [FxHashSet<KmerKey>],
-) -> Result<()> {
+    node_seen: &mut [FxHashSet<u128>],
+    edge_seen: &mut [FxHashSet<u128>],
+) {
+    let mut rollers = templates.to_vec();
     let mut quality_prefix = vec![0_u64; quality.len() + 1];
     for (index, value) in quality.iter().enumerate() {
         quality_prefix[index + 1] = quality_prefix[index] + u64::from(value.saturating_sub(33));
     }
 
-    for_each_multi_canonical_kmer(sequence, orders, |order, item| {
-        for (layer_index, layer) in pending.iter_mut().enumerate() {
-            if order == layer.k {
-                let window_quality =
-                    quality_prefix[item.position + order] - quality_prefix[item.position];
-                let entry = layer.node_evidence.entry(item.key).or_default();
+    for (index, &base) in sequence.iter().enumerate() {
+        let Some(bits) = base_bits(base) else {
+            for roller in &mut rollers {
+                roller.reset();
+            }
+            continue;
+        };
+        for roller in &mut rollers {
+            let Some((key, order)) = roller.push(bits) else {
+                continue;
+            };
+            if roller.edge {
+                let entry = pending[roller.layer].edges.entry(key).or_default();
+                entry.count = entry.count.saturating_add(1);
+                pending[roller.layer].edge_observations =
+                    pending[roller.layer].edge_observations.saturating_add(1);
+                edge_seen[roller.layer].insert(key);
+            } else {
+                let position = index + 1 - order;
+                let window_quality = quality_prefix[position + order] - quality_prefix[position];
+                let entry = pending[roller.layer].nodes.entry(key).or_default();
                 entry.count = entry.count.saturating_add(1);
                 entry.quality_sum = entry.quality_sum.saturating_add(window_quality);
-                layer.observations = layer.observations.saturating_add(1);
-                node_seen[layer_index].insert(item.key);
-            } else if order == layer.k + 1 {
-                let entry = layer.edge_evidence.entry(item.key).or_default();
-                entry.count = entry.count.saturating_add(1);
-                layer.edge_observations = layer.edge_observations.saturating_add(1);
-                edge_seen[layer_index].insert(item.key);
+                pending[roller.layer].observations =
+                    pending[roller.layer].observations.saturating_add(1);
+                node_seen[roller.layer].insert(key);
             }
         }
-    })?;
-    Ok(())
+    }
 }
 
 fn count_multi_k(
@@ -299,18 +292,15 @@ fn count_multi_k(
     ks: &[usize],
     max_pairs: Option<usize>,
 ) -> Result<(Vec<PendingLayer>, usize)> {
-    let mut orders = Vec::with_capacity(ks.len() * 2);
-    for &k in ks {
-        orders.push(k);
-        orders.push(k + 1);
-    }
-    orders.sort_unstable();
-    orders.dedup();
-
+    let templates: Vec<Roller> = ks
+        .iter()
+        .enumerate()
+        .flat_map(|(layer, &k)| [Roller::new(k, layer, false), Roller::new(k + 1, layer, true)])
+        .collect();
     let mut pending: Vec<PendingLayer> = ks.iter().copied().map(PendingLayer::new).collect();
-    let mut node_seen: Vec<FxHashSet<KmerKey>> =
+    let mut node_seen: Vec<FxHashSet<u128>> =
         (0..ks.len()).map(|_| FxHashSet::default()).collect();
-    let mut edge_seen: Vec<FxHashSet<KmerKey>> =
+    let mut edge_seen: Vec<FxHashSet<u128>> =
         (0..ks.len()).map(|_| FxHashSet::default()).collect();
 
     let read_pairs = for_each_pair(read1, read2, max_pairs, |_pair_index, left, right| {
@@ -324,30 +314,30 @@ fn count_multi_k(
         scan_record(
             &left.sequence,
             &left.quality,
-            &orders,
+            &templates,
             &mut pending,
             &mut node_seen,
             &mut edge_seen,
-        )?;
+        );
         if let Some(right) = right {
             scan_record(
                 &right.sequence,
                 &right.quality,
-                &orders,
+                &templates,
                 &mut pending,
                 &mut node_seen,
                 &mut edge_seen,
-            )?;
+            );
         }
 
-        for layer_index in 0..pending.len() {
-            for key in node_seen[layer_index].drain() {
-                if let Some(entry) = pending[layer_index].node_evidence.get_mut(&key) {
+        for layer in 0..pending.len() {
+            for key in node_seen[layer].drain() {
+                if let Some(entry) = pending[layer].nodes.get_mut(&key) {
                     entry.fragment_count = entry.fragment_count.saturating_add(1);
                 }
             }
-            for key in edge_seen[layer_index].drain() {
-                if let Some(entry) = pending[layer_index].edge_evidence.get_mut(&key) {
+            for key in edge_seen[layer].drain() {
+                if let Some(entry) = pending[layer].edges.get_mut(&key) {
                     entry.fragment_count = entry.fragment_count.saturating_add(1);
                 }
             }
@@ -358,29 +348,16 @@ fn count_multi_k(
     Ok((pending, read_pairs))
 }
 
-fn oriented_state(
-    sequence: &[u8],
-    k: usize,
-    index: &FxHashMap<KmerKey, u32>,
-) -> Result<Option<u32>> {
-    let key = KmerKey::from_sequence(sequence)?;
-    let (canonical, reverse) = key.canonical(k);
-    Ok(index
-        .get(&canonical)
-        .copied()
-        .map(|node| node * 2 + u32::from(reverse)))
-}
-
 fn finalize_layer(
     pending: PendingLayer,
     min_count: u32,
     min_fragment_support: u32,
     min_mean_quality: f32,
 ) -> Result<MultiKLayer> {
-    let distinct_kmers = pending.node_evidence.len();
-    let distinct_kplus1 = pending.edge_evidence.len();
-    let mut keys: Vec<KmerKey> = pending
-        .node_evidence
+    let distinct_kmers = pending.nodes.len();
+    let distinct_kplus1 = pending.edges.len();
+    let retained_packed: Vec<u128> = pending
+        .nodes
         .iter()
         .filter_map(|(key, value)| {
             (value.count >= min_count
@@ -389,34 +366,44 @@ fn finalize_layer(
                 .then_some(*key)
         })
         .collect();
-    keys.sort_unstable();
-    if keys.len() > (u32::MAX as usize) / 2 {
+    if retained_packed.len() > (u32::MAX as usize) / 2 {
         bail!("k={} graph has too many canonical nodes", pending.k);
     }
 
-    let index: FxHashMap<KmerKey, u32> = keys
+    let mut packed_sorted = retained_packed;
+    packed_sorted.sort_unstable();
+    let packed_index: FxHashMap<u128, u32> = packed_sorted
         .iter()
         .enumerate()
-        .map(|(node_id, key)| (*key, node_id as u32))
+        .map(|(node, key)| (*key, node as u32))
         .collect();
-    let counts: Vec<u32> = keys
+    let keys: Vec<KmerKey> = packed_sorted.iter().copied().map(packed_to_kmer).collect();
+    let counts: Vec<u32> = packed_sorted
         .iter()
-        .map(|key| pending.node_evidence.get(key).map_or(0, |value| value.count))
+        .map(|key| pending.nodes.get(key).map_or(0, |value| value.count))
         .collect();
 
     let mut edges = Vec::new();
     let mut singleton_solid_edges = 0_usize;
-    for (edge_key, evidence) in &pending.edge_evidence {
-        let sequence = edge_key.to_sequence(pending.k + 1);
-        let Some(source) = oriented_state(&sequence[..pending.k], pending.k, &index)? else {
+    let target_mask = packed_mask(pending.k);
+    for (edge_key, evidence) in &pending.edges {
+        let source_forward = edge_key >> 2;
+        let target_forward = edge_key & target_mask;
+        let (source_key, source_reverse) = canonical_packed(source_forward, pending.k);
+        let (target_key, target_reverse) = canonical_packed(target_forward, pending.k);
+        let (Some(&source_node), Some(&target_node)) =
+            (packed_index.get(&source_key), packed_index.get(&target_key))
+        else {
             continue;
         };
-        let Some(target) = oriented_state(&sequence[1..], pending.k, &index)? else {
-            continue;
-        };
+        let source = source_node * 2 + u32::from(source_reverse);
+        let target = target_node * 2 + u32::from(target_reverse);
         edges.push((source, target));
-        edges.push((RawGraph::reverse_state(target), RawGraph::reverse_state(source)));
-        if evidence.count < min_count {
+        edges.push((
+            RawGraph::reverse_state(target),
+            RawGraph::reverse_state(source),
+        ));
+        if evidence.count < min_count || evidence.fragment_count < min_fragment_support {
             singleton_solid_edges += 2;
         }
     }
@@ -430,10 +417,10 @@ fn finalize_layer(
         out_offsets[source as usize + 1] += 1;
         indegree[target as usize] = indegree[target as usize].saturating_add(1);
     }
-    for offset in 1..out_offsets.len() {
-        out_offsets[offset] += out_offsets[offset - 1];
+    for index in 1..out_offsets.len() {
+        out_offsets[index] += out_offsets[index - 1];
     }
-    let out_targets: Vec<u32> = edges.into_iter().map(|(_, target)| target).collect();
+    let out_targets = edges.into_iter().map(|(_, target)| target).collect();
     let raw_graph = RawGraph {
         k: pending.k,
         keys,
@@ -644,8 +631,11 @@ pub fn build_multik_graph(config: &MultiKConfig) -> Result<MultiKGraph> {
     if ks.len() < 2 {
         bail!("multi-k graph requires at least two distinct k values");
     }
-    if ks.iter().any(|&k| k == 0 || k >= MAX_K) {
-        bail!("multi-k values must be in 1..{} so k+1 remains representable", MAX_K);
+    if ks.iter().any(|&k| k == 0 || k >= MAX_COMPACT_K) {
+        bail!(
+            "Stage34 compact multi-k values must be in 1..{} so k+1 fits in u128",
+            MAX_COMPACT_K
+        );
     }
 
     let total_started = Instant::now();
@@ -816,17 +806,37 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn packed_sequence(value: u128, k: usize) -> Vec<u8> {
+        packed_to_kmer(value).to_sequence(k)
+    }
+
     #[test]
-    fn simultaneous_roller_matches_single_order_extraction() {
+    fn compact_roller_matches_existing_kmer_encoding() {
         let sequence = b"ACGTTGCANNTGCAACGTACGATCGTACGTTAGC";
-        let orders = [3_usize, 5, 7, 11];
-        let mut observed: FxHashMap<usize, Vec<OrientedKmer>> = FxHashMap::default();
-        for_each_multi_canonical_kmer(sequence, &orders, |k, item| {
-            observed.entry(k).or_default().push(item);
-        })
-        .unwrap();
-        for &k in &orders {
-            assert_eq!(observed.get(&k).unwrap(), &canonical_kmers(sequence, k).unwrap());
+        for k in [3_usize, 5, 7, 11] {
+            let template = Roller::new(k, 0, false);
+            let mut pending = vec![PendingLayer::new(k)];
+            let mut node_seen = vec![FxHashSet::default()];
+            let mut edge_seen = vec![FxHashSet::default()];
+            scan_record(
+                sequence,
+                &vec![b'I'; sequence.len()],
+                &[template],
+                &mut pending,
+                &mut node_seen,
+                &mut edge_seen,
+            );
+            let observed: FxHashSet<Vec<u8>> = pending[0]
+                .nodes
+                .keys()
+                .map(|key| packed_sequence(*key, k))
+                .collect();
+            let expected: FxHashSet<Vec<u8>> = canonical_kmers(sequence, k)
+                .unwrap()
+                .into_iter()
+                .map(|item| item.key.to_sequence(k))
+                .collect();
+            assert_eq!(observed, expected);
         }
     }
 
@@ -834,11 +844,13 @@ mod tests {
     fn builds_layered_graph_and_cross_k_projection() {
         let dir = tempfile::tempdir().unwrap();
         let reads = dir.path().join("reads.fastq");
+        let sequence = "ACGTTGCAACGTCAGTACGATCGTAGCTAACGTTGCA";
         let mut handle = File::create(&reads).unwrap();
         for index in 0..3 {
             writeln!(
                 handle,
-                "@r{index}\nACGTTGCAACGTCAGTACGATCGTAGCTAACGTTGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII"
+                "@r{index}\n{sequence}\n+\n{}",
+                "I".repeat(sequence.len())
             )
             .unwrap();
         }
@@ -857,7 +869,10 @@ mod tests {
         };
         let graph = build_multik_graph(&config).unwrap();
         assert_eq!(graph.layers.len(), 2);
-        assert!(graph.layers.iter().all(|layer| !layer.raw_graph.keys.is_empty()));
+        assert!(graph
+            .layers
+            .iter()
+            .all(|layer| !layer.raw_graph.keys.is_empty()));
         assert_eq!(graph.projection_pairs.len(), 1);
         assert!(graph.projection_pairs[0].summary.exact_unitigs > 0);
     }
