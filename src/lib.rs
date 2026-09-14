@@ -3,6 +3,7 @@ pub mod dna;
 pub mod fastq;
 pub mod graph;
 pub mod kmer;
+pub mod multik;
 pub mod output;
 pub mod read_store;
 pub mod scaffold;
