@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bridgeasm::assembler::{assemble, AssembleConfig};
 use bridgeasm::dna::MAX_K;
+use bridgeasm::multik::{build_multik_graph, write_multik_outputs, MultiKConfig};
 use bridgeasm::output::write_outputs;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Assemble paired or single-end FASTQ reads.
+    /// Assemble paired or single-end FASTQ reads with one fixed k.
     Assemble {
         #[arg(short = '1', long)]
         read1: PathBuf,
@@ -61,6 +62,30 @@ enum Command {
         max_pairs: Option<usize>,
         #[arg(short = 't', long, default_value_t = 1)]
         threads: usize,
+    },
+    /// Stage34 prototype: one FASTQ pass, multiple k layers, exact cross-k projections.
+    Multik {
+        #[arg(short = '1', long)]
+        read1: PathBuf,
+        #[arg(short = '2', long)]
+        read2: Option<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Comma-separated k values, for example 21,31,41,55.
+        #[arg(long, value_delimiter = ',', default_value = "21,31,41,55")]
+        ks: Vec<usize>,
+        #[arg(long, default_value_t = 2)]
+        min_count: u32,
+        /// Count support once per original physical fragment for each k-mer.
+        #[arg(long, default_value_t = 2)]
+        min_fragment_support: u32,
+        #[arg(long, default_value_t = 20.0)]
+        min_mean_quality: f32,
+        #[arg(long)]
+        max_pairs: Option<usize>,
+        /// Maximum lower-k unique walk when probing a high-k dead-end rescue.
+        #[arg(long, default_value_t = 500)]
+        max_rescue_bases: usize,
     },
 }
 
@@ -129,6 +154,38 @@ fn main() -> Result<()> {
                 product.stats.primary_bases,
                 product.stats.simple_bubbles,
                 product.stats.haplotigs
+            );
+        }
+        Command::Multik {
+            read1,
+            read2,
+            output,
+            ks,
+            min_count,
+            min_fragment_support,
+            min_mean_quality,
+            max_pairs,
+            max_rescue_bases,
+        } => {
+            let config = MultiKConfig {
+                read1,
+                read2,
+                output_dir: output.clone(),
+                ks,
+                min_count,
+                min_fragment_support,
+                min_mean_quality,
+                max_pairs,
+                max_rescue_bases,
+            };
+            let graph = build_multik_graph(&config)?;
+            write_multik_outputs(&graph, &output)?;
+            eprintln!(
+                "built {} multi-k layers from {} physical read pairs in {:.3}s; {} cross-k rescue candidates",
+                graph.layers.len(),
+                graph.summary.read_pairs,
+                graph.summary.timings_seconds.total_seconds,
+                graph.rescue_candidates.len()
             );
         }
     }
