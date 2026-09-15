@@ -6,6 +6,7 @@ pub mod kmer;
 pub mod multik;
 pub mod multik_fast;
 pub mod multik_mem;
+pub mod multik_stream;
 pub mod output;
 pub mod read_store;
 pub mod scaffold;
