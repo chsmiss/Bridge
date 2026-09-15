@@ -4,6 +4,7 @@ pub mod fastq;
 pub mod graph;
 pub mod kmer;
 pub mod multik;
+pub mod multik_fast;
 pub mod output;
 pub mod read_store;
 pub mod scaffold;
