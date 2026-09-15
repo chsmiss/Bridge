@@ -7,6 +7,8 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - src/multik_fast.rs
+      - src/multik_mem.rs
+      - src/multik_stream.rs
       - src/main.rs
       - src/lib.rs
       - .github/workflows/zymo-stage34-multik-scaling.yml
@@ -61,6 +63,7 @@ jobs:
                 --min-fragment-support 2 \
                 --min-mean-quality 20 \
                 --max-rescue-bases 500 \
+                --threads 4 \
                 --max-pairs "$pairs" \
                 > "$out/run.log" 2>&1
             cat "$out/time.txt"
@@ -76,6 +79,7 @@ jobs:
 
           root=Path('benchmark/stage34-scaling')
           rows=[]
+          versions=[]
           for pairs in (1_000_000,5_000_000,10_000_000):
               p=root/str(pairs)
               text=(p/'time.txt').read_text()
@@ -83,9 +87,11 @@ jobs:
                   m=re.search(r'^\s*'+re.escape(name)+r':\s*(.+?)\s*$',text,re.M)
                   return m.group(1) if m else None
               summary=json.loads((p/'output/multik_summary.json').read_text())
+              versions.append(summary['version'])
               rows.append({
                   'pairs':pairs,
                   'elapsed_wall_clock':field('Elapsed (wall clock) time (h:mm:ss or m:ss)'),
+                  'cpu_percent':field('Percent of CPU this job got'),
                   'user_seconds':float(field('User time (seconds)')),
                   'system_seconds':float(field('System time (seconds)')),
                   'max_rss_kbytes':int(field('Maximum resident set size (kbytes)')),
@@ -96,12 +102,12 @@ jobs:
                   'rescue_seconds':summary['timings_seconds']['rescue_seconds'],
                   'layers':summary['layers'],
               })
-          out={'version':'stage34-layered-multik-v1-fast','points':rows}
+          out={'version':versions[-1], 'threads':4, 'points':rows}
           (root/'scaling_summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
           with (root/'scaling_summary.tsv').open('w') as h:
-              h.write('pairs\tinternal_total_seconds\tcount_seconds\tfinalize_seconds\tprojection_seconds\trescue_seconds\tmax_rss_kbytes\n')
+              h.write('pairs\tinternal_total_seconds\tcount_seconds\tfinalize_seconds\tprojection_seconds\trescue_seconds\tmax_rss_kbytes\tcpu_percent\n')
               for r in rows:
-                  h.write(f"{r['pairs']}\t{r['internal_total_seconds']:.3f}\t{r['count_seconds']:.3f}\t{r['finalize_seconds']:.3f}\t{r['projection_seconds']:.3f}\t{r['rescue_seconds']:.3f}\t{r['max_rss_kbytes']}\n")
+                  h.write(f"{r['pairs']}\t{r['internal_total_seconds']:.3f}\t{r['count_seconds']:.3f}\t{r['finalize_seconds']:.3f}\t{r['projection_seconds']:.3f}\t{r['rescue_seconds']:.3f}\t{r['max_rss_kbytes']}\t{r['cpu_percent']}\n")
           print(json.dumps(out,indent=2,sort_keys=True))
           PY
 
