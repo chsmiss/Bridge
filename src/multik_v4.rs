@@ -204,8 +204,7 @@ impl Roller {
     #[inline]
     fn push(&mut self, bits: u8) -> Option<(u128, bool)> {
         self.forward = ((self.forward << 2) | u128::from(bits)) & self.mask;
-        self.reverse =
-            (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
+        self.reverse = (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
         self.valid += 1;
         if self.valid < self.order {
             None
@@ -852,7 +851,12 @@ fn count_edges_all_k(
     let mut merged = workers_iter
         .next()
         .map(|worker| worker.supports)
-        .unwrap_or_else(|| layers.iter().map(|layer| vec![0; layer.state_count()]).collect());
+        .unwrap_or_else(|| {
+            layers
+                .iter()
+                .map(|layer| vec![0; layer.state_count()])
+                .collect()
+        });
     for worker in workers_iter {
         for (target, source) in merged.iter_mut().zip(worker.supports) {
             pool.install(|| {
@@ -929,9 +933,7 @@ fn build_raw_from_support(prepared: PreparedLayer, support: Vec<u8>) -> Result<C
     }
 
     let PreparedLayer {
-        keys,
-        prefix_index,
-        ..
+        keys, prefix_index, ..
     } = lookup;
     Ok(CompactRawGraph {
         k,
@@ -1003,8 +1005,7 @@ fn compact_unitigs(raw: &CompactRawGraph) -> CompactUnitigGraph {
         }
     }
 
-    let (out_offsets, out_targets, indegree) =
-        build_unitig_adjacency(raw, &unitigs, &edge_unitig);
+    let (out_offsets, out_targets, indegree) = build_unitig_adjacency(raw, &unitigs, &edge_unitig);
     CompactUnitigGraph {
         unitigs,
         edge_unitig,
