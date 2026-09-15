@@ -2,6 +2,7 @@ use anyhow::Result;
 use bridgeasm::assembler::{assemble, AssembleConfig};
 use bridgeasm::dna::MAX_K;
 use bridgeasm::multik::MultiKConfig;
+use bridgeasm::multik_hybrid::{run_multik_hybrid, write_hybrid_outputs, HybridConfig};
 use bridgeasm::multik_stream::write_streaming_outputs;
 use bridgeasm::multik_v4::run_multik_v4;
 use bridgeasm::output::write_outputs;
@@ -65,7 +66,7 @@ enum Command {
         #[arg(short = 't', long, default_value_t = 1)]
         threads: usize,
     },
-    /// Stage34: four-pass compact multi-k graph with packed exact edge support.
+    /// Stage34 v4: four-pass compact global multi-k graph.
     Multik {
         #[arg(short = '1', long)]
         read1: PathBuf,
@@ -89,6 +90,43 @@ enum Command {
         #[arg(long, default_value_t = 500)]
         max_rescue_bases: usize,
         /// Worker threads for Stage34 fixed-memory scans and cross-k analysis.
+        #[arg(short = 't', long, default_value_t = 4)]
+        threads: usize,
+    },
+    /// Stage34 v5: compact global backbone plus conservative local adaptive high-k refinement.
+    MultikHybrid {
+        #[arg(short = '1', long)]
+        read1: PathBuf,
+        #[arg(short = '2', long)]
+        read2: Option<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Global compact backbone k. Must fit the u128 backbone representation.
+        #[arg(long, default_value_t = 31)]
+        backbone_k: usize,
+        /// First local high-k candidate. Larger k values are chosen adaptively from routed read lengths.
+        #[arg(long, default_value_t = 55)]
+        local_start_k: usize,
+        /// Hard cap for local wide-key refinement. The v5 wide key supports k <= 255.
+        #[arg(long, default_value_t = 255)]
+        max_local_k: usize,
+        #[arg(long, default_value_t = 2)]
+        min_count: u32,
+        #[arg(long, default_value_t = 2)]
+        min_fragment_support: u32,
+        #[arg(long, default_value_t = 20.0)]
+        min_mean_quality: f32,
+        /// Raw-graph state radius around branch/dead-end seeds.
+        #[arg(long, default_value_t = 64)]
+        neighborhood_radius: usize,
+        /// Maximum raw oriented states in one local neighborhood.
+        #[arg(long, default_value_t = 4096)]
+        max_neighborhood_states: usize,
+        /// Maximum adaptive neighborhoods. Limited to 64 so routing uses one u64 mask.
+        #[arg(long, default_value_t = 64)]
+        max_neighborhoods: usize,
+        #[arg(long)]
+        max_pairs: Option<usize>,
         #[arg(short = 't', long, default_value_t = 4)]
         threads: usize,
     },
@@ -193,6 +231,58 @@ fn main() -> Result<()> {
                 run.summary.timings_seconds.total_seconds,
                 threads.max(1),
                 run.rescue_candidates.len()
+            );
+        }
+        Command::MultikHybrid {
+            read1,
+            read2,
+            output,
+            backbone_k,
+            local_start_k,
+            max_local_k,
+            min_count,
+            min_fragment_support,
+            min_mean_quality,
+            neighborhood_radius,
+            max_neighborhood_states,
+            max_neighborhoods,
+            max_pairs,
+            threads,
+        } => {
+            let config = HybridConfig {
+                read1,
+                read2,
+                output_dir: output.clone(),
+                backbone_k,
+                local_start_k,
+                max_local_k,
+                min_count,
+                min_fragment_support,
+                min_mean_quality,
+                neighborhood_radius,
+                max_neighborhood_states,
+                max_neighborhoods,
+                max_pairs,
+            };
+            let run = run_multik_hybrid(&config, threads)?;
+            write_hybrid_outputs(&run, &output)?;
+            let resolved = run.summary.local.iter().filter(|item| item.resolved).count();
+            let above_55 = run
+                .summary
+                .local
+                .iter()
+                .filter_map(|item| item.selected_k)
+                .filter(|&k| k > 55)
+                .count();
+            eprintln!(
+                "hybrid Stage34 built k={} backbone from {} pairs and refined {} neighborhoods in {:.3}s using {} threads; {} resolved, {} selected k>55",
+                run.summary.backbone_k,
+                run.summary.read_pairs,
+                run.summary.neighborhoods,
+                run.summary.total_seconds,
+                threads.max(1),
+                resolved,
+                above_55
             );
         }
     }
