@@ -1,8 +1,8 @@
 use anyhow::Result;
 use bridgeasm::assembler::{assemble, AssembleConfig};
 use bridgeasm::dna::MAX_K;
-use bridgeasm::multik::{write_multik_outputs, MultiKConfig};
-use bridgeasm::multik_mem::build_multik_graph_memory_bounded;
+use bridgeasm::multik::MultiKConfig;
+use bridgeasm::multik_stream::{run_multik_streaming, write_streaming_outputs};
 use bridgeasm::output::write_outputs;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ enum Command {
         #[arg(short = 't', long, default_value_t = 1)]
         threads: usize,
     },
-    /// Stage34: memory-bounded multi-k graph with exact retained-node evidence.
+    /// Stage34: compact streaming multi-k graph with exact retained-node evidence.
     Multik {
         #[arg(short = '1', long)]
         read1: PathBuf,
@@ -87,6 +87,9 @@ enum Command {
         /// Maximum lower-k unique walk when probing a high-k dead-end rescue.
         #[arg(long, default_value_t = 500)]
         max_rescue_bases: usize,
+        /// Worker threads for Stage34 fixed-memory scans and cross-k analysis.
+        #[arg(short = 't', long, default_value_t = 4)]
+        threads: usize,
     },
 }
 
@@ -167,6 +170,7 @@ fn main() -> Result<()> {
             min_mean_quality,
             max_pairs,
             max_rescue_bases,
+            threads,
         } => {
             let config = MultiKConfig {
                 read1,
@@ -179,14 +183,15 @@ fn main() -> Result<()> {
                 max_pairs,
                 max_rescue_bases,
             };
-            let graph = build_multik_graph_memory_bounded(&config)?;
-            write_multik_outputs(&graph, &output)?;
+            let run = run_multik_streaming(&config, threads)?;
+            write_streaming_outputs(&run, &output)?;
             eprintln!(
-                "built {} multi-k layers from {} physical read pairs in {:.3}s; {} cross-k rescue candidates",
-                graph.layers.len(),
-                graph.summary.read_pairs,
-                graph.summary.timings_seconds.total_seconds,
-                graph.rescue_candidates.len()
+                "built {} compact streaming multi-k layers from {} physical read pairs in {:.3}s using {} threads; {} cross-k rescue candidates",
+                run.summary.layers.len(),
+                run.summary.read_pairs,
+                run.summary.timings_seconds.total_seconds,
+                threads.max(1),
+                run.rescue_candidates.len()
             );
         }
     }
