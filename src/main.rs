@@ -3,6 +3,7 @@ use bridgeasm::assembler::{assemble, AssembleConfig};
 use bridgeasm::dna::MAX_K;
 use bridgeasm::multik::MultiKConfig;
 use bridgeasm::multik_hybrid::{run_multik_hybrid, write_hybrid_outputs, HybridConfig};
+use bridgeasm::multik_hybrid_safe::enforce_hybrid_safe_gate;
 use bridgeasm::multik_stream::write_streaming_outputs;
 use bridgeasm::multik_v4::run_multik_v4;
 use bridgeasm::output::write_outputs;
@@ -196,6 +197,7 @@ fn main() -> Result<()> {
                 product.stats.primary_n50,
                 product.stats.primary_bases,
                 product.stats.simple_bubbles,
+                product.stats.variant_alleles,
                 product.stats.haplotigs
             );
         }
@@ -264,7 +266,8 @@ fn main() -> Result<()> {
                 max_neighborhoods,
                 max_pairs,
             };
-            let run = run_multik_hybrid(&config, threads)?;
+            let mut run = run_multik_hybrid(&config, threads)?;
+            enforce_hybrid_safe_gate(&mut run);
             write_hybrid_outputs(&run, &output)?;
             let resolved = run
                 .summary
@@ -280,7 +283,7 @@ fn main() -> Result<()> {
                 .filter(|&k| k > 55)
                 .count();
             eprintln!(
-                "hybrid Stage34 built k={} backbone from {} pairs and refined {} neighborhoods in {:.3}s using {} threads; {} resolved, {} selected k>55",
+                "hybrid Stage34 built k={} backbone from {} pairs and refined {} neighborhoods in {:.3}s using {} threads; {} connectivity-safe resolved, {} selected k>55",
                 run.summary.backbone_k,
                 run.summary.read_pairs,
                 run.summary.neighborhoods,
