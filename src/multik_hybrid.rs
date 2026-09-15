@@ -196,8 +196,7 @@ impl Roller128 {
     #[inline]
     fn push(&mut self, bits: u8) -> Option<(u128, bool)> {
         self.forward = ((self.forward << 2) | u128::from(bits)) & self.mask;
-        self.reverse =
-            (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
+        self.reverse = (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
         self.valid += 1;
         if self.valid < self.k {
             None
@@ -472,11 +471,7 @@ fn merge_local_maps(
     left
 }
 
-fn exact_backbone(
-    config: &HybridConfig,
-    repeated: &Bloom,
-    pool: &ThreadPool,
-) -> Result<Vec<u128>> {
+fn exact_backbone(config: &HybridConfig, repeated: &Bloom, pool: &ThreadPool) -> Result<Vec<u128>> {
     let mut global: FxHashMap<u128, ExactEvidence> = FxHashMap::default();
     process_pair_batches(
         &config.read1,
@@ -825,7 +820,8 @@ impl RouteStats {
     fn observe(&mut self, span: usize, support: usize) {
         self.fragments += 1;
         self.top_spans.push(span);
-        self.top_spans.sort_unstable_by(|left, right| right.cmp(left));
+        self.top_spans
+            .sort_unstable_by(|left, right| right.cmp(left));
         self.top_spans.truncate(support.max(1));
     }
 
@@ -1270,12 +1266,17 @@ fn build_local_k(
     let dead_end_states = indegree
         .iter()
         .zip(outdegree.iter())
-        .filter(|&(&incoming, &outgoing)| incoming + outgoing > 0 && (incoming == 0 || outgoing == 0))
+        .filter(|&(&incoming, &outgoing)| {
+            incoming + outgoing > 0 && (incoming == 0 || outgoing == 0)
+        })
         .count();
     let (projection_missing_nodes, projection_missing_edges) = keys
         .par_iter()
         .map(|&key| project_wide_key(key, k, backbone))
-        .reduce(|| (0_usize, 0_usize), |left, right| (left.0 + right.0, left.1 + right.1));
+        .reduce(
+            || (0_usize, 0_usize),
+            |left, right| (left.0 + right.0, left.1 + right.1),
+        );
     let resolved = !keys.is_empty()
         && ambiguous_states == 0
         && projection_missing_nodes == 0
@@ -1293,7 +1294,7 @@ fn build_local_k(
 }
 
 fn odd_floor(value: usize) -> usize {
-    if value % 2 == 0 {
+    if value.is_multiple_of(2) {
         value.saturating_sub(1)
     } else {
         value
@@ -1301,7 +1302,7 @@ fn odd_floor(value: usize) -> usize {
 }
 
 fn odd_ceil(value: usize) -> usize {
-    if value % 2 == 0 {
+    if value.is_multiple_of(2) {
         value.saturating_add(1)
     } else {
         value
@@ -1499,7 +1500,8 @@ pub fn write_hybrid_outputs(run: &HybridRunStats, output: &Path) -> Result<()> {
             item.ambiguous_states,
             item.routed_fragments,
             item.supported_max_k,
-            item.selected_k.map_or_else(|| "NA".to_string(), |k| k.to_string()),
+            item.selected_k
+                .map_or_else(|| "NA".to_string(), |k| k.to_string()),
             item.resolved
         )?;
     }

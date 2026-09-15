@@ -5,7 +5,6 @@ pub mod graph;
 pub mod kmer;
 pub mod multik;
 pub mod multik_fast;
-#[allow(clippy::manual_is_multiple_of)]
 pub mod multik_hybrid;
 pub mod multik_mem;
 pub mod multik_stream;

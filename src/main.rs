@@ -266,7 +266,12 @@ fn main() -> Result<()> {
             };
             let run = run_multik_hybrid(&config, threads)?;
             write_hybrid_outputs(&run, &output)?;
-            let resolved = run.summary.local.iter().filter(|item| item.resolved).count();
+            let resolved = run
+                .summary
+                .local
+                .iter()
+                .filter(|item| item.resolved)
+                .count();
             let above_55 = run
                 .summary
                 .local
