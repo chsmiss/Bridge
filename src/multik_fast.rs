@@ -104,8 +104,7 @@ impl Roller {
     #[inline]
     fn push(&mut self, bits: u8) -> Option<u128> {
         self.forward = ((self.forward << 2) | u128::from(bits)) & self.mask;
-        self.reverse = (self.reverse >> 2)
-            | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
+        self.reverse = (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
         self.valid += 1;
         (self.valid >= self.order).then_some(self.forward.min(self.reverse))
     }
@@ -142,12 +141,7 @@ fn packed_to_kmer(value: u128) -> KmerKey {
 }
 
 #[inline]
-fn observe_node(
-    pending: &mut PendingLayer,
-    key: u128,
-    fragment_id: usize,
-    quality_sum: u64,
-) {
+fn observe_node(pending: &mut PendingLayer, key: u128, fragment_id: usize, quality_sum: u64) {
     let entry = pending.nodes.entry(key).or_default();
     entry.count = entry.count.saturating_add(1);
     entry.quality_sum = entry.quality_sum.saturating_add(quality_sum);
@@ -194,7 +188,8 @@ fn scan_record_layer(
         quality_sum = quality_sum.saturating_add(q);
         valid += 1;
         if valid > k {
-            quality_sum = quality_sum.saturating_sub(u64::from(quality[index - k].saturating_sub(33)));
+            quality_sum =
+                quality_sum.saturating_sub(u64::from(quality[index - k].saturating_sub(33)));
         }
 
         if let Some(key) = node.push(bits) {
@@ -260,9 +255,9 @@ fn count_multi_k_parallel(
                     Vec::with_capacity(BATCH_PAIRS),
                 ));
                 for sender in &senders {
-                    sender
-                        .send(Arc::clone(&shared))
-                        .map_err(|_| anyhow::anyhow!("multi-k layer worker stopped unexpectedly"))?;
+                    sender.send(Arc::clone(&shared)).map_err(|_| {
+                        anyhow::anyhow!("multi-k layer worker stopped unexpectedly")
+                    })?;
                 }
             }
             if fragment_id % PROGRESS_PAIRS == 0 {
@@ -683,8 +678,12 @@ mod tests {
         let sequence = "ACGTTGCAACGTCAGTACGATCGTAGCTAACGTTGCA";
         let mut handle = File::create(&reads).unwrap();
         for index in 0..4 {
-            writeln!(handle, "@r{index}\n{sequence}\n+\n{}", "I".repeat(sequence.len()))
-                .unwrap();
+            writeln!(
+                handle,
+                "@r{index}\n{sequence}\n+\n{}",
+                "I".repeat(sequence.len())
+            )
+            .unwrap();
         }
         drop(handle);
         let config = MultiKConfig {
@@ -701,6 +700,9 @@ mod tests {
         let graph = build_multik_graph_fast(&config).unwrap();
         assert_eq!(graph.layers.len(), 2);
         assert_eq!(graph.summary.version, "stage34-layered-multik-v1-fast");
-        assert!(graph.layers.iter().all(|layer| !layer.raw_graph.keys.is_empty()));
+        assert!(graph
+            .layers
+            .iter()
+            .all(|layer| !layer.raw_graph.keys.is_empty()));
     }
 }
