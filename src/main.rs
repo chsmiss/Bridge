@@ -2,7 +2,7 @@ use anyhow::Result;
 use bridgeasm::assembler::{assemble, AssembleConfig};
 use bridgeasm::dna::MAX_K;
 use bridgeasm::multik::{write_multik_outputs, MultiKConfig};
-use bridgeasm::multik_fast::build_multik_graph_fast;
+use bridgeasm::multik_mem::build_multik_graph_memory_bounded;
 use bridgeasm::output::write_outputs;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ enum Command {
         #[arg(short = 't', long, default_value_t = 1)]
         threads: usize,
     },
-    /// Stage34: one FASTQ pass, parallel k layers, exact cross-k projections.
+    /// Stage34: memory-bounded multi-k graph with exact retained-node evidence.
     Multik {
         #[arg(short = '1', long)]
         read1: PathBuf,
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
                 max_pairs,
                 max_rescue_bases,
             };
-            let graph = build_multik_graph_fast(&config)?;
+            let graph = build_multik_graph_memory_bounded(&config)?;
             write_multik_outputs(&graph, &output)?;
             eprintln!(
                 "built {} multi-k layers from {} physical read pairs in {:.3}s; {} cross-k rescue candidates",
