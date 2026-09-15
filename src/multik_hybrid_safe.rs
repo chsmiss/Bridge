@@ -18,7 +18,10 @@ pub fn enforce_hybrid_safe_gate(run: &mut HybridRunStats) {
             candidate.resolved = candidate.resolved && candidate_has_connectivity(candidate);
         }
 
-        neighborhood.resolved = neighborhood.candidates.iter().any(|candidate| candidate.resolved);
+        neighborhood.resolved = neighborhood
+            .candidates
+            .iter()
+            .any(|candidate| candidate.resolved);
         if let Some(candidate) = neighborhood
             .candidates
             .iter()
@@ -42,7 +45,12 @@ mod tests {
         HybridNeighborhoodSummary, HybridRunStats, HybridSummary, LocalKSummary,
     };
 
-    fn candidate(k: usize, retained_kmers: usize, directed_edges: usize, resolved: bool) -> LocalKSummary {
+    fn candidate(
+        k: usize,
+        retained_kmers: usize,
+        directed_edges: usize,
+        resolved: bool,
+    ) -> LocalKSummary {
         LocalKSummary {
             k,
             retained_kmers,
