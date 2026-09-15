@@ -45,7 +45,7 @@ enum Command {
         min_read_support: u32,
         #[arg(long, default_value_t = 2)]
         min_pair_support: u32,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_value_t = 5)]
         min_primary_support: u32,
         #[arg(long, default_value_t = 0.75)]
         primary_dominance: f32,
@@ -197,7 +197,6 @@ fn main() -> Result<()> {
                 product.stats.primary_n50,
                 product.stats.primary_bases,
                 product.stats.simple_bubbles,
-                product.stats.variant_alleles,
                 product.stats.haplotigs
             );
         }
