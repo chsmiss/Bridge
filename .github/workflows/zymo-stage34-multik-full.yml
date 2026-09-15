@@ -7,6 +7,9 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - src/multik.rs
+      - src/multik_fast.rs
+      - src/multik_mem.rs
+      - src/multik_stream.rs
       - src/main.rs
       - src/lib.rs
       - scripts/download_ena_full.py
@@ -90,6 +93,7 @@ jobs:
               --min-fragment-support 2 \
               --min-mean-quality 20 \
               --max-rescue-bases 500 \
+              --threads 4 \
               > benchmark/stage34.log 2>&1
           status=$?
           set -e
@@ -119,11 +123,13 @@ jobs:
           summary={
               'exit_status':exit_status,
               'elapsed_wall_clock':field('Elapsed (wall clock) time (h:mm:ss or m:ss)'),
+              'cpu_percent':field('Percent of CPU this job got'),
               'user_seconds':field('User time (seconds)'),
               'system_seconds':field('System time (seconds)'),
               'max_rss_kbytes':field('Maximum resident set size (kbytes)'),
               'filesystem_inputs':field('File system inputs'),
               'filesystem_outputs':field('File system outputs'),
+              'threads':4,
           }
           multi=Path('benchmark/stage34/multik_summary.json')
           if multi.exists():
@@ -136,7 +142,7 @@ jobs:
           )
           print(json.dumps(summary,indent=2,sort_keys=True))
           PY
-          printf 'commit\t%s\ndataset\tERR2935805_complete_run\nks\t21,31,41,55\n' \
+          printf 'commit\t%s\ndataset\tERR2935805_complete_run\nks\t21,31,41,55\nthreads\t4\n' \
             "$GITHUB_SHA" > benchmark/stage34_provenance.tsv
 
       - name: Upload Stage34 full-data resource artifact
