@@ -1,0 +1,121 @@
+name: Zymo Stage34 multi-k scaling
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/multik_fast.rs
+      - src/main.rs
+      - src/lib.rs
+      - .github/workflows/zymo-stage34-multik-scaling.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zymo-stage34-multik-scaling-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install resource measurement tool
+        run: sudo apt-get update && sudo apt-get install -y time
+
+      - name: Download deterministic first 10M Zymo read pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/zymo-stage34-scaling
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-stage34-scaling --pairs 10000000 \
+            | tee zymo_stage34_scaling_download.log
+          ls -lh /tmp/zymo-stage34-scaling/ERR2935805_*.fastq.gz
+
+      - name: Run 1M 5M 10M scaling points
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/stage34-scaling
+          for pairs in 1000000 5000000 10000000; do
+            out="benchmark/stage34-scaling/${pairs}"
+            mkdir -p "$out"
+            echo "=== START ${pairs} PAIRS ==="
+            /usr/bin/time -v -o "$out/time.txt" \
+              ./target/release/bridgeasm multik \
+                -1 /tmp/zymo-stage34-scaling/ERR2935805_1.fastq.gz \
+                -2 /tmp/zymo-stage34-scaling/ERR2935805_2.fastq.gz \
+                -o "$out/output" \
+                --ks 21,31,41,55 \
+                --min-count 2 \
+                --min-fragment-support 2 \
+                --min-mean-quality 20 \
+                --max-rescue-bases 500 \
+                --max-pairs "$pairs" \
+                > "$out/run.log" 2>&1
+            cat "$out/time.txt"
+            cat "$out/output/multik_summary.json"
+          done
+
+      - name: Summarize scaling
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          root=Path('benchmark/stage34-scaling')
+          rows=[]
+          for pairs in (1_000_000,5_000_000,10_000_000):
+              p=root/str(pairs)
+              text=(p/'time.txt').read_text()
+              def field(name):
+                  m=re.search(r'^\s*'+re.escape(name)+r':\s*(.+?)\s*$',text,re.M)
+                  return m.group(1) if m else None
+              summary=json.loads((p/'output/multik_summary.json').read_text())
+              rows.append({
+                  'pairs':pairs,
+                  'elapsed_wall_clock':field('Elapsed (wall clock) time (h:mm:ss or m:ss)'),
+                  'user_seconds':float(field('User time (seconds)')),
+                  'system_seconds':float(field('System time (seconds)')),
+                  'max_rss_kbytes':int(field('Maximum resident set size (kbytes)')),
+                  'internal_total_seconds':summary['timings_seconds']['total_seconds'],
+                  'count_seconds':summary['timings_seconds']['count_seconds'],
+                  'finalize_seconds':summary['timings_seconds']['finalize_seconds'],
+                  'projection_seconds':summary['timings_seconds']['projection_seconds'],
+                  'rescue_seconds':summary['timings_seconds']['rescue_seconds'],
+                  'layers':summary['layers'],
+              })
+          out={'version':'stage34-layered-multik-v1-fast','points':rows}
+          (root/'scaling_summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          with (root/'scaling_summary.tsv').open('w') as h:
+              h.write('pairs\tinternal_total_seconds\tcount_seconds\tfinalize_seconds\tprojection_seconds\trescue_seconds\tmax_rss_kbytes\n')
+              for r in rows:
+                  h.write(f"{r['pairs']}\t{r['internal_total_seconds']:.3f}\t{r['count_seconds']:.3f}\t{r['finalize_seconds']:.3f}\t{r['projection_seconds']:.3f}\t{r['rescue_seconds']:.3f}\t{r['max_rss_kbytes']}\n")
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+
+      - name: Upload scaling artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage34-multik-scaling
+          path: |
+            benchmark/stage34-scaling/scaling_summary.json
+            benchmark/stage34-scaling/scaling_summary.tsv
+            benchmark/stage34-scaling/*/time.txt
+            benchmark/stage34-scaling/*/run.log
+            benchmark/stage34-scaling/*/output/multik_summary.json
+            benchmark/stage34-scaling/*/output/layer_summary.tsv
+            benchmark/stage34-scaling/*/output/projection_summary.tsv
+            benchmark/stage34-scaling/*/output/adaptive_rescue.tsv
+          retention-days: 14
