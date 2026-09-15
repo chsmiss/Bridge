@@ -182,8 +182,7 @@ impl Roller {
     #[inline]
     fn push(&mut self, bits: u8) -> Option<(u128, bool)> {
         self.forward = ((self.forward << 2) | u128::from(bits)) & self.mask;
-        self.reverse =
-            (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
+        self.reverse = (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
         self.valid += 1;
         if self.valid < self.order {
             None
@@ -215,7 +214,11 @@ fn packed_to_kmer(value: u128) -> KmerKey {
     }
 }
 
-fn scan_discovery_record(sequence: &[u8], layer: &mut DiscoveryLayer, fragment_keys: &mut Vec<u128>) {
+fn scan_discovery_record(
+    sequence: &[u8],
+    layer: &mut DiscoveryLayer,
+    fragment_keys: &mut Vec<u128>,
+) {
     let mut node = Roller::new(layer.k);
     let mut edge = Roller::new(layer.k + 1);
     for &base in sequence {
