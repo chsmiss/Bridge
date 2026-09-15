@@ -2,8 +2,8 @@ use crate::dna::base_bits;
 use crate::fastq::{for_each_pair, FastqRecord};
 use crate::graph::GraphSummary;
 use crate::multik::{
-    AdaptiveRescueCandidate, AdaptiveRescueSummary, MultiKConfig, MultiKLayerSummary, MultiKSummary,
-    MultiKTimingSummary, ProjectionSummary,
+    AdaptiveRescueCandidate, AdaptiveRescueSummary, MultiKConfig, MultiKLayerSummary,
+    MultiKSummary, MultiKTimingSummary, ProjectionSummary,
 };
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
@@ -202,8 +202,7 @@ impl Roller {
     #[inline]
     fn push(&mut self, bits: u8) -> Option<(u128, bool)> {
         self.forward = ((self.forward << 2) | u128::from(bits)) & self.mask;
-        self.reverse =
-            (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
+        self.reverse = (self.reverse >> 2) | (u128::from(3 - (bits & 0b11)) << self.reverse_shift);
         self.valid += 1;
         if self.valid < self.order {
             None
@@ -470,7 +469,11 @@ where
     Ok(read_pairs)
 }
 
-fn scan_discovery_sequence(sequence: &[u8], layer: &mut DiscoveryLayer, fragment_keys: &mut Vec<u128>) {
+fn scan_discovery_sequence(
+    sequence: &[u8],
+    layer: &mut DiscoveryLayer,
+    fragment_keys: &mut Vec<u128>,
+) {
     let mut node = Roller::new(layer.k);
     let mut edge = Roller::new(layer.k + 1);
     for &base in sequence {
@@ -508,11 +511,7 @@ fn discover_repeated_parallel(
                     let mut fragment_keys = Vec::with_capacity(512);
                     for pair in batch {
                         fragment_keys.clear();
-                        scan_discovery_sequence(
-                            &pair.left_sequence,
-                            layer,
-                            &mut fragment_keys,
-                        );
+                        scan_discovery_sequence(&pair.left_sequence, layer, &mut fragment_keys);
                         if let Some(sequence) = pair.right_sequence.as_deref() {
                             scan_discovery_sequence(sequence, layer, &mut fragment_keys);
                         }
@@ -610,9 +609,10 @@ fn exact_node_count_parallel(
                                 pair.fragment_id,
                                 &mut local,
                             );
-                            if let (Some(sequence), Some(quality)) =
-                                (pair.right_sequence.as_deref(), pair.right_quality.as_deref())
-                            {
+                            if let (Some(sequence), Some(quality)) = (
+                                pair.right_sequence.as_deref(),
+                                pair.right_quality.as_deref(),
+                            ) {
                                 scan_exact_sequence(
                                     sequence,
                                     quality,
@@ -843,12 +843,7 @@ fn walk_unitig(
     states
 }
 
-fn push_unitig(
-    raw: &CompactRawGraph,
-    states: Vec<u32>,
-    id: u32,
-    unitigs: &mut Vec<CompactUnitig>,
-) {
+fn push_unitig(raw: &CompactRawGraph, states: Vec<u32>, id: u32, unitigs: &mut Vec<CompactUnitig>) {
     if states.is_empty() {
         return;
     }
@@ -1100,11 +1095,13 @@ fn build_projection_summary(
             .unitigs
             .par_iter()
             .map(|unitig| project_one(&unitig.sequence, low))
-            .reduce(ProjectionAccumulator::default, |left, right| ProjectionAccumulator {
-                exact: left.exact + right.exact,
-                missing_node: left.missing_node + right.missing_node,
-                missing_edge: left.missing_edge + right.missing_edge,
-                visits: left.visits + right.visits,
+            .reduce(ProjectionAccumulator::default, |left, right| {
+                ProjectionAccumulator {
+                    exact: left.exact + right.exact,
+                    missing_node: left.missing_node + right.missing_node,
+                    missing_edge: left.missing_edge + right.missing_edge,
+                    visits: left.visits + right.visits,
+                }
             })
     });
     ProjectionSummary {
@@ -1294,9 +1291,7 @@ pub fn run_multik_streaming(config: &MultiKConfig, threads: usize) -> Result<Sta
     let count_started = Instant::now();
     let (mut discovery, read_pairs) = discover_repeated_parallel(config, &ks, &pool)?;
     let count_seconds = count_started.elapsed().as_secs_f64();
-    eprintln!(
-        "stage34 v3 repeat discovery complete: {read_pairs} pairs in {count_seconds:.3}s"
-    );
+    eprintln!("stage34 v3 repeat discovery complete: {read_pairs} pairs in {count_seconds:.3}s");
 
     let mut finalize_duration = Duration::ZERO;
     let mut projection_duration = Duration::ZERO;
@@ -1509,13 +1504,19 @@ mod tests {
         assert_eq!(compact.raw.keys, old_keys);
         assert_eq!(
             compact.raw.out_offsets,
-            old.out_offsets.iter().map(|&value| value as u32).collect::<Vec<_>>()
+            old.out_offsets
+                .iter()
+                .map(|&value| value as u32)
+                .collect::<Vec<_>>()
         );
         assert_eq!(compact.raw.out_targets, old.out_targets);
 
         let run = run_multik_streaming(&config, 2).unwrap();
         assert_eq!(run.summary.layers.len(), 2);
         assert_eq!(run.summary.projections.len(), 1);
-        assert_eq!(run.summary.version, "stage34-layered-multik-v3-compact-streaming");
+        assert_eq!(
+            run.summary.version,
+            "stage34-layered-multik-v3-compact-streaming"
+        );
     }
 }
