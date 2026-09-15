@@ -6,6 +6,7 @@ pub mod kmer;
 pub mod multik;
 pub mod multik_fast;
 pub mod multik_hybrid;
+pub mod multik_hybrid_safe;
 pub mod multik_mem;
 pub mod multik_stream;
 #[allow(dead_code)]
