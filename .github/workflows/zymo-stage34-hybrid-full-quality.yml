@@ -1,0 +1,298 @@
+name: Zymo full Stage34 hybrid GF N50
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/multik_hybrid.rs
+      - src/multik_hybrid_safe.rs
+      - src/main.rs
+      - src/lib.rs
+      - src/assembler.rs
+      - src/graph.rs
+      - src/output.rs
+      - scripts/download_ena_full.py
+      - scripts/fasta_stats.py
+      - scripts/summarize_metaquast.py
+      - .github/workflows/zymo-stage34-hybrid-full-quality.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zymo-stage34-hybrid-full-quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  THREADS: '4'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install evaluation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl unzip minimap2 time
+          curl -L --retry 3 -o /tmp/quast.tar.gz \
+            https://github.com/ablab/quast/releases/download/quast_5.3.0/quast-5.3.0.tar.gz
+          tar -xzf /tmp/quast.tar.gz -C /tmp
+
+      - name: Prepare runner and inspect full ENA metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark /tmp/zymo-full
+          python3 scripts/download_ena_full.py ERR2935805 /tmp/zymo-full --metadata-only \
+            | tee benchmark/ena_metadata.log
+          cp /tmp/zymo-full/full_provenance.json benchmark/ena_full_metadata.json
+          df -B1 / | tee benchmark/disk_before.tsv
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet || true
+          sudo apt-get clean || true
+          df -B1 / | tee benchmark/disk_after_cleanup.tsv
+          python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          meta=json.loads(Path('benchmark/ena_full_metadata.json').read_text())
+          need=int(meta.get('expected_compressed_bytes_total') or 0)
+          free=shutil.disk_usage('/').free
+          reserve=6_000_000_000
+          print(f'ENA_COMPRESSED_BYTES={need}')
+          print(f'FREE_BYTES={free}')
+          if need and need + reserve > free:
+              raise SystemExit(f'full ENA FASTQ needs {need} bytes; only {free} free with {reserve} reserve')
+          PY
+
+      - name: Download complete ERR2935805 paired FASTQ
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            rm -f /tmp/zymo-full/ERR2935805_1.fastq.gz /tmp/zymo-full/ERR2935805_2.fastq.gz
+            if python3 scripts/download_ena_full.py ERR2935805 /tmp/zymo-full \
+              | tee benchmark/ena_download.log; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 10
+          done
+          cp /tmp/zymo-full/full_provenance.json benchmark/ena_full_provenance.json
+          ls -lh /tmp/zymo-full/ERR2935805_*.fastq.gz | tee benchmark/input_files.txt
+          df -h / | tee benchmark/disk_after_download.txt
+
+      - name: Download official Zymo references
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --retry 3 -o /tmp/zymo-refs.zip \
+            'https://zenodo.org/records/3935737/files/ZymoBIOMICS.STD.refseq.v2.zip?download=1'
+          rm -rf /tmp/zymo-refs
+          mkdir -p /tmp/zymo-refs
+          unzip -q /tmp/zymo-refs.zip -d /tmp/zymo-refs
+          find /tmp/zymo-refs -type f \( -iname '*.fasta' -o -iname '*.fa' -o -iname '*.fna' \) -print0 \
+            | sort -z | xargs -0 cat > /tmp/zymo-references.fasta
+          test -s /tmp/zymo-references.fasta
+          grep -c '^>' /tmp/zymo-references.fasta | tee benchmark/reference_count.txt
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run full Stage34 v5 hybrid diagnostics
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p benchmark/hybrid
+          set +e
+          /usr/bin/time -v -o benchmark/hybrid.time.txt \
+            ./target/release/bridgeasm multik-hybrid \
+              -1 /tmp/zymo-full/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-full/ERR2935805_2.fastq.gz \
+              -o benchmark/hybrid \
+              --backbone-k 31 \
+              --local-start-k 55 \
+              --max-local-k 255 \
+              --min-count 2 \
+              --min-fragment-support 2 \
+              --min-mean-quality 20 \
+              --neighborhood-radius 64 \
+              --max-neighborhood-states 4096 \
+              --max-neighborhoods 64 \
+              --threads "$THREADS" \
+              > benchmark/hybrid.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > benchmark/hybrid.exit_status
+          tail -n 100 benchmark/hybrid.log || true
+          cat benchmark/hybrid.time.txt || true
+          exit 0
+
+      - name: Run full production k31 assembly companion
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p benchmark/assembly
+          set +e
+          /usr/bin/time -v -o benchmark/assembly.time.txt \
+            ./target/release/bridgeasm assemble \
+              -1 /tmp/zymo-full/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-full/ERR2935805_2.fastq.gz \
+              -o benchmark/assembly \
+              -k 31 \
+              --min-count 2 \
+              --mercy-max-kmers 16 \
+              --mercy-min-support 1 \
+              --mercy-min-quality 25 \
+              --min-read-support 2 \
+              --min-pair-support 2 \
+              --min-primary-support 5 \
+              --primary-dominance 0.75 \
+              --min-contig-length 200 \
+              --threads "$THREADS" \
+              > benchmark/assembly.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > benchmark/assembly.exit_status
+          tail -n 100 benchmark/assembly.log || true
+          cat benchmark/assembly.time.txt || true
+          exit 0
+
+      - name: Calculate assembly N50
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s benchmark/assembly/primary_contigs.fasta ]; then
+            python3 scripts/fasta_stats.py benchmark/assembly/primary_contigs.fasta \
+              --json benchmark/assembly_primary.stats.json \
+              | tee benchmark/assembly_primary.stats.tsv
+          else
+            echo 'production primary_contigs.fasta unavailable' | tee benchmark/n50_unavailable.txt
+          fi
+
+      - name: Calculate Genome Fraction with MetaQUAST
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s benchmark/assembly/primary_contigs.fasta ]; then
+            python3 /tmp/quast-5.3.0/metaquast.py \
+              benchmark/assembly/primary_contigs.fasta \
+              -r /tmp/zymo-references.fasta \
+              -o benchmark/metaquast --threads "$THREADS" --min-contig 200 --no-plots
+            python3 scripts/summarize_metaquast.py \
+              benchmark/metaquast/combined_reference/transposed_report.tsv \
+              --json benchmark/metaquast_summary.json \
+              | tee benchmark/metaquast_summary.tsv
+          else
+            echo 'production primary_contigs.fasta unavailable' | tee benchmark/gf_unavailable.txt
+          fi
+
+      - name: Build full quality summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+
+          def read_json(path):
+              p=Path(path)
+              return json.loads(p.read_text()) if p.exists() else None
+
+          def exit_status(path):
+              p=Path(path)
+              if not p.exists(): return None
+              try: return int(p.read_text().strip())
+              except Exception: return None
+
+          def time_fields(path):
+              p=Path(path)
+              text=p.read_text(errors='replace') if p.exists() else ''
+              def field(name):
+                  m=re.search(r'^\s*'+re.escape(name)+r':\s*(.+?)\s*$', text, re.M)
+                  return m.group(1) if m else None
+              return {
+                  'elapsed_wall_clock': field('Elapsed (wall clock) time (h:mm:ss or m:ss)'),
+                  'cpu_percent': field('Percent of CPU this job got'),
+                  'user_seconds': field('User time (seconds)'),
+                  'system_seconds': field('System time (seconds)'),
+                  'max_rss_kbytes': field('Maximum resident set size (kbytes)'),
+              }
+
+          meta=read_json('benchmark/metaquast_summary.json')
+          meta_row=meta[0] if isinstance(meta,list) and meta else None
+          fasta=read_json('benchmark/assembly_primary.stats.json')
+          hybrid=read_json('benchmark/hybrid/hybrid_summary.json')
+          result={
+              'dataset':'ERR2935805_complete_run',
+              'threads':4,
+              'hybrid_v5': {
+                  'exit_status': exit_status('benchmark/hybrid.exit_status'),
+                  'resources': time_fields('benchmark/hybrid.time.txt'),
+                  'summary': hybrid,
+              },
+              'production_k31_companion': {
+                  'exit_status': exit_status('benchmark/assembly.exit_status'),
+                  'resources': time_fields('benchmark/assembly.time.txt'),
+                  'fasta_stats': fasta,
+                  'metaquast': meta_row,
+              },
+          }
+          if fasta:
+              result['production_k31_companion']['n50']=fasta.get('n50')
+          if meta_row:
+              result['production_k31_companion']['genome_fraction_percent']=meta_row.get('Genome fraction (%)')
+              result['production_k31_companion']['na50']=meta_row.get('NA50')
+              result['production_k31_companion']['misassemblies']=meta_row.get('# misassemblies')
+              result['production_k31_companion']['duplication_ratio']=meta_row.get('Duplication ratio')
+          Path('benchmark/full_quality_summary.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+          printf 'commit\t%s\ndataset\tERR2935805_complete_run\nthreads\t%s\nquality_scope\tproduction_k31_companion\nhybrid_scope\tv5_diagnostics_only\n' \
+            "$GITHUB_SHA" "$THREADS" > benchmark/full_quality_provenance.tsv
+
+      - name: Upload full hybrid quality artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage34-hybrid-full-quality
+          path: |
+            benchmark/full_quality_summary.json
+            benchmark/full_quality_provenance.tsv
+            benchmark/hybrid.time.txt
+            benchmark/hybrid.log
+            benchmark/hybrid.exit_status
+            benchmark/hybrid/hybrid_summary.json
+            benchmark/hybrid/hybrid_neighborhoods.tsv
+            benchmark/assembly.time.txt
+            benchmark/assembly.log
+            benchmark/assembly.exit_status
+            benchmark/assembly/primary_contigs.fasta
+            benchmark/assembly/assembly_stats.json
+            benchmark/assembly_primary.stats.json
+            benchmark/assembly_primary.stats.tsv
+            benchmark/metaquast_summary.json
+            benchmark/metaquast_summary.tsv
+            benchmark/metaquast/combined_reference/transposed_report.tsv
+            benchmark/ena_full_metadata.json
+            benchmark/ena_full_provenance.json
+            benchmark/ena_metadata.log
+            benchmark/ena_download.log
+            benchmark/input_files.txt
+            benchmark/reference_count.txt
+            benchmark/disk_before.tsv
+            benchmark/disk_after_cleanup.tsv
+            benchmark/disk_after_download.txt
+            benchmark/n50_unavailable.txt
+            benchmark/gf_unavailable.txt
+          if-no-files-found: warn
+          retention-days: 14
