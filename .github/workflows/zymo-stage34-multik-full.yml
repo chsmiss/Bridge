@@ -1,0 +1,173 @@
+name: Zymo full Stage34 adaptive multi-k benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/multik.rs
+      - src/multik_fast.rs
+      - src/multik_mem.rs
+      - src/multik_stream.rs
+      - src/main.rs
+      - src/lib.rs
+      - scripts/download_ena_full.py
+      - .github/workflows/zymo-stage34-multik-full.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zymo-stage34-multik-full-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Stage34 release binary
+        run: cargo build --release
+
+      - name: Prepare runner and inspect ENA full-run metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark /tmp/zymo-full
+          python3 scripts/download_ena_full.py ERR2935805 /tmp/zymo-full --metadata-only \
+            | tee benchmark/ena_metadata.log
+          cp /tmp/zymo-full/full_provenance.json benchmark/ena_full_metadata.json
+          df -B1 / | tee benchmark/disk_before.tsv
+          # Hosted runners contain large SDKs that are irrelevant to this benchmark.
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet || true
+          sudo apt-get clean || true
+          df -B1 / | tee benchmark/disk_after_cleanup.tsv
+          python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          meta=json.loads(Path('benchmark/ena_full_metadata.json').read_text())
+          need=int(meta.get('expected_compressed_bytes_total') or 0)
+          free=shutil.disk_usage('/').free
+          reserve=4_000_000_000
+          print(f'ENA_COMPRESSED_BYTES={need}')
+          print(f'FREE_BYTES={free}')
+          if need and need + reserve > free:
+              raise SystemExit(f'full ENA FASTQ needs {need} bytes; only {free} free with {reserve} reserve')
+          PY
+
+      - name: Download complete ERR2935805 paired FASTQ
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            rm -f /tmp/zymo-full/ERR2935805_1.fastq.gz /tmp/zymo-full/ERR2935805_2.fastq.gz
+            if python3 scripts/download_ena_full.py ERR2935805 /tmp/zymo-full \
+              | tee benchmark/ena_download.log; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 10
+          done
+          cp /tmp/zymo-full/full_provenance.json benchmark/ena_full_provenance.json
+          ls -lh /tmp/zymo-full/ERR2935805_*.fastq.gz | tee benchmark/input_files.txt
+          df -h / | tee benchmark/disk_after_download.txt
+
+      - name: Run Stage34 full-data multi-k benchmark
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p benchmark/stage34
+          set +e
+          /usr/bin/time -v -o benchmark/stage34.time.txt \
+            ./target/release/bridgeasm multik \
+              -1 /tmp/zymo-full/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-full/ERR2935805_2.fastq.gz \
+              -o benchmark/stage34 \
+              --ks 21,31,41,55 \
+              --min-count 2 \
+              --min-fragment-support 2 \
+              --min-mean-quality 20 \
+              --max-rescue-bases 500 \
+              --threads 4 \
+              > benchmark/stage34.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > benchmark/stage34.exit_status
+          cat benchmark/stage34.log
+          cat benchmark/stage34.time.txt || true
+          # Keep the workflow alive long enough to upload resource diagnostics even on OOM/signal.
+          exit 0
+
+      - name: Summarize elapsed time and peak RSS
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+
+          time_path=Path('benchmark/stage34.time.txt')
+          text=time_path.read_text(errors='replace') if time_path.exists() else ''
+          def field(name):
+              m=re.search(r'^\s*'+re.escape(name)+r':\s*(.+?)\s*$', text, re.M)
+              return m.group(1) if m else None
+          exit_status=None
+          p=Path('benchmark/stage34.exit_status')
+          if p.exists():
+              exit_status=int(p.read_text().strip())
+          summary={
+              'exit_status':exit_status,
+              'elapsed_wall_clock':field('Elapsed (wall clock) time (h:mm:ss or m:ss)'),
+              'cpu_percent':field('Percent of CPU this job got'),
+              'user_seconds':field('User time (seconds)'),
+              'system_seconds':field('System time (seconds)'),
+              'max_rss_kbytes':field('Maximum resident set size (kbytes)'),
+              'filesystem_inputs':field('File system inputs'),
+              'filesystem_outputs':field('File system outputs'),
+              'threads':4,
+          }
+          multi=Path('benchmark/stage34/multik_summary.json')
+          if multi.exists():
+              summary['multik']=json.loads(multi.read_text())
+          provenance=Path('benchmark/ena_full_provenance.json')
+          if provenance.exists():
+              summary['input']=json.loads(provenance.read_text())
+          Path('benchmark/stage34_resource_summary.json').write_text(
+              json.dumps(summary,indent=2,sort_keys=True)+'\n'
+          )
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+          printf 'commit\t%s\ndataset\tERR2935805_complete_run\nks\t21,31,41,55\nthreads\t4\n' \
+            "$GITHUB_SHA" > benchmark/stage34_provenance.tsv
+
+      - name: Upload Stage34 full-data resource artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage34-multik-full
+          path: |
+            benchmark/stage34_resource_summary.json
+            benchmark/stage34.time.txt
+            benchmark/stage34.log
+            benchmark/stage34.exit_status
+            benchmark/stage34_provenance.tsv
+            benchmark/ena_full_metadata.json
+            benchmark/ena_full_provenance.json
+            benchmark/ena_metadata.log
+            benchmark/ena_download.log
+            benchmark/input_files.txt
+            benchmark/disk_before.tsv
+            benchmark/disk_after_cleanup.tsv
+            benchmark/disk_after_download.txt
+            benchmark/stage34/multik_summary.json
+            benchmark/stage34/layer_summary.tsv
+            benchmark/stage34/projection_summary.tsv
+            benchmark/stage34/adaptive_rescue.tsv
+            benchmark/stage34/adaptive_candidates.tsv
+          if-no-files-found: warn
+          retention-days: 14

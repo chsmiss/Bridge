@@ -49,3 +49,41 @@ jobs:
             --additional /tmp/bridgeasm-out/haplotigs.fasta | tee /tmp/bridgeasm-evaluation.tsv
           awk -F '\t' '$1 == "minor_variant_recall" { found=1; if ($2 + 0 <= 0) exit 1 } END { if (!found) exit 1 }' \
             /tmp/bridgeasm-evaluation.tsv
+      - name: Stage34 hybrid adaptive-k smoke
+        run: |
+          python3 - <<'PY'
+          import random
+          from pathlib import Path
+          random.seed(7)
+          alphabet = 'ACGT'
+          seq_a = ''.join(random.choice(alphabet) for _ in range(120))
+          replacement = next(base for base in alphabet if base != seq_a[60])
+          seq_b = seq_a[:60] + replacement + seq_a[61:]
+          out = Path('/tmp/hybrid-v5.fastq')
+          with out.open('w') as handle:
+              for index in range(12):
+                  seq = seq_a if index < 6 else seq_b
+                  handle.write(f'@r{index}\n{seq}\n+\n{"I" * len(seq)}\n')
+          PY
+          rm -rf /tmp/hybrid-v5-out
+          cargo run --release -- multik-hybrid \
+            -1 /tmp/hybrid-v5.fastq \
+            -o /tmp/hybrid-v5-out \
+            --backbone-k 15 \
+            --local-start-k 55 \
+            --max-local-k 119 \
+            --neighborhood-radius 32 \
+            --max-neighborhood-states 1024 \
+            --max-neighborhoods 8 \
+            --threads 4
+          test -s /tmp/hybrid-v5-out/hybrid_summary.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          summary = json.loads(Path('/tmp/hybrid-v5-out/hybrid_summary.json').read_text())
+          assert summary['version'] == 'stage34-hybrid-adaptive-backbone-v6'
+          assert summary['neighborhoods'] > 0
+          assert summary['routed_fragment_copies'] > 0
+          assert any((item.get('selected_k') or 0) > 55 for item in summary['local'])
+          assert any(item.get('supported_max_k', 0) >= 119 for item in summary['local'])
+          PY

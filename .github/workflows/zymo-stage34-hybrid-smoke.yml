@@ -1,0 +1,126 @@
+name: Zymo Stage34 hybrid adaptive-k smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - codex/bridgeasm-rust-v0
+    paths:
+      - src/multik_hybrid.rs
+      - src/multik_hybrid_safe.rs
+      - src/main.rs
+      - src/lib.rs
+      - .github/workflows/zymo-stage34-hybrid-smoke.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zymo-stage34-hybrid-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install resource measurement tool
+        run: sudo apt-get update && sudo apt-get install -y time
+
+      - name: Download deterministic first 1M Zymo read pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/zymo-stage34-hybrid
+          python3 scripts/download_ena_subset.py ERR2935805 /tmp/zymo-stage34-hybrid --pairs 1000000 \
+            | tee zymo_stage34_hybrid_download.log
+          ls -lh /tmp/zymo-stage34-hybrid/ERR2935805_*.fastq.gz
+
+      - name: Run 1M hybrid adaptive-k benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf benchmark/stage34-hybrid-1m
+          mkdir -p benchmark/stage34-hybrid-1m
+          /usr/bin/time -v -o benchmark/stage34-hybrid-1m/time.txt \
+            ./target/release/bridgeasm multik-hybrid \
+              -1 /tmp/zymo-stage34-hybrid/ERR2935805_1.fastq.gz \
+              -2 /tmp/zymo-stage34-hybrid/ERR2935805_2.fastq.gz \
+              -o benchmark/stage34-hybrid-1m/output \
+              --backbone-k 0 \
+              --backbone-candidates 21,25,31,35,41 \
+              --backbone-pilot-pairs 200000 \
+              --local-start-k 55 \
+              --max-local-k 255 \
+              --min-count 2 \
+              --min-fragment-support 2 \
+              --min-mean-quality 20 \
+              --neighborhood-radius 64 \
+              --max-neighborhood-states 4096 \
+              --max-neighborhoods 64 \
+              --threads 4 \
+              --max-pairs 1000000 \
+              > benchmark/stage34-hybrid-1m/run.log 2>&1
+          cat benchmark/stage34-hybrid-1m/time.txt
+          cat benchmark/stage34-hybrid-1m/output/hybrid_summary.json
+
+      - name: Summarize hybrid smoke
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+          root=Path('benchmark/stage34-hybrid-1m')
+          text=(root/'time.txt').read_text()
+          summary=json.loads((root/'output/hybrid_summary.json').read_text())
+          def field(name):
+              m=re.search(r'^\s*'+re.escape(name)+r':\s*(.+?)\s*$', text, re.M)
+              return m.group(1) if m else None
+          selected=[x['selected_k'] for x in summary['local'] if x.get('selected_k') is not None]
+          resolved=sum(1 for x in summary['local'] if x.get('resolved'))
+          routed_unique_upper=sum(x.get('routed_fragments',0) for x in summary['local'])
+          out={
+              'version':summary['version'],
+              'pairs':summary['read_pairs'],
+              'threads':summary['threads'],
+              'elapsed_wall_clock':field('Elapsed (wall clock) time (h:mm:ss or m:ss)'),
+              'cpu_percent':field('Percent of CPU this job got'),
+              'max_rss_kbytes':int(field('Maximum resident set size (kbytes)')),
+              'backbone_k':summary['backbone_k'],
+              'backbone_selection':summary.get('backbone_selection'),
+              'backbone_retained_kmers':summary['backbone_retained_kmers'],
+              'backbone_directed_edges':summary['backbone_directed_edges'],
+              'backbone_ambiguous_states':summary['backbone_ambiguous_states'],
+              'neighborhoods':summary['neighborhoods'],
+              'routed_fragment_copies':summary['routed_fragment_copies'],
+              'routed_copy_fraction':summary['routed_fragment_copies']/max(1,summary['read_pairs']),
+              'resolved_neighborhoods':resolved,
+              'selected_k_min':min(selected) if selected else None,
+              'selected_k_max':max(selected) if selected else None,
+              'selected_k_above_55':sum(k>55 for k in selected),
+              'backbone_seconds':summary['backbone_seconds'],
+              'routing_seconds':summary['routing_seconds'],
+              'local_refinement_seconds':summary['local_refinement_seconds'],
+              'internal_total_seconds':summary['total_seconds'],
+          }
+          (root/'benchmark_summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+
+      - name: Upload hybrid smoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zymo-stage34-hybrid-1m
+          path: |
+            benchmark/stage34-hybrid-1m/time.txt
+            benchmark/stage34-hybrid-1m/run.log
+            benchmark/stage34-hybrid-1m/benchmark_summary.json
+            benchmark/stage34-hybrid-1m/output/hybrid_summary.json
+            benchmark/stage34-hybrid-1m/output/hybrid_neighborhoods.tsv
+          retention-days: 14
