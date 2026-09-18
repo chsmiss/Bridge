@@ -766,7 +766,6 @@ fn summarize_backbone_pilot(
     let ambiguous_states = graph_ambiguous_states(graph);
     let dead_end_states = graph_dead_end_states(graph);
     let denominator = active_states.max(1) as f64;
-    let empty_penalty = if active_states == 0 { 1.0 } else { 0.0 };
     BackbonePilotSummary {
         k,
         read_pairs,
@@ -784,7 +783,7 @@ fn summarize_backbone_pilot(
             1.0
         } else {
             dead_end_states as f64 / denominator
-        } + empty_penalty * 0.0,
+        },
         peak_memory_proxy_bytes: backbone_peak_memory_proxy_bytes(graph, threads),
     }
 }
@@ -803,8 +802,8 @@ fn choose_backbone_k(candidates: &[BackbonePilotSummary]) -> Result<usize> {
         .filter(|item| item.dead_end_rate <= connectivity_budget)
         .map(|item| item.ambiguity_rate)
         .fold(f64::INFINITY, f64::min);
-    let ambiguity_tolerance = (best_ambiguity * AUTO_BACKBONE_AMBIGUITY_REL_TOL)
-        .max(AUTO_BACKBONE_AMBIGUITY_ABS_TOL);
+    let ambiguity_tolerance =
+        (best_ambiguity * AUTO_BACKBONE_AMBIGUITY_REL_TOL).max(AUTO_BACKBONE_AMBIGUITY_ABS_TOL);
     candidates
         .iter()
         .filter(|item| item.dead_end_rate <= connectivity_budget)
@@ -833,7 +832,9 @@ fn auto_select_backbone(
     } else {
         config.backbone_pilot_pairs
     };
-    let pilot_pairs = config.max_pairs.map_or(requested_pilot, |limit| limit.min(requested_pilot));
+    let pilot_pairs = config
+        .max_pairs
+        .map_or(requested_pilot, |limit| limit.min(requested_pilot));
     if pilot_pairs == 0 {
         bail!("hybrid automatic backbone pilot requires at least one read pair");
     }
@@ -843,7 +844,8 @@ fn auto_select_backbone(
         pilot_config.backbone_k = k;
         pilot_config.max_pairs = Some(pilot_pairs);
         let (graph, observed_pairs) = build_backbone(&pilot_config, pool)?;
-        let summary = summarize_backbone_pilot(k, observed_pairs, &graph, pool.current_num_threads());
+        let summary =
+            summarize_backbone_pilot(k, observed_pairs, &graph, pool.current_num_threads());
         eprintln!(
             "stage34 auto-backbone pilot k={}: retained={} edges={} ambiguity={:.4}% dead_end={:.4}% peak_proxy={:.2} MiB",
             summary.k,
@@ -1706,7 +1708,12 @@ mod tests {
         key
     }
 
-    fn pilot_summary(k: usize, ambiguity_rate: f64, dead_end_rate: f64, bytes: usize) -> BackbonePilotSummary {
+    fn pilot_summary(
+        k: usize,
+        ambiguity_rate: f64,
+        dead_end_rate: f64,
+        bytes: usize,
+    ) -> BackbonePilotSummary {
         BackbonePilotSummary {
             k,
             read_pairs: 1000,
