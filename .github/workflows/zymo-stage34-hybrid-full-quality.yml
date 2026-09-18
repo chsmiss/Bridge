@@ -117,7 +117,9 @@ jobs:
               -1 /tmp/zymo-full/ERR2935805_1.fastq.gz \
               -2 /tmp/zymo-full/ERR2935805_2.fastq.gz \
               -o benchmark/hybrid \
-              --backbone-k 31 \
+              --backbone-k 0 \
+              --backbone-candidates 21,25,31,35,41 \
+              --backbone-pilot-pairs 200000 \
               --local-start-k 55 \
               --max-local-k 255 \
               --min-count 2 \
