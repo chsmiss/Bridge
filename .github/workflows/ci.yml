@@ -81,7 +81,7 @@ jobs:
           import json
           from pathlib import Path
           summary = json.loads(Path('/tmp/hybrid-v5-out/hybrid_summary.json').read_text())
-          assert summary['version'] == 'stage34-hybrid-adaptive-local-v5'
+          assert summary['version'] == 'stage34-hybrid-adaptive-backbone-v6'
           assert summary['neighborhoods'] > 0
           assert summary['routed_fragment_copies'] > 0
           assert any((item.get('selected_k') or 0) > 55 for item in summary['local'])
