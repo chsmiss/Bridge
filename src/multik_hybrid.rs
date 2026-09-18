@@ -13,6 +13,11 @@ use std::time::Instant;
 
 const BACKBONE_MAX_K: usize = 62;
 const WIDE_MAX_K: usize = 255;
+const AUTO_BACKBONE_CANDIDATES: [usize; 5] = [21, 25, 31, 35, 41];
+const AUTO_BACKBONE_PILOT_PAIRS: usize = 200_000;
+const AUTO_BACKBONE_DEAD_END_SLACK: f64 = 0.02;
+const AUTO_BACKBONE_AMBIGUITY_REL_TOL: f64 = 0.05;
+const AUTO_BACKBONE_AMBIGUITY_ABS_TOL: f64 = 0.001;
 const WIDE_WORDS: usize = 8;
 const BLOOM_BITS: usize = 1 << 30;
 const BLOOM_WORDS: usize = BLOOM_BITS / 64;
@@ -25,7 +30,10 @@ pub struct HybridConfig {
     pub read1: PathBuf,
     pub read2: Option<PathBuf>,
     pub output_dir: PathBuf,
+    /// 0 means automatic pilot selection; non-zero pins the global backbone k.
     pub backbone_k: usize,
+    pub backbone_candidates: Vec<usize>,
+    pub backbone_pilot_pairs: usize,
     pub local_start_k: usize,
     pub max_local_k: usize,
     pub min_count: u32,
@@ -63,11 +71,34 @@ pub struct HybridNeighborhoodSummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct BackbonePilotSummary {
+    pub k: usize,
+    pub read_pairs: usize,
+    pub retained_kmers: usize,
+    pub directed_edges: usize,
+    pub active_states: usize,
+    pub ambiguous_states: usize,
+    pub dead_end_states: usize,
+    pub ambiguity_rate: f64,
+    pub dead_end_rate: f64,
+    pub peak_memory_proxy_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BackboneSelectionSummary {
+    pub mode: String,
+    pub pilot_pairs: usize,
+    pub selected_k: usize,
+    pub candidates: Vec<BackbonePilotSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct HybridSummary {
     pub version: String,
     pub read_pairs: usize,
     pub threads: usize,
     pub backbone_k: usize,
+    pub backbone_selection: BackboneSelectionSummary,
     pub backbone_retained_kmers: usize,
     pub backbone_directed_edges: usize,
     pub backbone_ambiguous_states: usize,
@@ -697,6 +728,145 @@ fn graph_ambiguous_states(graph: &BackboneGraph) -> usize {
     (0..graph.state_count() as u32)
         .filter(|&state| state_ambiguous(graph, state))
         .count()
+}
+
+fn graph_active_states(graph: &BackboneGraph) -> usize {
+    (0..graph.state_count() as u32)
+        .filter(|&state| graph.indegree[state as usize] > 0 || graph.outdegree(state) > 0)
+        .count()
+}
+
+fn graph_dead_end_states(graph: &BackboneGraph) -> usize {
+    (0..graph.state_count() as u32)
+        .filter(|&state| {
+            let incoming = graph.indegree[state as usize] as usize;
+            let outgoing = graph.outdegree(state);
+            incoming + outgoing > 0 && (incoming == 0 || outgoing == 0)
+        })
+        .count()
+}
+
+fn backbone_peak_memory_proxy_bytes(graph: &BackboneGraph, threads: usize) -> usize {
+    let persistent = graph.keys.len() * std::mem::size_of::<u128>()
+        + graph.prefix.offsets.len() * std::mem::size_of::<u32>()
+        + graph.out_offsets.len() * std::mem::size_of::<u32>()
+        + graph.out_targets.len() * std::mem::size_of::<u32>()
+        + graph.indegree.len() * std::mem::size_of::<u8>();
+    let edge_counting_support = graph.state_count() * threads.max(1) * std::mem::size_of::<u8>();
+    persistent.saturating_add(edge_counting_support)
+}
+
+fn summarize_backbone_pilot(
+    k: usize,
+    read_pairs: usize,
+    graph: &BackboneGraph,
+    threads: usize,
+) -> BackbonePilotSummary {
+    let active_states = graph_active_states(graph);
+    let ambiguous_states = graph_ambiguous_states(graph);
+    let dead_end_states = graph_dead_end_states(graph);
+    let denominator = active_states.max(1) as f64;
+    let empty_penalty = if active_states == 0 { 1.0 } else { 0.0 };
+    BackbonePilotSummary {
+        k,
+        read_pairs,
+        retained_kmers: graph.keys.len(),
+        directed_edges: graph.out_targets.len(),
+        active_states,
+        ambiguous_states,
+        dead_end_states,
+        ambiguity_rate: if active_states == 0 {
+            1.0
+        } else {
+            ambiguous_states as f64 / denominator
+        },
+        dead_end_rate: if active_states == 0 {
+            1.0
+        } else {
+            dead_end_states as f64 / denominator
+        } + empty_penalty * 0.0,
+        peak_memory_proxy_bytes: backbone_peak_memory_proxy_bytes(graph, threads),
+    }
+}
+
+fn choose_backbone_k(candidates: &[BackbonePilotSummary]) -> Result<usize> {
+    if candidates.is_empty() {
+        bail!("automatic backbone selection has no pilot candidates");
+    }
+    let min_dead_end = candidates
+        .iter()
+        .map(|item| item.dead_end_rate)
+        .fold(f64::INFINITY, f64::min);
+    let connectivity_budget = (min_dead_end + AUTO_BACKBONE_DEAD_END_SLACK).min(1.0);
+    let best_ambiguity = candidates
+        .iter()
+        .filter(|item| item.dead_end_rate <= connectivity_budget)
+        .map(|item| item.ambiguity_rate)
+        .fold(f64::INFINITY, f64::min);
+    let ambiguity_tolerance = (best_ambiguity * AUTO_BACKBONE_AMBIGUITY_REL_TOL)
+        .max(AUTO_BACKBONE_AMBIGUITY_ABS_TOL);
+    candidates
+        .iter()
+        .filter(|item| item.dead_end_rate <= connectivity_budget)
+        .filter(|item| item.ambiguity_rate <= best_ambiguity + ambiguity_tolerance)
+        .min_by_key(|item| (item.peak_memory_proxy_bytes, item.k))
+        .map(|item| item.k)
+        .context("automatic backbone selector found no connectivity-safe candidate")
+}
+
+fn auto_select_backbone(
+    config: &HybridConfig,
+    pool: &ThreadPool,
+) -> Result<BackboneSelectionSummary> {
+    let mut ks = if config.backbone_candidates.is_empty() {
+        AUTO_BACKBONE_CANDIDATES.to_vec()
+    } else {
+        config.backbone_candidates.clone()
+    };
+    ks.sort_unstable();
+    ks.dedup();
+    if ks.is_empty() || ks.iter().any(|&k| k == 0 || k > BACKBONE_MAX_K) {
+        bail!("hybrid backbone candidates must all be in 1..={BACKBONE_MAX_K}");
+    }
+    let requested_pilot = if config.backbone_pilot_pairs == 0 {
+        AUTO_BACKBONE_PILOT_PAIRS
+    } else {
+        config.backbone_pilot_pairs
+    };
+    let pilot_pairs = config.max_pairs.map_or(requested_pilot, |limit| limit.min(requested_pilot));
+    if pilot_pairs == 0 {
+        bail!("hybrid automatic backbone pilot requires at least one read pair");
+    }
+    let mut pilots = Vec::with_capacity(ks.len());
+    for k in ks {
+        let mut pilot_config = config.clone();
+        pilot_config.backbone_k = k;
+        pilot_config.max_pairs = Some(pilot_pairs);
+        let (graph, observed_pairs) = build_backbone(&pilot_config, pool)?;
+        let summary = summarize_backbone_pilot(k, observed_pairs, &graph, pool.current_num_threads());
+        eprintln!(
+            "stage34 auto-backbone pilot k={}: retained={} edges={} ambiguity={:.4}% dead_end={:.4}% peak_proxy={:.2} MiB",
+            summary.k,
+            summary.retained_kmers,
+            summary.directed_edges,
+            100.0 * summary.ambiguity_rate,
+            100.0 * summary.dead_end_rate,
+            summary.peak_memory_proxy_bytes as f64 / (1024.0 * 1024.0)
+        );
+        pilots.push(summary);
+    }
+    let selected_k = choose_backbone_k(&pilots)?;
+    eprintln!(
+        "stage34 auto-backbone selected k={selected_k} from {:?} using {} pilot pairs",
+        pilots.iter().map(|item| item.k).collect::<Vec<_>>(),
+        pilot_pairs
+    );
+    Ok(BackboneSelectionSummary {
+        mode: "auto".to_string(),
+        pilot_pairs,
+        selected_k,
+        candidates: pilots,
+    })
 }
 
 fn find_neighborhoods(config: &HybridConfig, graph: &BackboneGraph) -> Vec<Neighborhood> {
@@ -1377,8 +1547,8 @@ fn refine_one(
 }
 
 pub fn run_multik_hybrid(config: &HybridConfig, threads: usize) -> Result<HybridRunStats> {
-    if config.backbone_k == 0 || config.backbone_k > BACKBONE_MAX_K {
-        bail!("hybrid backbone k must be in 1..={BACKBONE_MAX_K}");
+    if config.backbone_k > BACKBONE_MAX_K {
+        bail!("hybrid backbone k must be 0 (auto) or in 1..={BACKBONE_MAX_K}");
     }
     if config.min_count < 2 || config.min_fragment_support < 2 {
         bail!("hybrid Stage34 requires min-count>=2 and min-fragment-support>=2");
@@ -1399,6 +1569,20 @@ pub fn run_multik_hybrid(config: &HybridConfig, threads: usize) -> Result<Hybrid
     let threads = threads.max(1);
     let pool = ThreadPoolBuilder::new().num_threads(threads).build()?;
     let total_started = Instant::now();
+
+    let backbone_selection = if config.backbone_k == 0 {
+        auto_select_backbone(config, &pool)?
+    } else {
+        BackboneSelectionSummary {
+            mode: "fixed".to_string(),
+            pilot_pairs: 0,
+            selected_k: config.backbone_k,
+            candidates: Vec::new(),
+        }
+    };
+    let mut resolved_config = config.clone();
+    resolved_config.backbone_k = backbone_selection.selected_k;
+    let config = &resolved_config;
 
     let backbone_started = Instant::now();
     let (backbone, read_pairs) = build_backbone(config, &pool)?;
@@ -1459,10 +1643,11 @@ pub fn run_multik_hybrid(config: &HybridConfig, threads: usize) -> Result<Hybrid
     let _ = fs::remove_dir(config.output_dir.join("hybrid_routes"));
 
     let summary = HybridSummary {
-        version: "stage34-hybrid-adaptive-local-v5".to_string(),
+        version: "stage34-hybrid-adaptive-backbone-v6".to_string(),
         read_pairs,
         threads,
         backbone_k: config.backbone_k,
+        backbone_selection,
         backbone_retained_kmers: backbone.keys.len(),
         backbone_directed_edges: backbone.out_targets.len(),
         backbone_ambiguous_states: backbone_ambiguous,
@@ -1519,6 +1704,42 @@ mod tests {
             key.shift_left_append(base_bits(base).unwrap(), sequence.len());
         }
         key
+    }
+
+    fn pilot_summary(k: usize, ambiguity_rate: f64, dead_end_rate: f64, bytes: usize) -> BackbonePilotSummary {
+        BackbonePilotSummary {
+            k,
+            read_pairs: 1000,
+            retained_kmers: 100,
+            directed_edges: 180,
+            active_states: 200,
+            ambiguous_states: (ambiguity_rate * 200.0) as usize,
+            dead_end_states: (dead_end_rate * 200.0) as usize,
+            ambiguity_rate,
+            dead_end_rate,
+            peak_memory_proxy_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn auto_backbone_rejects_fragmented_high_k() {
+        let candidates = vec![
+            pilot_summary(21, 0.12, 0.03, 100),
+            pilot_summary(31, 0.07, 0.035, 120),
+            pilot_summary(35, 0.068, 0.04, 105),
+            pilot_summary(41, 0.04, 0.09, 90),
+        ];
+        assert_eq!(choose_backbone_k(&candidates).unwrap(), 35);
+    }
+
+    #[test]
+    fn auto_backbone_prefers_lower_memory_with_near_equal_ambiguity() {
+        let candidates = vec![
+            pilot_summary(25, 0.051, 0.03, 90),
+            pilot_summary(31, 0.050, 0.032, 130),
+            pilot_summary(35, 0.049, 0.034, 150),
+        ];
+        assert_eq!(choose_backbone_k(&candidates).unwrap(), 25);
     }
 
     #[test]
