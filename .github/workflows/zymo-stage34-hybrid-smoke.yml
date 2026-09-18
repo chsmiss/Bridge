@@ -7,6 +7,7 @@ on:
       - codex/bridgeasm-rust-v0
     paths:
       - src/multik_hybrid.rs
+      - src/multik_hybrid_safe.rs
       - src/main.rs
       - src/lib.rs
       - .github/workflows/zymo-stage34-hybrid-smoke.yml
