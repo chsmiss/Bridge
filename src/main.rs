@@ -94,7 +94,7 @@ enum Command {
         #[arg(short = 't', long, default_value_t = 4)]
         threads: usize,
     },
-    /// Stage34 v5: compact global backbone plus conservative local adaptive high-k refinement.
+    /// Stage34 v6: auto-selected compact global backbone plus conservative local adaptive high-k refinement.
     MultikHybrid {
         #[arg(short = '1', long)]
         read1: PathBuf,
@@ -102,9 +102,15 @@ enum Command {
         read2: Option<PathBuf>,
         #[arg(short, long)]
         output: PathBuf,
-        /// Global compact backbone k. Must fit the u128 backbone representation.
-        #[arg(long, default_value_t = 31)]
+        /// Global compact backbone k. 0 (default) selects automatically from the pilot candidates.
+        #[arg(long, default_value_t = 0)]
         backbone_k: usize,
+        /// Candidate k values for automatic backbone selection.
+        #[arg(long, value_delimiter = ',', default_value = "21,25,31,35,41")]
+        backbone_candidates: Vec<usize>,
+        /// Number of read pairs used by the automatic backbone pilot.
+        #[arg(long, default_value_t = 200000)]
+        backbone_pilot_pairs: usize,
         /// First local high-k candidate. Larger k values are chosen adaptively from routed read lengths.
         #[arg(long, default_value_t = 55)]
         local_start_k: usize,
@@ -239,6 +245,8 @@ fn main() -> Result<()> {
             read2,
             output,
             backbone_k,
+            backbone_candidates,
+            backbone_pilot_pairs,
             local_start_k,
             max_local_k,
             min_count,
@@ -255,6 +263,8 @@ fn main() -> Result<()> {
                 read2,
                 output_dir: output.clone(),
                 backbone_k,
+                backbone_candidates,
+                backbone_pilot_pairs,
                 local_start_k,
                 max_local_k,
                 min_count,
@@ -282,8 +292,9 @@ fn main() -> Result<()> {
                 .filter(|&k| k > 55)
                 .count();
             eprintln!(
-                "hybrid Stage34 built k={} backbone from {} pairs and refined {} neighborhoods in {:.3}s using {} threads; {} connectivity-safe resolved, {} selected k>55",
+                "hybrid Stage34 v6 built k={} backbone ({}) from {} pairs and refined {} neighborhoods in {:.3}s using {} threads; {} connectivity-safe resolved, {} selected k>55",
                 run.summary.backbone_k,
+                run.summary.backbone_selection.mode,
                 run.summary.read_pairs,
                 run.summary.neighborhoods,
                 run.summary.total_seconds,
