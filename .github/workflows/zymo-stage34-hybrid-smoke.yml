@@ -52,7 +52,9 @@ jobs:
               -1 /tmp/zymo-stage34-hybrid/ERR2935805_1.fastq.gz \
               -2 /tmp/zymo-stage34-hybrid/ERR2935805_2.fastq.gz \
               -o benchmark/stage34-hybrid-1m/output \
-              --backbone-k 31 \
+              --backbone-k 0 \
+              --backbone-candidates 21,25,31,35,41 \
+              --backbone-pilot-pairs 200000 \
               --local-start-k 55 \
               --max-local-k 255 \
               --min-count 2 \
@@ -90,6 +92,7 @@ jobs:
               'cpu_percent':field('Percent of CPU this job got'),
               'max_rss_kbytes':int(field('Maximum resident set size (kbytes)')),
               'backbone_k':summary['backbone_k'],
+              'backbone_selection':summary.get('backbone_selection'),
               'backbone_retained_kmers':summary['backbone_retained_kmers'],
               'backbone_directed_edges':summary['backbone_directed_edges'],
               'backbone_ambiguous_states':summary['backbone_ambiguous_states'],
