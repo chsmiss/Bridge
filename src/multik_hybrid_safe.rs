@@ -42,7 +42,8 @@ pub fn enforce_hybrid_safe_gate(run: &mut HybridRunStats) {
 mod tests {
     use super::*;
     use crate::multik_hybrid::{
-        HybridNeighborhoodSummary, HybridRunStats, HybridSummary, LocalKSummary,
+        BackboneSelectionSummary, HybridNeighborhoodSummary, HybridRunStats, HybridSummary,
+        LocalKSummary,
     };
 
     fn candidate(
@@ -70,6 +71,12 @@ mod tests {
                 read_pairs: 1,
                 threads: 1,
                 backbone_k: 31,
+                backbone_selection: BackboneSelectionSummary {
+                    mode: "fixed".to_string(),
+                    pilot_pairs: 0,
+                    selected_k: 31,
+                    candidates: Vec::new(),
+                },
                 backbone_retained_kmers: 1,
                 backbone_directed_edges: 1,
                 backbone_ambiguous_states: 1,
